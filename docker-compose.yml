@@ -2,8 +2,6 @@
 # This file orchestrates the RXinDexer services including API, database, cache, and blockchain node.
 # It defines how the services connect and operate together in production.
 
-version: '3.8'
-
 services:
   # RXinDexer API service
   rxindexer-api:
@@ -61,6 +59,7 @@ services:
       - REDIS_PORT=6379
       - LOG_LEVEL=INFO
       - IN_DOCKER=true
+      - IN_INDEXER=true # Explicitly mark as indexer context
       # Reduced sync parameters to prevent RPC overload
       - SYNC_BATCH_SIZE=1000
       - SYNC_MAX_WORKERS=8
@@ -80,11 +79,11 @@ services:
       - db
       - redis
       - radiant
-    command: ["python", "sync/rxindex_sync.py"]
+    command: ["python", "sync/rxindex_sync.py"] # Command is properly passed through entrypoint now
     networks:
       - rxindexer-network
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "python -m src.indexer"]
+      test: ["CMD", "pgrep", "-f", "python sync/rxindex_sync.py"]
       interval: 30s
       timeout: 10s
       retries: 3
