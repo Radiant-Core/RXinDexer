@@ -1,0 +1,92 @@
+#!/sbin/runscript
+
+# backward compatibility for existing gentoo layout 
+#
+if [ -d "/var/lib/radiant/.radiant" ]; then
+	RADIANTD_DEFAULT_DATADIR="/var/lib/radiant/.radiant"
+else
+	RADIANTD_DEFAULT_DATADIR="/var/lib/radiantd"
+fi
+
+RADIANTD_CONFIGFILE=${RADIANTD_CONFIGFILE:-/etc/radiant/radiant.conf}
+RADIANTD_PIDDIR=${RADIANTD_PIDDIR:-/var/run/radiantd}
+RADIANTD_PIDFILE=${RADIANTD_PIDFILE:-${RADIANTD_PIDDIR}/radiantd.pid}
+RADIANTD_DATADIR=${RADIANTD_DATADIR:-${RADIANTD_DEFAULT_DATADIR}}
+RADIANTD_USER=${RADIANTD_USER:-${BITCOIN_USER:-radiant}}
+RADIANTD_GROUP=${RADIANTD_GROUP:-radiant}
+RADIANTD_BIN=${RADIANTD_BIN:-/usr/bin/radiantd}
+RADIANTD_NICE=${RADIANTD_NICE:-${NICELEVEL:-0}}
+RADIANTD_OPTS="${RADIANTD_OPTS:-${BITCOIN_OPTS}}"
+
+name="Radiant Node Daemon"
+description="Bitcoin cryptocurrency P2P network daemon"
+
+command="/usr/bin/radiantd"
+command_args="-pid=\"${RADIANTD_PIDFILE}\" \
+		-conf=\"${RADIANTD_CONFIGFILE}\" \
+		-datadir=\"${RADIANTD_DATADIR}\" \
+		-daemon \
+		${RADIANTD_OPTS}"
+
+required_files="${RADIANTD_CONFIGFILE}"
+start_stop_daemon_args="-u ${RADIANTD_USER} \
+			-N ${RADIANTD_NICE} -w 2000"
+pidfile="${RADIANTD_PIDFILE}"
+
+# The retry schedule to use when stopping the daemon. Could be either
+# a timeout in seconds or multiple signal/timeout pairs (like
+# "SIGKILL/180 SIGTERM/300")
+retry="${RADIANTD_SIGTERM_TIMEOUT}"
+
+depend() {
+	need localmount net
+}
+
+# verify
+# 1) that the datadir exists and is writable (or create it)
+# 2) that a directory for the pid exists and is writable
+# 3) ownership and permissions on the config file
+start_pre() {
+	checkpath \
+	-d \
+	--mode 0750 \
+	--owner "${RADIANTD_USER}:${RADIANTD_GROUP}" \
+	"${RADIANTD_DATADIR}"
+
+	checkpath \
+	-d \
+	--mode 0755 \
+	--owner "${RADIANTD_USER}:${RADIANTD_GROUP}" \
+	"${RADIANTD_PIDDIR}"
+
+	checkpath -f \
+	-o ${RADIANTD_USER}:${RADIANTD_GROUP} \
+	-m 0660 \
+	${RADIANTD_CONFIGFILE}
+
+	checkconfig || return 1
+}
+
+checkconfig()
+{
+	if ! grep -qs '^rpcpassword=' "${RADIANTD_CONFIGFILE}" ; then
+		eerror ""
+		eerror "ERROR: You must set a secure rpcpassword to run radiantd."
+		eerror "The setting must appear in ${RADIANTD_CONFIGFILE}"
+		eerror ""
+		eerror "This password is security critical to securing wallets "
+		eerror "and must not be the same as the rpcuser setting."
+		eerror "You can generate a suitable random password using the following "
+		eerror "command from the shell:"
+		eerror ""
+		eerror "bash -c 'tr -dc a-zA-Z0-9 < /dev/urandom | head -c32 && echo'"
+		eerror ""
+		eerror "It is recommended that you also set alertnotify so you are "
+		eerror "notified of problems:"
+		eerror ""
+		eerror "ie: alertnotify=echo %%s | mail -s \"Bitcoin Alert\"" \
+			"admin@foo.com"
+		eerror ""
+		return 1
+	fi
+}

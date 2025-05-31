@@ -1,0 +1,43 @@
+# /Users/radiant/Desktop/RXinDexer/.gitignore
+# This file specifies which files and directories should be ignored by Git.
+# It excludes virtual environments, cache files, and other non-essential resources.
+
+# Python virtual environment
+venv/
+.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.so
+.Python
+.coverage
+htmlcov/
+
+# Database files
+*.sqlite3
+*.db
+
+# Logs
+logs/
+*.log
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Docker volumes
+data/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Node modules (if any frontend components)
+node_modules/

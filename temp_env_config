@@ -1,0 +1,40 @@
+# Database Settings
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=rxindexer_dev
+DB_USER=postgres
+DB_PASSWORD=development_db_password
+
+# Radiant Node Settings
+RADIANT_NODE_URL=http://localhost
+RADIANT_RPC_USER=rxin
+RADIANT_RPC_PASSWORD=development_password
+RADIANT_RPC_PORT=7332
+
+# Redis Settings
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=2
+REDIS_PASSWORD=
+
+# API Settings
+API_HOST=0.0.0.0
+API_PORT=8000
+API_DEBUG=true
+API_WORKERS=1
+
+# Sync Settings
+SYNC_BATCH_SIZE=25
+SYNC_START_HEIGHT=0
+
+# Enhanced Indexing Settings
+GLYPH_DEEP_INDEXING=true
+GLYPH_MEDIA_FETCH=true
+GLYPH_COLLECTION_TRACKING=true
+GLYPH_CONTAINER_DEPTH=3
+MEDIA_FETCH_WORKERS=4
+MEDIA_FETCH_TIMEOUT=30
+
+# Environment Settings
+ENVIRONMENT=development
+LOG_LEVEL=DEBUG

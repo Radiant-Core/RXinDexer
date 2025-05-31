@@ -1,0 +1,95 @@
+# /Users/radiant/Desktop/RXinDexer/docker/Dockerfile.radiant
+# This file defines a robust Dockerfile for the Radiant Node built from source
+# It includes all necessary indexes and configs for the RXinDexer application
+
+# Multi-stage build approach
+# Stage 1: Build Radiant Node from source
+FROM debian:bullseye as builder
+
+# Set environment variables to avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libevent-dev \
+    libboost-system-dev \
+    libboost-filesystem-dev \
+    libboost-chrono-dev \
+    libboost-test-dev \
+    libboost-thread-dev \
+    libzmq3-dev \
+    libdb++-dev \
+    libminiupnpc-dev \
+    help2man \
+    git \
+    ca-certificates \
+    curl \
+    cmake \
+    ninja-build \
+    python3 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone Radiant repository
+RUN git clone --depth=1 https://github.com/Radiant-Core/Radiant-Node.git /tmp/radiant
+
+# Build Radiant Node using CMake
+WORKDIR /tmp/radiant
+RUN mkdir build && cd build && \
+    cmake -GNinja .. -DBUILD_RADIANT_QT=OFF && \
+    ninja && \
+    ninja install && \
+    strip /usr/local/bin/radiantd && \
+    strip /usr/local/bin/radiant-cli
+
+# Stage 2: Create the runtime image
+FROM debian:bullseye-slim
+
+# Set environment variables to avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libzmq5 \
+    libboost-chrono1.74.0 \
+    libboost-filesystem1.74.0 \
+    libboost-thread1.74.0 \
+    libboost-system1.74.0 \
+    libboost-program-options1.74.0 \
+    libboost-test1.74.0 \
+    libssl1.1 \
+    libevent-2.1-7 \
+    libevent-pthreads-2.1-7 \
+    libdb5.3++ \
+    libminiupnpc17 \
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binaries from the builder stage
+COPY --from=builder /usr/local/bin/radiantd /usr/local/bin/
+COPY --from=builder /usr/local/bin/radiant-cli /usr/local/bin/
+
+# Create data directory and set permissions
+RUN mkdir -p /data/.radiant && \
+    chmod 755 /data/.radiant
+
+# Set working directory
+WORKDIR /data
+
+# Create a default configuration file to ensure the node can start even without a mounted config
+RUN echo "server=1\nrpcuser=rxin\nrpcpassword=securepassword\nrpcport=7332\nrpcallowip=0.0.0.0/0\nrpcbind=0.0.0.0\ntxindex=1\nlisten=1\nbind=0.0.0.0\ndebug=0\nprinttoconsole=1" > /data/.radiant/radiant.conf && \
+    chmod 600 /data/.radiant/radiant.conf
+
+# Expose RPC and P2P ports
+EXPOSE 7332 7333
+
+# Add a health check script
+COPY healthcheck.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/healthcheck.sh
+
+# Set the entrypoint to run the Radiant daemon
+CMD ["radiantd", "-conf=/data/.radiant/radiant.conf", "-datadir=/data/.radiant", "-daemon=0"]

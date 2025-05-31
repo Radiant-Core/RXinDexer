@@ -1,0 +1,100 @@
+# Copyright (c) 2020-2021 The Bitcoin developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+# Use the following command to build HTML documentation:
+#
+#     ninja doc/html
+
+site_name: Radiant Node documentation
+site_description: Documentation for the Radiant Node project
+site_author: The Bitcoin developers
+site_dir: html
+
+repo_url: https://github.com/radiantblockchain/radiant-node
+edit_uri: ""
+
+docs_dir: md
+
+markdown_extensions:
+  - pymdownx.superfences
+
+theme:
+  name: material
+  logo: doc/images/logo.svg
+
+extra_css:
+  - doc/stylesheets/custom.css
+
+
+nav:
+  - Home: README.md
+  - Setup instructions: doc/README.md
+  - Release notes:
+      - Current release notes: doc/release-notes.md
+  - Build guides:
+      - doc/dependencies.md
+      - Linux build guides:
+          - Ubuntu/Debian build guide: doc/build-unix-deb.md
+          - Arch Linux build guide: doc/build-unix-arch.md
+          - Alpine Linux build guide: doc/build-unix-alpine.md
+          - Fedora/CentOS build guide: doc/build-unix-rpm.md
+      - FreeBSD build guide: doc/build-freebsd.md
+      - macOS build guide: doc/build-osx.md
+      - Unix build guide: doc/build-unix.md
+      - Windows build guide: doc/build-windows.md
+      - Gitian deterministic builds:
+          - doc/gitian-building.md
+          - doc/gitian-signing.md
+          - doc/gitian-building/gitian-building-create-vm-debian.md
+          - doc/gitian-building/gitian-building-manual.md
+          - doc/gitian-building/gitian-building-setup-gitian-debian.md
+          - doc/gitian-building/gitian-building-vagrant.md
+          - Deterministic macOS DMGs: doc/README_osx.md
+  - API documentation:
+      - Command-line interfaces:
+          - bitcoind: doc/cli/bitcoind.md
+          - bitcoin-qt: doc/cli/bitcoin-qt.md
+          - bitcoin-cli: doc/cli/bitcoin-cli.md
+          - bitcoin-tx: doc/cli/bitcoin-tx.md
+          - bitcoin-seeder: doc/cli/bitcoin-seeder.md
+      - JSON-RPC interface:
+          - JSON-RPC commands list: doc/json-rpc/README.md
+      - doc/REST-interface.md
+      - Output descriptors: doc/descriptors.md
+      - ZeroMQ: doc/zmq.md
+  - Technical standards:
+      - BIPs: doc/bips.md
+      - Radiant Node upgrades: doc/rad-upgrades.md
+      - getblocktemplatelight: doc/getblocktemplatelight.md
+      - XVersionMessage: doc/xversionmessage.md
+      - DSProof implementation notes: doc/dsproof-implementation-notes.md
+  - Development:
+      - Contributing: CONTRIBUTING.md
+      - GitLab rules & guidelines: doc/radn-gitlab-usage-rules-and-guidelines.md
+      - doc/developer-notes.md
+      - doc/ninja_targets.md
+      - Internationalization: doc/translation_strings_policy.md
+      - doc/shared-libraries.md
+      - doc/backporting.md
+      - Testing:
+          - doc/unit-tests.md
+          - Unit test coverage: doc/coverage.md
+          - doc/functional-tests.md
+          - RapidCheck: doc/rapidcheck.md
+          - doc/fuzzing.md
+          - doc/benchmarking.md
+          - doc/test-networks.md
+      - Translation: doc/translation_process.md
+      - doc/release-process.md
+      - Responsible disclosure: DISCLOSURE_POLICY.md
+  - Miscellaneous:
+      - List of files: doc/files.md
+      - Init scripts: doc/init.md
+      - Tor support: doc/tor.md
+      - Traffic reduction: doc/reduce-traffic.md
+      - src/univalue/README.md
+      - Publishing documentation: doc/publishing-documentation.md
+      - DNS seed policy: doc/dnsseed-policy.md
+      - doc/assets-attribution.md
+  - License: COPYING.md

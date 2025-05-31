@@ -1,0 +1,33 @@
+# /etc/conf.d/radiantd: config file for /etc/init.d/radiantd
+
+# Config file location
+#BITCOIND_CONFIGFILE="/etc/radiant/radiant.conf"
+
+# What directory to write pidfile to?  (created and owned by $BITCOIND_USER)
+#BITCOIND_PIDDIR="/var/run/radiantd"
+
+# What filename to give the pidfile
+#BITCOIND_PIDFILE="${BITCOIND_PIDDIR}/radiantd.pid"
+
+# Where to write radiantd data (be mindful that the blockchain is large)
+#BITCOIND_DATADIR="/var/lib/radiantd"
+
+# User and group to own radiantd process
+#BITCOIND_USER="radiant"
+#BITCOIND_GROUP="radiant"
+
+# Path to radiantd executable
+#BITCOIND_BIN="/usr/bin/radiantd"
+
+# Nice value to run radiantd under
+#BITCOIND_NICE=0
+
+# Additional options (avoid -conf and -datadir, use flags above)
+#BITCOIND_OPTS=""
+
+# The timeout in seconds OpenRC will wait for radiantd to terminate
+# after a SIGTERM has been raised.
+# Note that this will be mapped as argument to start-stop-daemon's
+# '--retry' option, which means you can specify a retry schedule
+# here. For more information see man 8 start-stop-daemon.
+BITCOIND_SIGTERM_TIMEOUT=60

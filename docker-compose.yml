@@ -1,0 +1,242 @@
+# /Users/radiant/Desktop/RXinDexer/docker-compose.yml
+# This file orchestrates the RXinDexer services including API, database, cache, and blockchain node.
+# It defines how the services connect and operate together in production.
+
+version: '3.8'
+
+services:
+  # RXinDexer API service
+  rxindexer-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rxindexer-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/rxindexer
+      - RADIANT_RPC_URL=http://radiant:7332
+      - RADIANT_RPC_USER=rxin
+      - RADIANT_RPC_PASSWORD=securepassword
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - INIT_DB=true
+      - LOG_LEVEL=INFO
+      - IN_DOCKER=true
+      - IN_API=true  # Explicitly mark as API context
+      - ENVIRONMENT=production
+      - SERVICE_NAME=rxindexer-api
+      - RADIANT_MAX_RETRIES=10
+      - CONNECTION_RETRY_DELAY=1.5
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - db
+      - redis
+      - radiant
+    command: ["python", "docker-entry.py"]
+    networks:
+      - rxindexer-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || curl -f http://localhost:8000/api/v1/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # RXinDexer Indexer service
+  rxindexer-indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rxindexer-indexer
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/rxindexer
+      - RADIANT_RPC_URL=http://radiant:7332
+      - RADIANT_RPC_USER=rxin
+      - RADIANT_RPC_PASSWORD=securepassword
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=INFO
+      - IN_DOCKER=true
+      # Reduced sync parameters to prevent RPC overload
+      - SYNC_BATCH_SIZE=1000
+      - SYNC_MAX_WORKERS=8
+      - UTXO_MAX_WORKERS=4
+      - BLOCK_PARALLEL_THRESHOLD=25
+      - RPC_RATE_LIMIT=10
+      - PROGRESSIVE_SYNC=true
+      - INITIAL_SYNC_MINIMAL=true
+      - USE_REDIS_CACHE=true
+      - REDIS_URL=redis://redis:6379/0
+      - RADIANT_RPC_TIMEOUT=60
+      - CONNECTION_RETRY_DELAY=5
+      - GLYPH_DEEP_INDEXING=true
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - db
+      - redis
+      - radiant
+    command: ["python", "sync/rxindex_sync.py"]
+    networks:
+      - rxindexer-network
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "python -m src.indexer"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # PostgreSQL database with optimizations
+  db:
+    image: postgres:16
+    container_name: rxindexer-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=rxindexer
+      - POSTGRES_MAX_CONNECTIONS=100
+    volumes:
+      # Mount custom PostgreSQL configuration file
+      - ./docker/postgresql.conf:/etc/postgresql/postgresql.conf
+      # Mount initialization scripts with all database optimizations
+      - ./docker/postgresql-init.sql:/docker-entrypoint-initdb.d/01-init-optimizations.sql
+      - ./fix_ambiguous_column.sql:/docker-entrypoint-initdb.d/02-fix-ambiguous-column.sql
+      - ./fix_query_stats.sql:/docker-entrypoint-initdb.d/03-fix-query-stats.sql
+      - ./final_temp_table_fix.sql:/docker-entrypoint-initdb.d/04-final-temp-table-fix.sql
+      - postgres-data:/var/lib/postgresql/data
+    command: ["-c", "config_file=/etc/postgresql/postgresql.conf"]
+    # CPU and memory constraints to prevent overwhelming the host
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    ports:
+      - "5432:5432"
+    networks:
+      - rxindexer-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Redis cache with optimizations
+  redis:
+    image: redis:7.2.3-alpine
+    container_name: rxindexer-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    networks:
+      - rxindexer-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1.5G
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Radiant Node for blockchain indexing
+  radiant:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.radiant
+    container_name: rxindexer-radiant
+    restart: unless-stopped
+    volumes:
+      - radiant-data:/data/.radiant
+      - ./docker/radiant.conf:/data/.radiant/radiant.conf
+    ports:
+      - "7332:7332"
+      - "7333:7333"
+    command: ["radiantd", "-printtoconsole", "-server", "-txindex=1", "-datadir=/data/.radiant"]
+    networks:
+      - rxindexer-network
+    healthcheck:
+      test: ["CMD", "radiant-cli", "-rpcuser=rxin", "-rpcpassword=securepassword", "getblockchaininfo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Database maintenance service
+  rxindexer-db-maintenance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rxindexer-db-maintenance
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/rxindexer
+      - LOG_LEVEL=INFO
+    depends_on:
+      - db
+    command: ["python", "-m", "src.utils.db_maintenance", "--daemon"]
+    networks:
+      - rxindexer-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # Monitoring dashboard
+  rxindexer-monitoring:
+    image: grafana/grafana:10.0.0
+    container_name: rxindexer-monitoring
+    restart: unless-stopped
+    depends_on:
+      - rxindexer-prometheus
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - rxindexer-network
+
+  # Metrics collection
+  rxindexer-prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: rxindexer-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - rxindexer-network
+
+networks:
+  rxindexer-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  radiant-data:
+  grafana-data:
+  prometheus-data:

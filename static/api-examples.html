@@ -1,0 +1,357 @@
+//# /Users/radiant/Desktop/RXinDexer/static/api-examples.html
+//# This file contains example API usage documentation for RXinDexer.
+//# It provides code snippets and explanations for common API operations.
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RXinDexer API Examples</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1, h2, h3 {
+            color: #2c3e50;
+        }
+        .example {
+            margin: 20px 0;
+            padding: 20px;
+            background-color: #f9f9f9;
+            border-radius: 5px;
+            border-left: 5px solid #3498db;
+        }
+        pre {
+            background-color: #f1f1f1;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        code {
+            font-family: 'Courier New', Courier, monospace;
+        }
+        .endpoint {
+            font-weight: bold;
+            color: #2980b9;
+        }
+        .method {
+            font-weight: bold;
+            color: #27ae60;
+        }
+        .note {
+            padding: 10px;
+            background-color: #f8f4e5;
+            border-left: 5px solid #f1c40f;
+            margin: 15px 0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+    </style>
+</head>
+<body>
+    <h1>RXinDexer API Examples</h1>
+    <p>This page provides examples of how to use the RXinDexer API to query Radiant blockchain data, including transactions, balances, and Glyph tokens.</p>
+
+    <h2>Address Endpoints</h2>
+
+    <div class="example">
+        <h3>Get Address Balance</h3>
+        <p>Retrieve RXD balance and token holdings for an address.</p>
+        <p class="endpoint"><span class="method">GET</span> /api/address/{address}/balance</p>
+        
+        <h4>Example Request:</h4>
+        <pre><code>curl -X GET "http://localhost:8000/api/address/12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX/balance"</code></pre>
+        
+        <h4>Example Response:</h4>
+        <pre><code>{
+  "address": "12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX",
+  "rxd_balance": "50.0",
+  "glyph_tokens": {
+    "glyph:1234": 1,
+    "glyph:5678": 2
+  }
+}</code></pre>
+    </div>
+
+    <div class="example">
+        <h3>Get Address UTXOs</h3>
+        <p>Retrieve unspent transaction outputs (UTXOs) for an address.</p>
+        <p class="endpoint"><span class="method">GET</span> /api/address/{address}/utxos</p>
+        
+        <h4>Example Request:</h4>
+        <pre><code>curl -X GET "http://localhost:8000/api/address/12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX/utxos?unspent_only=true"</code></pre>
+        
+        <h4>Example Response:</h4>
+        <pre><code>{
+  "address": "12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX",
+  "utxos": [
+    {
+      "txid": "d5ada6c79a4abd38fe2a95d8a4b86bec64af447eb3c5216e7e6bc278387d614e",
+      "vout": 0,
+      "amount": "50.0",
+      "token_ref": null,
+      "spent": false,
+      "block_height": 1
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "total_items": 1,
+    "total_pages": 1,
+    "has_next": false,
+    "has_prev": false
+  }
+}</code></pre>
+    </div>
+
+    <h2>Token Endpoints</h2>
+
+    <div class="example">
+        <h3>Get Token Information</h3>
+        <p>Retrieve metadata and current status of a Glyph token.</p>
+        <p class="endpoint"><span class="method">GET</span> /api/token/{ref}</p>
+        
+        <h4>Example Request:</h4>
+        <pre><code>curl -X GET "http://localhost:8000/api/token/glyph:1234"</code></pre>
+        
+        <h4>Example Response:</h4>
+        <pre><code>{
+  "ref": "glyph:1234",
+  "type": "fungible",
+  "metadata": {
+    "name": "Test Token",
+    "decimals": 8,
+    "symbol": "TEST"
+  },
+  "genesis_txid": "d5ada6c79a4abd38fe2a95d8a4b86bec64af447eb3c5216e7e6bc278387d614e",
+  "genesis_block_height": 1,
+  "current_owner": "12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX"
+}</code></pre>
+    </div>
+
+    <div class="example">
+        <h3>List Tokens</h3>
+        <p>List all tokens with optional filtering by type.</p>
+        <p class="endpoint"><span class="method">GET</span> /api/token/</p>
+        
+        <h4>Example Request:</h4>
+        <pre><code>curl -X GET "http://localhost:8000/api/token/?token_type=fungible&page=1&limit=10"</code></pre>
+        
+        <h4>Example Response:</h4>
+        <pre><code>{
+  "tokens": [
+    {
+      "ref": "glyph:1234",
+      "type": "fungible",
+      "genesis_block_height": 1
+    },
+    {
+      "ref": "glyph:5678",
+      "type": "fungible",
+      "genesis_block_height": 2
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 10,
+    "total_items": 2,
+    "total_pages": 1,
+    "has_next": false,
+    "has_prev": false
+  }
+}</code></pre>
+    </div>
+
+    <h2>Holder Endpoints</h2>
+
+    <div class="example">
+        <h3>Get RXD Holder Count</h3>
+        <p>Get the count of unique addresses holding RXD.</p>
+        <p class="endpoint"><span class="method">GET</span> /api/holder/count/rxd</p>
+        
+        <h4>Example Request:</h4>
+        <pre><code>curl -X GET "http://localhost:8000/api/holder/count/rxd?min_balance=1.0"</code></pre>
+        
+        <h4>Example Response:</h4>
+        <pre><code>{
+  "asset": "RXD",
+  "min_balance": 1.0,
+  "holder_count": 1250
+}</code></pre>
+    </div>
+
+    <div class="example">
+        <h3>Get Token Holder Count</h3>
+        <p>Get the count of unique addresses holding a specific token.</p>
+        <p class="endpoint"><span class="method">GET</span> /api/holder/count/token/{ref}</p>
+        
+        <h4>Example Request:</h4>
+        <pre><code>curl -X GET "http://localhost:8000/api/holder/count/token/glyph:1234"</code></pre>
+        
+        <h4>Example Response:</h4>
+        <pre><code>{
+  "asset": "glyph:1234",
+  "holder_count": 42
+}</code></pre>
+    </div>
+
+    <h2>Transaction Endpoints</h2>
+
+    <div class="example">
+        <h3>Get Transaction Details</h3>
+        <p>Get detailed information about a specific transaction.</p>
+        <p class="endpoint"><span class="method">GET</span> /api/transaction/{txid}</p>
+        
+        <h4>Example Request:</h4>
+        <pre><code>curl -X GET "http://localhost:8000/api/transaction/d5ada6c79a4abd38fe2a95d8a4b86bec64af447eb3c5216e7e6bc278387d614e"</code></pre>
+        
+        <h4>Example Response:</h4>
+        <pre><code>{
+  "txid": "d5ada6c79a4abd38fe2a95d8a4b86bec64af447eb3c5216e7e6bc278387d614e",
+  "block_height": 1,
+  "inputs": [
+    {
+      "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+      "vout": 0,
+      "address": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+      "amount": "50.0",
+      "token_ref": null
+    }
+  ],
+  "outputs": [
+    {
+      "vout": 0,
+      "address": "12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX",
+      "amount": "50.0",
+      "token_ref": "glyph:1234",
+      "spent": false
+    }
+  ],
+  "tokens": [
+    {
+      "ref": "glyph:1234",
+      "type": "fungible",
+      "vout": 0
+    }
+  ]
+}</code></pre>
+    </div>
+
+    <div class="example">
+        <h3>Get Block Transactions</h3>
+        <p>Get transactions included in a specific block.</p>
+        <p class="endpoint"><span class="method">GET</span> /api/transaction/block/{height}</p>
+        
+        <h4>Example Request:</h4>
+        <pre><code>curl -X GET "http://localhost:8000/api/transaction/block/1"</code></pre>
+        
+        <h4>Example Response:</h4>
+        <pre><code>{
+  "block_height": 1,
+  "transactions": [
+    {
+      "txid": "d5ada6c79a4abd38fe2a95d8a4b86bec64af447eb3c5216e7e6bc278387d614e",
+      "has_tokens": true
+    },
+    {
+      "txid": "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
+      "has_tokens": false
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "total_items": 2,
+    "total_pages": 1,
+    "has_next": false,
+    "has_prev": false
+  }
+}</code></pre>
+    </div>
+
+    <div class="note">
+        <h3>Authentication</h3>
+        <p>Currently, the API does not require authentication. For rate limiting and additional security, consider using API keys in a production environment.</p>
+    </div>
+
+    <div class="note">
+        <h3>Rate Limiting</h3>
+        <p>To prevent abuse, the API implements rate limiting. If you receive a 429 status code, please reduce your request frequency.</p>
+    </div>
+
+    <h2>Using the API with JavaScript</h2>
+    <div class="example">
+        <h4>Fetch Address Balance Example:</h4>
+        <pre><code>async function getAddressBalance(address) {
+  try {
+    const response = await fetch(`http://localhost:8000/api/address/${address}/balance`);
+    if (!response.ok) {
+      throw new Error(`HTTP error! Status: ${response.status}`);
+    }
+    const data = await response.json();
+    console.log(`Address: ${data.address}`);
+    console.log(`RXD Balance: ${data.rxd_balance}`);
+    console.log('Glyph Tokens:');
+    for (const [tokenRef, amount] of Object.entries(data.glyph_tokens)) {
+      console.log(`- ${tokenRef}: ${amount}`);
+    }
+    return data;
+  } catch (error) {
+    console.error('Error fetching address balance:', error);
+  }
+}
+
+// Example usage
+getAddressBalance('12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX');</code></pre>
+    </div>
+
+    <h2>Using the API with Python</h2>
+    <div class="example">
+        <h4>Get Token Information Example:</h4>
+        <pre><code>import requests
+
+def get_token_info(token_ref):
+    try:
+        response = requests.get(f'http://localhost:8000/api/token/{token_ref}')
+        response.raise_for_status()  # Raise exception for HTTP errors
+        data = response.json()
+        
+        print(f"Token: {data['ref']}")
+        print(f"Type: {data['type']}")
+        print(f"Metadata: {data['metadata']}")
+        print(f"Current Owner: {data['current_owner']}")
+        
+        return data
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching token information: {e}")
+
+# Example usage
+get_token_info('glyph:1234')</code></pre>
+    </div>
+
+    <footer>
+        <p>For more information and full API documentation, visit the <a href="/docs">Swagger UI</a> or <a href="/redoc">ReDoc</a> pages.</p>
+    </footer>
+</body>
+</html>

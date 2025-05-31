@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+#  radiantd The Radiant Node server.
+#
+#
+# chkconfig: 345 80 20
+# description: radiantd
+# processname: radiantd
+#
+
+# Source function library.
+. /etc/init.d/functions
+
+# you can override defaults in /etc/sysconfig/radiantd, see below
+if [ -f /etc/sysconfig/radiantd ]; then
+        . /etc/sysconfig/radiantd
+fi
+
+RETVAL=0
+
+prog=radiantd
+# you can override the lockfile via RADIANTD_LOCKFILE in /etc/sysconfig/radiantd
+lockfile=${RADIANTD_LOCKFILE-/var/lock/subsys/radiantd}
+
+# radiantd defaults to /usr/bin/radiantd, override with RADIANTD_BIN
+radiantd=${RADIANTD_BIN-/usr/bin/radiantd}
+
+# radiantd opts default to -disablewallet, override with RADIANTD_OPTS
+radiantd_opts=${RADIANTD_OPTS--disablewallet}
+
+start() {
+    echo -n $"Starting $prog: "
+    daemon $DAEMONOPTS $radiantd $radiantd_opts
+    RETVAL=$?
+    echo
+    [ $RETVAL -eq 0 ] && touch $lockfile
+    return $RETVAL
+}
+
+stop() {
+    echo -n $"Stopping $prog: "
+    killproc $prog
+    RETVAL=$?
+    echo
+    [ $RETVAL -eq 0 ] && rm -f $lockfile
+    return $RETVAL
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    status)
+        status $prog
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    *)
+        echo "Usage: service $prog {start|stop|status|restart}"
+        exit 1
+        ;;
+esac

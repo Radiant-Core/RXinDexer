@@ -1,0 +1,22 @@
+[Unit]
+Description=Radiant Node Daemon
+After=network.target
+
+[Service]
+User=radiant
+Group=radiant
+
+Type=forking
+PIDFile=/var/lib/radiantd/radiantd.pid
+ExecStart=/usr/bin/radiantd -daemon -pid=/var/lib/radiantd/radiantd.pid \
+-conf=/etc/radiant/radiant.conf -datadir=/var/lib/radiantd -disablewallet
+
+Restart=always
+PrivateTmp=true
+TimeoutStopSec=60s
+TimeoutStartSec=2s
+StartLimitInterval=120s
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
