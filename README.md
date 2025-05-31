@@ -406,7 +406,6 @@ curl -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"1.0","id":"test
 ## Support and Resources
 
 - **GitHub Repository**: [https://github.com/Radiant-Core/RXinDexer](https://github.com/Radiant-Core/RXinDexer)
-- **Documentation**: [https://docs.rxindexer.io](https://docs.rxindexer.io)
-- **Issue Tracker**: [https://github.com/Radiant-Core/RXinDexer/issues](https://github.com/Radiant-Core/RXinDexer/issues)
+- **Documentation**: (https://github.com/Radiant-Core/RXinDexer/docs)
 
-For urgent production support, contact the Radiant Core team at support@radiantblockchain.org.
+For urgent production support, contact the Radiant Core team at info@radiantfoundation.org 
