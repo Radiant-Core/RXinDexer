@@ -131,13 +131,24 @@ touch /app/logs/app.log
 echo "Log directory ready: /app/logs"
 
 # Print final startup message
-echo "Starting RXinDexer with the fixed entry point"
+echo "Starting RXinDexer with the container-specific entry point"
 echo "==============================="
 
-# Force the correct module path regardless of what was passed in
-echo "Using direct entry point: python docker-entry.py"
-cd /app
-exec python docker-entry.py
+# Determine which service to run based on environment variables
+if [ "$IN_INDEXER" = "true" ]; then
+  echo "Detected indexer context - using indexer entry point"
+  cd /app
+  exec "$@"
+elif [ "$IN_API" = "true" ]; then
+  echo "Detected API context - using API entry point"
+  cd /app
+  exec python docker-entry.py
+else
+  # Default case - use the command passed to the container
+  echo "Using command from docker-compose: $@"
+  cd /app
+  exec "$@"
+fi
 
 # This will only execute if the exec fails
 echo "ERROR: Failed to execute the entry point"

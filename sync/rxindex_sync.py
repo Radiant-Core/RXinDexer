@@ -50,12 +50,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration from environment variables with sensible defaults
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = int(os.getenv('DB_PORT', 5432))
-DB_NAME = os.getenv('DB_NAME', 'rxindex')
-DB_USER = os.getenv('DB_USER', 'postgres')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'postgres')
+# Parse DATABASE_URL if provided, otherwise use individual settings
+DATABASE_URL = os.getenv('DATABASE_URL')
+if DATABASE_URL:
+    # Parse the DATABASE_URL to extract components
+    try:
+        import urllib.parse
+        parsed_url = urllib.parse.urlparse(DATABASE_URL)
+        
+        # Extract components from the URL
+        DB_USER = parsed_url.username or 'postgres'
+        DB_PASSWORD = parsed_url.password or 'postgres'
+        DB_HOST = parsed_url.hostname or 'db'  # Use 'db' as default in Docker
+        DB_PORT = parsed_url.port or 5432
+        DB_NAME = parsed_url.path.lstrip('/') or 'rxindexer'
+        
+        logger.info(f"Using database connection from DATABASE_URL: {DB_HOST}:{DB_PORT}/{DB_NAME}")
+    except Exception as e:
+        logger.error(f"Error parsing DATABASE_URL: {e}, falling back to individual settings")
+        # Fall back to individual settings if parsing fails
+        DB_HOST = os.getenv('DB_HOST', 'db')  # Default to 'db' for Docker
+        DB_PORT = int(os.getenv('DB_PORT', 5432))
+        DB_NAME = os.getenv('DB_NAME', 'rxindexer')
+        DB_USER = os.getenv('DB_USER', 'postgres')
+        DB_PASSWORD = os.getenv('DB_PASSWORD', 'postgres')
+else:
+    # Use individual environment variables with sensible defaults
+    DB_HOST = os.getenv('DB_HOST', 'db')  # Default to 'db' for Docker
+    DB_PORT = int(os.getenv('DB_PORT', 5432))
+    DB_NAME = os.getenv('DB_NAME', 'rxindexer')
+    DB_USER = os.getenv('DB_USER', 'postgres')
+    DB_PASSWORD = os.getenv('DB_PASSWORD', 'postgres')
 
 # RPC connection parameters
 RPC_URL = os.getenv('RADIANT_RPC_URL', 'http://radiant:7332')
@@ -497,7 +522,7 @@ class RXinDexerSync:
                             id INTEGER PRIMARY KEY,
                             current_height INTEGER NOT NULL DEFAULT 0,
                             current_hash VARCHAR(64),
-                            last_updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+                            last_updated_at DOUBLE PRECISION NOT NULL,
                             last_error TEXT,
                             current_chainwork VARCHAR(64),
                             glyph_scan_height INTEGER DEFAULT 0,
@@ -505,25 +530,27 @@ class RXinDexerSync:
                         )
                     """)
                     
-                    # Insert initial state
+                    # Insert initial state with Unix timestamp
+                    current_time = time.time()
                     cur.execute("""
                         INSERT INTO sync_state (id, current_height, current_hash, last_updated_at, is_syncing) 
-                        VALUES (1, %s, %s, NOW(), 0)
-                    """, (height, block_hash))
+                        VALUES (1, %s, %s, %s, 0)
+                    """, (height, block_hash, current_time))
                     logger.info(f"Created sync_state table and inserted initial record at height {height}")
                 else:
-                    # Update existing state
+                    # Update existing state with Unix timestamp
+                    current_time = time.time()
                     cur.execute("""
-                        UPDATE sync_state
-                        SET current_height = %s, current_hash = %s, last_updated_at = NOW()
+                        UPDATE sync_state 
+                        SET current_height = %s, current_hash = %s, last_updated_at = %s
                         WHERE id = 1
-                    """, (height, block_hash))
+                    """, (height, block_hash, current_time))
                     
                     if cur.rowcount == 0:  # No rows updated
                         cur.execute("""
                             INSERT INTO sync_state (id, current_height, current_hash, last_updated_at, is_syncing) 
-                            VALUES (1, %s, %s, NOW(), 0)
-                        """, (height, block_hash))
+                            VALUES (1, %s, %s, %s, 0)
+                        """, (height, block_hash, current_time))
                         logger.info(f"Inserted new sync_state record at height {height}")
         except Exception as e:
             logger.error(f"Error updating sync state: {e}")
@@ -553,13 +580,14 @@ class RXinDexerSync:
                     if cur.fetchone()[0]:
                         # Reset any in-progress syncing
                         try:
+                            current_time = time.time()
                             cur.execute("""
                                 UPDATE sync_state 
                                 SET is_syncing = 0, 
-                                    last_updated_at = to_timestamp(extract(epoch from now())),
+                                    last_updated_at = %s,
                                     last_error = 'Reset during startup' 
                                 WHERE is_syncing = 1
-                            """)
+                            """, (current_time,))
                             if cur.rowcount > 0:
                                 logger.info(f"Reset {cur.rowcount} sync_state rows that were marked as syncing")
                         except Exception as update_error:
@@ -1037,12 +1065,13 @@ class RXinDexerSync:
                 # Update sync state using the same connection with the correct schema
                 try:
                     # Insert a new record in sync_state using the correct column names
+                    current_time = time.time()  # Use Unix timestamp
                     cur.execute("""
                         INSERT INTO sync_state (id, current_height, current_hash, last_updated_at)
-                        VALUES (1, %s, %s, NOW())
+                        VALUES (1, %s, %s, %s)
                         ON CONFLICT (id) DO UPDATE
-                        SET current_height = %s, current_hash = %s, last_updated_at = NOW()
-                    """, (height, block_hash, height, block_hash))
+                        SET current_height = %s, current_hash = %s, last_updated_at = %s
+                    """, (height, block_hash, current_time, height, block_hash, current_time))
                 except psycopg2.Error as e:
                     logger.error(f"Error updating sync_state: {str(e)}")
                     # If there's an error, try to ensure the table exists
@@ -1060,10 +1089,11 @@ class RXinDexerSync:
                             )
                         """)
                         # Try the insert again
+                        current_time = time.time()  # Use Unix timestamp
                         cur.execute("""
                             INSERT INTO sync_state (id, current_height, current_hash, last_updated_at)
-                            VALUES (1, %s, %s, NOW())
-                        """, (height, block_hash))
+                            VALUES (1, %s, %s, %s)
+                        """, (height, block_hash, current_time))
                     else:
                         # Rethrow other errors
                         raise
