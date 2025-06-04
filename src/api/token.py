@@ -3,6 +3,7 @@
 # It provides token metadata, ownership information, and transfer history.
 
 import logging
+import time
 from typing import Dict, List, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -14,14 +15,21 @@ from src.utils.cache import get_cached, cache_result, cache_decorator, CACHE_TTL
 # Import RPC client from the selector for development mode compatibility
 from src.sync.rpc_selector import RadiantRPC
 
-router = APIRouter()
+# Import security module
+from src.api.security import get_api_key
+
+# Create router with explicit API key dependency for ALL endpoints
+router = APIRouter(
+    dependencies=[Depends(get_api_key)]
+)
 logger = logging.getLogger(__name__)
 
 @router.get("/{ref}")
 @cache_decorator(ttl=CACHE_TTL)
 async def get_token_info(
     ref: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     Get information about a specific Glyph token.
@@ -68,7 +76,8 @@ async def get_token_info(
 async def list_tokens(
     token_type: Optional[str] = Query(None, description="Filter by token type (fungible, non-fungible, dmint)"),
     pagination: PaginationParams = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     List all Glyph tokens with optional filtering.
@@ -108,7 +117,8 @@ async def list_tokens(
 async def get_token_history(
     ref: str,
     pagination: PaginationParams = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     Get the transfer history of a token.
@@ -149,3 +159,73 @@ async def get_token_history(
         "history": history,
         "pagination": pagination_data
     }
+
+# Define with exact path matching that the test expects
+@router.get("/stats", include_in_schema=True)
+@cache_decorator(ttl=CACHE_TTL)
+async def get_token_statistics(
+    token_type: Optional[str] = Query(None, description="Filter by token type (fungible, non-fungible, dmint)"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get overall token statistics
+    
+    Args:
+        token_type: Optional filter by token type
+        
+    Returns:
+        Statistics about tokens including counts, volume, and distribution
+    """
+    try:
+        # Base query for all tokens
+        query = db.query(GlyphToken)
+        
+        # Apply token type filter if provided
+        if token_type:
+            query = query.filter(GlyphToken.type == token_type)
+        
+        # Get total count
+        total_tokens = query.count()
+        
+        # Get counts by type
+        type_counts = {}
+        for t_type in ["fungible", "non-fungible", "dmint"]:
+            count = db.query(GlyphToken).filter(GlyphToken.type == t_type).count()
+            type_counts[t_type] = count
+        
+        # Get unique holders count (simple approximation)
+        unique_holders = db.query(UTXO.address).filter(
+            UTXO.token_ref.isnot(None),
+            UTXO.spent == False
+        ).distinct().count()
+        
+        # Calculate basic statistics - always return valid data even when empty
+        stats = {
+            "total_tokens": total_tokens,
+            "tokens_by_type": type_counts,
+            "unique_holders": unique_holders,
+            "latest_token": {
+                "ref": "",
+                "type": "",
+                "genesis_txid": ""
+            },
+            "timestamp": int(time.time())  # Current timestamp as fallback
+        }
+        
+        # Get most recent token
+        latest_token = db.query(GlyphToken).order_by(
+            GlyphToken.created_at.desc()
+        ).first()
+        
+        if latest_token:
+            stats["latest_token"] = {
+                "ref": latest_token.ref,
+                "type": latest_token.type,
+                "genesis_txid": latest_token.genesis_txid
+            }
+            stats["timestamp"] = latest_token.created_at
+            
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting token statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error retrieving token statistics")

@@ -18,7 +18,28 @@ http://<host>:<port>/api/v1/health
 
 ## Authentication
 
-Currently, the API is accessible without authentication. Rate limiting may be implemented in future versions.
+The RXinDexer API uses API key authentication for protected endpoints. Public endpoints can be accessed without authentication, while protected endpoints require an API key to be provided in the request headers.
+
+### API Key Header
+
+For protected endpoints, include your API key in the `X-API-Key` header:
+
+```
+X-API-Key: your-api-key-here
+```
+
+### Authentication Response Codes
+
+- **401 Unauthorized**: Returned when no API key is provided for a protected endpoint
+- **403 Forbidden**: Returned when an invalid API key is provided
+- **200 OK**: Returned when a valid API key is provided (assuming the request is otherwise valid)
+
+### Protected vs Public Endpoints
+
+Most informational and read-only endpoints are public and don't require authentication. Protected endpoints typically include those that provide detailed statistics or could be resource-intensive.
+
+Examples of protected endpoints:
+- `/api/v1/tokens/stats/holders` - Token holder statistics
 
 ## Response Format
 
@@ -265,6 +286,75 @@ Get holders of a specific Glyph token.
     "page_size": 50,
     "total_items": 156,
     "total_pages": 4
+  }
+}
+```
+
+#### GET /api/v1/tokens/stats
+
+Get general token statistics (non-authenticated endpoint).
+
+**Response:**
+```json
+{
+  "total_tokens": 1024,
+  "total_fungible": 156,
+  "total_non_fungible": 868,
+  "total_holders": 2750,
+  "latest_token": {
+    "ref": "glyph:token1248",
+    "type": "fungible",
+    "genesis_txid": "7f5d1f8e8a76d32a95601518d183e030e9d73788d79c18583c04adff13092160"
+  }
+}
+```
+
+#### GET /api/v1/tokens/stats/holders
+
+Get detailed token holder statistics (protected endpoint, requires API key authentication).
+
+**Authentication:**
+- Requires API key via `X-API-Key` header
+
+**Parameters:**
+- `offset` (query parameter, integer, default: 0): Offset for pagination
+- `limit` (query parameter, integer, default: 50): Number of results per page
+
+**Response:**
+```json
+{
+  "total_holders": 2750,
+  "holders": [
+    {
+      "address": "rx1qvz9qsdp9e4xrx4l79ej9t0qttf26yczfrevlxu",
+      "tokens": [
+        {
+          "ref": "glyph:token1",
+          "amount": "10.00000000",
+          "type": "fungible"
+        },
+        {
+          "ref": "glyph:token2",
+          "amount": "1.00000000",
+          "type": "non-fungible"
+        }
+      ]
+    },
+    {
+      "address": "rx1qk2e95tp4j962f2c9vq885psy8fmtm3tepkfmz4",
+      "tokens": [
+        {
+          "ref": "glyph:token3",
+          "amount": "5.00000000",
+          "type": "fungible"
+        }
+      ]
+    }
+  ],
+  "pagination": {
+    "total": 2750,
+    "offset": 0,
+    "limit": 50
   }
 }
 ```

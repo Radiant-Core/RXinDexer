@@ -1,0 +1,13 @@
+HTTP/1.1 200 OK
+date: Sun, 01 Jun 2025 05:59:59 GMT
+server: uvicorn
+content-length: 104
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+content-security-policy: default-src 'self';
+x-process-time: 0.00031638145446777344
+x-request-id: 4e7d99cf-7b45-4689-b75a-9c18e6d12e52
+
+{"status":"healthy","timestamp":1748757600.3293316,"components":{"api":"online","database":"connected"}}

@@ -29,6 +29,7 @@ pytest-cov==4.1.0
 # Utilities
 python-dotenv==1.0.1
 requests==2.31.0
+psutil==5.9.8
 schedule==1.2.1
 
 # Bloom Filter for Performance Optimization (Optional)

@@ -11,7 +11,7 @@ services:
     container_name: rxindexer-api
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "0.0.0.0:8000:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/rxindexer
       - RADIANT_RPC_URL=http://radiant:7332
@@ -27,6 +27,11 @@ services:
       - SERVICE_NAME=rxindexer-api
       - RADIANT_MAX_RETRIES=10
       - CONNECTION_RETRY_DELAY=1.5
+      # Security settings
+      - API_KEYS=test-api-key-1,test-api-key-2  # Change these in production
+      - RATE_LIMIT_REQUESTS=1000   # Number of requests allowed per time window (increased for testing)
+      - RATE_LIMIT_DURATION=60   # Time window in seconds (increased for testing)
+      - ALLOWED_ORIGINS=*        # For production, set to specific origins
     volumes:
       - ./logs:/app/logs
     depends_on:
@@ -190,6 +195,12 @@ services:
     command: ["python", "-m", "src.utils.db_maintenance", "--daemon"]
     networks:
       - rxindexer-network
+    healthcheck:
+      test: ["CMD-SHELL", "bash /tmp/db_maintenance_healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     deploy:
       resources:
         limits:

@@ -530,27 +530,25 @@ class RXinDexerSync:
                         )
                     """)
                     
-                    # Insert initial state with Unix timestamp
-                    current_time = time.time()
+                    # Insert initial state with current timestamp
                     cur.execute("""
                         INSERT INTO sync_state (id, current_height, current_hash, last_updated_at, is_syncing) 
-                        VALUES (1, %s, %s, %s, 0)
-                    """, (height, block_hash, current_time))
+                        VALUES (1, %s, %s, NOW(), 0)
+                    """, (height, block_hash))
                     logger.info(f"Created sync_state table and inserted initial record at height {height}")
                 else:
-                    # Update existing state with Unix timestamp
-                    current_time = time.time()
+                    # Update existing state with current timestamp
                     cur.execute("""
                         UPDATE sync_state 
-                        SET current_height = %s, current_hash = %s, last_updated_at = %s
+                        SET current_height = %s, current_hash = %s, last_updated_at = NOW()
                         WHERE id = 1
-                    """, (height, block_hash, current_time))
+                    """, (height, block_hash))
                     
                     if cur.rowcount == 0:  # No rows updated
                         cur.execute("""
                             INSERT INTO sync_state (id, current_height, current_hash, last_updated_at, is_syncing) 
-                            VALUES (1, %s, %s, %s, 0)
-                        """, (height, block_hash, current_time))
+                            VALUES (1, %s, %s, NOW(), 0)
+                        """, (height, block_hash))
                         logger.info(f"Inserted new sync_state record at height {height}")
         except Exception as e:
             logger.error(f"Error updating sync state: {e}")
@@ -580,14 +578,13 @@ class RXinDexerSync:
                     if cur.fetchone()[0]:
                         # Reset any in-progress syncing
                         try:
-                            current_time = time.time()
                             cur.execute("""
                                 UPDATE sync_state 
                                 SET is_syncing = 0, 
-                                    last_updated_at = %s,
+                                    last_updated_at = NOW(),
                                     last_error = 'Reset during startup' 
                                 WHERE is_syncing = 1
-                            """, (current_time,))
+                            """)
                             if cur.rowcount > 0:
                                 logger.info(f"Reset {cur.rowcount} sync_state rows that were marked as syncing")
                         except Exception as update_error:
@@ -1068,10 +1065,10 @@ class RXinDexerSync:
                     current_time = time.time()  # Use Unix timestamp
                     cur.execute("""
                         INSERT INTO sync_state (id, current_height, current_hash, last_updated_at)
-                        VALUES (1, %s, %s, %s)
+                        VALUES (1, %s, %s, NOW())
                         ON CONFLICT (id) DO UPDATE
-                        SET current_height = %s, current_hash = %s, last_updated_at = %s
-                    """, (height, block_hash, current_time, height, block_hash, current_time))
+                        SET current_height = %s, current_hash = %s, last_updated_at = NOW()
+                    """, (height, block_hash, height, block_hash))
                 except psycopg2.Error as e:
                     logger.error(f"Error updating sync_state: {str(e)}")
                     # If there's an error, try to ensure the table exists

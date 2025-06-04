@@ -7,6 +7,9 @@ from typing import Dict, List, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+# Import security module for API key authentication
+from src.api.security import get_api_key
+
 from src.models import get_db, UTXO, GlyphToken
 from src.sync.rpc_selector import RadiantRPC  # Import from selector instead of direct import
 from src.utils.pagination import PaginationParams, paginate_results
@@ -17,7 +20,8 @@ logger = logging.getLogger(__name__)
 @router.get("/{txid}")
 async def get_transaction(
     txid: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     Get details about a specific transaction.
@@ -83,7 +87,8 @@ async def get_transaction(
 async def get_block_transactions(
     height: int,
     pagination: PaginationParams = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     Get transactions in a specific block.
@@ -129,10 +134,11 @@ async def get_block_transactions(
         "pagination": pagination_data
     }
 
-@router.get("/search/{query}")
+@router.get("/search")
 async def search_transaction(
     query: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     Search for a transaction by ID, address, or token reference.
@@ -178,3 +184,73 @@ async def search_transaction(
     
     # No results found
     raise HTTPException(status_code=404, detail="No results found for query")
+
+@router.get("/latest")
+async def get_latest_transactions(
+    pagination: PaginationParams = Depends(),
+    db: Session = Depends(get_db)
+):
+    """
+    Get the most recent transactions from the blockchain
+    
+    Args:
+        pagination: Pagination parameters
+        
+    Returns:
+        List of recent transactions
+    """
+    try:
+        # Query the most recent transactions from the database
+        query = db.query(UTXO).order_by(UTXO.block_height.desc(), UTXO.n.asc())
+        
+        # Apply pagination
+        paginated_results = paginate_results(query, pagination)
+        
+        # Format the transactions
+        transactions = []
+        tx_map = {}
+        
+        for utxo in paginated_results["items"]:
+            # Group by transaction ID
+            if utxo.txid not in tx_map:
+                tx_map[utxo.txid] = {
+                    "txid": utxo.txid,
+                    "block_height": utxo.block_height,
+                    "timestamp": None,  # Will be populated if available
+                    "value": 0,
+                    "outputs": []
+                }
+            
+            # Add this UTXO to the transaction
+            tx_map[utxo.txid]["value"] += utxo.value
+            tx_map[utxo.txid]["outputs"].append({
+                "address": utxo.address,
+                "value": utxo.value,
+                "n": utxo.n
+            })
+        
+        # Convert map to list
+        transactions = list(tx_map.values())
+        
+        # Try to get timestamp from RPC for these transactions if not in database
+        try:
+            rpc = RadiantRPC()
+            for tx in transactions:
+                if not tx["timestamp"] and tx["block_height"] > 0:
+                    # Get block hash for this height
+                    block_hash = rpc.client.getblockhash(tx["block_height"])
+                    # Get block data
+                    block_data = rpc.client.getblock(block_hash)
+                    # Set timestamp
+                    tx["timestamp"] = block_data["time"]
+        except Exception as rpc_err:
+            logger.error(f"Error getting timestamps from RPC: {str(rpc_err)}")
+            # Continue without timestamps if RPC fails
+        
+        return {
+            "transactions": transactions,
+            "pagination": paginated_results["pagination"]
+        }
+    except Exception as e:
+        logger.error(f"Error retrieving latest transactions: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error retrieving latest transactions")

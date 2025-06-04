@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from typing import Optional, Dict, Any, Generator
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, Column, TypeDecorator, TEXT, event, text
+from sqlalchemy import create_engine, Column, TypeDecorator, TEXT, event, text, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session, Session
 from sqlalchemy.engine import Engine
@@ -337,7 +337,7 @@ def init_db() -> bool:
                 sync_state = SyncState()
                 sync_state.last_block_height = 0
                 sync_state.is_syncing = False
-                sync_state.last_updated_at = time.time()
+                sync_state.last_updated_at = func.now()
                 db.add(sync_state)
         
         logger.info("Database initialization complete")

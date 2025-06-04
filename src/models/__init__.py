@@ -7,6 +7,8 @@ from .utxo import UTXO
 from .glyph_token import GlyphToken
 from .holder import Holder
 from .sync_state import SyncState
+from .block import Block
+from .transaction import Transaction
 
 # Import NFT and token models
 from .nft_metadata import NFTMetadata, NFTCollection, NFTTransfer

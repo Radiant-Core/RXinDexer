@@ -9,7 +9,7 @@ import contextlib
 from typing import Dict, List, Any, Optional, Tuple
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from sqlalchemy import text, create_engine
+from sqlalchemy import text, event, inspect, func
 from sqlalchemy.exc import SQLAlchemyError, PendingRollbackError
 
 from src.models import SyncState, UTXO, GlyphToken, Holder
@@ -306,15 +306,27 @@ class SyncManager:
         try:
             # Force a new connection to avoid transaction issues
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                # First, ensure the record exists
+                conn.execute(
+                    text("""
+                    INSERT INTO sync_state (id, current_height, current_hash, is_syncing, last_updated_at, last_error)
+                    VALUES (1, 0, '', 1, NOW(), NULL)
+                    ON CONFLICT (id) DO UPDATE SET
+                        is_syncing = EXCLUDED.is_syncing,
+                        last_updated_at = EXCLUDED.last_updated_at,
+                        last_error = EXCLUDED.last_error
+                    """)
+                )
+                
+                # Then update with the current state
                 conn.execute(
                     text("""
                     UPDATE sync_state SET 
                         is_syncing = 1, 
                         last_error = NULL,
-                        last_updated_at = :current_time
+                        last_updated_at = NOW()
                     WHERE id = 1
-                    """),
-                    {"current_time": current_time}
+                    """)
                 )
             updated_db = True
         except Exception as e:
@@ -325,15 +337,28 @@ class SyncManager:
                 try:
                     # Create a completely new session
                     new_session = next(get_db())
+                    
+                    # First ensure the record exists
+                    new_session.execute(
+                        text("""
+                        INSERT INTO sync_state (id, current_height, current_hash, is_syncing, last_updated_at, last_error)
+                        VALUES (1, 0, '', 1, NOW(), NULL)
+                        ON CONFLICT (id) DO UPDATE SET
+                            is_syncing = EXCLUDED.is_syncing,
+                            last_updated_at = EXCLUDED.last_updated_at,
+                            last_error = EXCLUDED.last_error
+                        """)
+                    )
+                    
+                    # Then update with the current state
                     new_session.execute(
                         text("""
                         UPDATE sync_state SET 
                             is_syncing = 1, 
                             last_error = NULL,
-                            last_updated_at = :current_time
+                            last_updated_at = NOW()
                         WHERE id = 1
-                        """),
-                        {"current_time": current_time}
+                        """)
                     )
                     new_session.commit()
                     new_session.close()
@@ -345,6 +370,7 @@ class SyncManager:
             try:
                 # Refresh our sync_state object to match the database
                 self.db.refresh(self.sync_state)
+                logger.info("Successfully updated sync state in database")
             except Exception as e:
                 logger.warning(f"Could not refresh sync_state: {str(e)}")
                 # We already updated our in-memory state above, so we're good to continue
@@ -371,17 +397,39 @@ class SyncManager:
         finally:
             # Always mark sync as complete when done
             try:
-                # Use autocommit to avoid transaction issues
+                # Get current timestamp once for consistency
+                current_time = time.time()
+                
+                # Update the database with consistent timestamp
                 with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                    # First ensure the record exists
                     conn.execute(
                         text("""
-                        UPDATE sync_state SET 
-                            is_syncing = 0,
-                            last_updated_at = :current_time
+                        INSERT INTO sync_state (id, current_height, current_hash, is_syncing, last_updated_at, last_error)
+                        VALUES (1, 0, '', 0, to_timestamp(:time) AT TIME ZONE 'UTC', NULL)
+                        ON CONFLICT (id) DO UPDATE SET
+                            is_syncing = EXCLUDED.is_syncing,
+                            last_updated_at = EXCLUDED.last_updated_at
+                        """),
+                        {"time": current_time}
+                    )
+                    
+                    # Then update with the current state
+                    conn.execute(
+                        text("""
+                        UPDATE sync_state 
+                        SET is_syncing = 0,
+                            last_updated_at = to_timestamp(:time) AT TIME ZONE 'UTC'
                         WHERE id = 1
                         """),
-                        {"current_time": time.time()}
+                        {"time": current_time}
                     )
+                
+                # Update in-memory state
+                self.sync_state.is_syncing = 0
+                self.sync_state.last_updated_at = current_time
+                
+                logger.info("Successfully marked sync as complete in database")
             except Exception as e:
                 logger.error(f"Failed to update sync state after completion: {str(e)}")
                 # At least update in-memory state
@@ -427,29 +475,35 @@ class SyncManager:
             
             # Update sync state with the new height
             try:
+                # Get current timestamp once for consistency
+                current_time = time.time()
+                
                 with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                    # Update the database with consistent timestamp
                     conn.execute(
                         text("""
                         UPDATE sync_state 
                         SET current_height = :height,
                             current_hash = :block_hash,
-                            last_updated_at = :time
+                            last_updated_at = to_timestamp(:time) AT TIME ZONE 'UTC',
+                            is_syncing = 1
                         WHERE id = 1
                         """),
-                        {"height": height, "block_hash": block_hash, "time": time.time()}
+                        {"height": height, "block_hash": block_hash, "time": current_time}
                     )
                 
-                # Update our in-memory copy
+                # Update our in-memory copy with the same values
                 self.sync_state.current_height = height
                 self.sync_state.current_hash = block_hash
-                self.sync_state.last_updated_at = time.time()
+                self.sync_state.last_updated_at = current_time
+                self.sync_state.is_syncing = 1
                 
             except Exception as e:
                 # If database update fails, at least keep our in-memory state accurate
                 logger.error(f"Failed to update sync state after block {height}: {str(e)}")
                 self.sync_state.current_height = height
                 self.sync_state.current_hash = block_hash
-                self.sync_state.last_updated_at = time.time()
+                self.sync_state.last_updated_at = func.now()
                 
             return True
         except Exception as e:
@@ -468,7 +522,7 @@ class SyncManager:
         try:
             # First update our in-memory state
             self.sync_state.last_error = error_message
-            self.sync_state.last_updated_at = time.time()
+            self.sync_state.last_updated_at = func.now()
             
             # Then try to update the database
             try:
@@ -477,10 +531,10 @@ class SyncManager:
                         text("""
                         UPDATE sync_state 
                         SET last_error = :error,
-                            last_updated_at = :time
+                            last_updated_at = NOW()
                         WHERE id = 1
                         """),
-                        {"error": error_message, "time": time.time()}
+                        {"error": error_message}
                     )
             except Exception as e:
                 logger.error(f"Failed to update error in database: {str(e)}")

@@ -720,7 +720,7 @@ class TwoPhaseSync:
                         glyph_scan_height INTEGER DEFAULT 0,
                         phase INTEGER DEFAULT 1,
                         sync_started_at TIMESTAMP DEFAULT NOW(),
-                        last_updated_at FLOAT,
+                        last_updated_at TIMESTAMP,
                         last_error TEXT,
                         created_at TIMESTAMP DEFAULT NOW(),
                         updated_at TIMESTAMP DEFAULT NOW()
@@ -798,9 +798,9 @@ class TwoPhaseSync:
                 # Insert or update sync state
                 cursor.execute("""
                     INSERT INTO sync_state (current_height, phase, sync_started_at, last_updated_at)
-                    VALUES (0, 1, NOW(), %s)
+                    VALUES (0, 1, NOW(), NOW())
                     ON CONFLICT DO NOTHING
-                """, (time.time(),))
+                """)
                 
                 self.db_conn.commit()
                 logger.info("Database prepared for Phase 1 sync")
@@ -916,9 +916,9 @@ class TwoPhaseSync:
                 # Update sync state for Phase 2
                 cursor.execute("""
                     UPDATE sync_state 
-                    SET phase = 2, last_updated_at = %s
+                    SET phase = 2, last_updated_at = NOW()
                     WHERE id = (SELECT MAX(id) FROM sync_state)
-                """, (time.time(),))
+                """)
                 
                 self.db_conn.commit()
                 logger.info("Database prepared for Phase 2 sync")
@@ -1127,10 +1127,10 @@ class TwoPhaseSync:
                     UPDATE sync_state 
                     SET current_height = %s, 
                         current_hash = %s,
-                        last_updated_at = %s,
+                        last_updated_at = NOW(),
                         updated_at = NOW()
                     WHERE id = (SELECT MAX(id) FROM sync_state)
-                """, (height, block_hash, time.time()))
+                """, (height, block_hash))
                 
                 # Also add a checkpoint
                 cursor.execute("""

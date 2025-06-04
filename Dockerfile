@@ -42,12 +42,16 @@ RUN pip install --upgrade pip && \
     # Verify installation
     python -c "import sqlalchemy, fastapi, cbor2, uvicorn; print('Dependencies installed successfully')"
 
+# Create necessary directories with proper permissions
+RUN mkdir -p /app/logs /app/data /app/static /app/src/db/functions && \
+    chmod -R 755 /app/logs /app/data /app/static
+
 # Copy application code
 COPY . .
 
-# Create necessary directories with proper permissions
-RUN mkdir -p /app/logs /app/data /app/src/db/functions && \
-    chmod -R 755 /app/logs /app/data
+# Ensure static files directory exists and has correct permissions
+RUN mkdir -p /app/static/swagger && \
+    chmod -R 755 /app/static
 
 # Expose ports
 EXPOSE 8000

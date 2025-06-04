@@ -10,7 +10,7 @@ import traceback
 from typing import Dict, List, Any, Optional, Tuple
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from sqlalchemy import text, create_engine
+from sqlalchemy import text, event, inspect, func
 from sqlalchemy.exc import SQLAlchemyError, PendingRollbackError
 
 # Import our custom transaction helper
@@ -663,7 +663,7 @@ class SyncManager:
                     # Update in-memory state as well
                     self.sync_state.current_height = height
                     self.sync_state.current_hash = block_hash
-                    self.sync_state.last_updated_at = time.time()
+                    self.sync_state.last_updated_at = func.now()
                 except Exception as e:
                     logger.error(f"Failed to update sync state in database: {str(e)}")
                 
@@ -701,7 +701,7 @@ class SyncManager:
             # First update our in-memory state
             if hasattr(self, 'sync_state') and self.sync_state is not None:
                 self.sync_state.last_error = error_message
-                self.sync_state.last_updated_at = time.time()
+                self.sync_state.last_updated_at = func.now()
             
             # Then try to update the database
             try:
@@ -710,10 +710,10 @@ class SyncManager:
                         text("""
                         UPDATE sync_state 
                         SET last_error = :error,
-                            last_updated_at = :time
+                            last_updated_at = NOW()
                         WHERE id = 1
                         """),
-                        {"error": error_message, "time": time.time()}
+                        {"error": error_message}
                     )
             except Exception:
                 # Silently continue with in-memory state only
