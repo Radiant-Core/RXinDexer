@@ -8,6 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from decimal import Decimal
 
+# Import security module for API key authentication
+from src.api.security import get_api_key
+
 from src.models import get_db, UTXO, Holder
 from src.utils.pagination import PaginationParams, paginate_results
 from src.utils.cache import get_cached, cache_result
@@ -21,7 +24,8 @@ logger = logging.getLogger(__name__)
 @router.get("/{address}/balance")
 async def get_address_balance(
     address: str, 
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     Get the current balance for an address.
@@ -71,7 +75,8 @@ async def get_address_utxos(
     address: str,
     unspent_only: bool = Query(True, description="Show only unspent UTXOs"),
     pagination: PaginationParams = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     Get UTXOs for an address.
@@ -119,7 +124,8 @@ async def get_address_utxos(
 async def get_address_transactions(
     address: str,
     pagination: PaginationParams = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
 ):
     """
     Get transaction history for an address.

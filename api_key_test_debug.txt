@@ -1,0 +1,14 @@
+HTTP/1.1 401 Unauthorized
+date: Sun, 01 Jun 2025 05:59:59 GMT
+server: uvicorn
+content-type: application/json
+www-authenticate: ApiKey
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+content-security-policy: default-src 'self';
+x-process-time: 0.0035774707794189453
+x-request-id: 07c9f83d-9179-48fc-823c-100105a725b2
+transfer-encoding: chunked
+
+{"detail":"API key is required"}

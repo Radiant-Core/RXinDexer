@@ -1,0 +1,85 @@
+# /Users/radiant/Desktop/RXinDexer/docker/Dockerfile.db-maintenance
+# This Dockerfile sets up a container for database maintenance tasks
+
+FROM postgres:16
+
+# Set environment variables for build and runtime
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC \
+    # Set default environment variables (can be overridden)
+    POSTGRES_USER=postgres \
+    POSTGRES_DB=rxindexer \
+    POSTGRES_HOST=db \
+    POSTGRES_PORT=5432 \
+    BACKUP_DIR=/backups \
+    LOG_DIR=/app/logs \
+    RETENTION_DAYS=30 \
+    MAINTENANCE_WINDOW_START=2 \
+    MAINTENANCE_WINDOW_END=4 \
+    PGSSLMODE=disable \
+    PGTZ=UTC
+
+# Install required tools and PostgreSQL extensions
+RUN set -ex; \
+    # Install prerequisites
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gnupg2 \
+        wget \
+        ca-certificates \
+        curl \
+        jq \
+        tzdata \
+        lsb-release \
+        apt-transport-https \
+    && \
+    # Use the PostgreSQL repository already configured in the base image
+    # Install PostgreSQL client and extensions
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        postgresql-client-16 \
+        postgresql-contrib-16 \
+        postgresql-plpython3-16 \
+        postgresql-16-pgaudit \
+        postgresql-16-repack \
+        postgresql-client-common \
+    && \
+    # Clean up
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Create necessary directories with proper permissions
+RUN mkdir -p /backups /app/logs /scripts /docker-entrypoint-initdb.d \
+    && chmod -R 755 /backups /app/logs /scripts /docker-entrypoint-initdb.d
+
+# Copy maintenance scripts and SQL files
+COPY scripts/ /scripts/
+COPY db/optimization/ /app/optimization/
+
+# Copy initialization scripts
+COPY docker/db-init-scripts/ /docker-entrypoint-initdb.d/
+COPY db_maintenance.sql /docker-entrypoint-initdb.d/99-db-maintenance.sql
+
+# Set proper permissions
+RUN chmod +x /scripts/*.sh \
+    && chown -R postgres:postgres /backups /app/logs /scripts /docker-entrypoint-initdb.d \
+    && chmod 755 /app/logs
+
+# Switch to non-root user for security
+USER postgres
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD pg_isready -U $POSTGRES_USER -h $POSTGRES_HOST -p $POSTGRES_PORT -d $POSTGRES_DB || exit 1
+
+# Default command - runs the maintenance script in a loop every 6 hours
+CMD ["/bin/bash", "-c", "while true; do \
+  export PGHOST=$POSTGRES_HOST \
+  export PGPORT=$POSTGRES_PORT \
+  export PGUSER=$POSTGRES_USER \
+  export PGDATABASE=$POSTGRES_DB \
+  /scripts/run_maintenance.sh || echo 'Maintenance script failed, will retry later'; \
+  sleep 21600; \
+done"]

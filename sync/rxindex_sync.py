@@ -530,27 +530,25 @@ class RXinDexerSync:
                         )
                     """)
                     
-                    # Insert initial state with Unix timestamp
-                    current_time = time.time()
+                    # Insert initial state with current timestamp
                     cur.execute("""
                         INSERT INTO sync_state (id, current_height, current_hash, last_updated_at, is_syncing) 
-                        VALUES (1, %s, %s, %s, 0)
-                    """, (height, block_hash, current_time))
+                        VALUES (1, %s, %s, NOW(), 0)
+                    """, (height, block_hash))
                     logger.info(f"Created sync_state table and inserted initial record at height {height}")
                 else:
-                    # Update existing state with Unix timestamp
-                    current_time = time.time()
+                    # Update existing state with current timestamp
                     cur.execute("""
                         UPDATE sync_state 
-                        SET current_height = %s, current_hash = %s, last_updated_at = %s
+                        SET current_height = %s, current_hash = %s, last_updated_at = NOW()
                         WHERE id = 1
-                    """, (height, block_hash, current_time))
+                    """, (height, block_hash))
                     
                     if cur.rowcount == 0:  # No rows updated
                         cur.execute("""
                             INSERT INTO sync_state (id, current_height, current_hash, last_updated_at, is_syncing) 
-                            VALUES (1, %s, %s, %s, 0)
-                        """, (height, block_hash, current_time))
+                            VALUES (1, %s, %s, NOW(), 0)
+                        """, (height, block_hash))
                         logger.info(f"Inserted new sync_state record at height {height}")
         except Exception as e:
             logger.error(f"Error updating sync state: {e}")
@@ -580,14 +578,13 @@ class RXinDexerSync:
                     if cur.fetchone()[0]:
                         # Reset any in-progress syncing
                         try:
-                            current_time = time.time()
                             cur.execute("""
                                 UPDATE sync_state 
                                 SET is_syncing = 0, 
-                                    last_updated_at = %s,
+                                    last_updated_at = NOW(),
                                     last_error = 'Reset during startup' 
                                 WHERE is_syncing = 1
-                            """, (current_time,))
+                            """)
                             if cur.rowcount > 0:
                                 logger.info(f"Reset {cur.rowcount} sync_state rows that were marked as syncing")
                         except Exception as update_error:
@@ -801,12 +798,24 @@ class RXinDexerSync:
                         self.bloom_filter.add(tx_id)
                     return
                 
-                # Insert transaction
+                # Insert transaction with all required fields
                 cur.execute("""
-                    INSERT INTO transactions (txid, block_height, block_hash, timestamp, created_at)
-                    VALUES (%s, %s, %s, TO_TIMESTAMP(%s), NOW())
+                    INSERT INTO transactions (
+                        txid, version, block_hash, block_height, 
+                        locktime, size, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, NOW(), NOW()
+                    )
                     ON CONFLICT (txid) DO NOTHING
-                """, (tx_id, height, block_hash, tx_timestamp))
+                """, (
+                    tx_id,  # txid
+                    tx.get('version', 1),  # version
+                    block_hash,  # block_hash
+                    height,  # block_height
+                    tx.get('locktime', 0),  # locktime
+                    tx.get('size', 0) or len(tx.get('hex', '')) // 2  # size (from hex if size not provided)
+                ))
                 
                 # Process inputs (mark UTXOs as spent)
                 vin = tx.get('vin', [])
@@ -1041,12 +1050,27 @@ class RXinDexerSync:
                     logger.info(f"Block {height} already processed, skipping")
                     return True
                 
-                # Insert block
+                # Insert block with all required fields and proper defaults
                 cur.execute("""
-                    INSERT INTO blocks (height, hash, timestamp, created_at)
-                    VALUES (%s, %s, TO_TIMESTAMP(%s), NOW())
+                    INSERT INTO blocks (
+                        height, hash, version, prev_hash, merkle_root, 
+                        timestamp, bits, nonce, chainwork, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, NOW(), NOW()
+                    )
                     ON CONFLICT (hash) DO NOTHING
-                """, (height, block_hash, block_timestamp))
+                """, (
+                    height, 
+                    block_hash,
+                    block_data.get('version', 1),           # version
+                    block_data.get('previousblockhash', ''),  # prev_hash
+                    block_data.get('merkleroot', ''),         # merkle_root
+                    int(block_timestamp),                     # timestamp
+                    block_data.get('bits', ''),               # bits
+                    block_data.get('nonce', 0),               # nonce
+                    block_data.get('chainwork', '')           # chainwork
+                ))
                 
                 # Process transactions sequentially (no parallelism to prevent connection issues)
                 transactions = block_data.get('tx', [])
@@ -1068,10 +1092,10 @@ class RXinDexerSync:
                     current_time = time.time()  # Use Unix timestamp
                     cur.execute("""
                         INSERT INTO sync_state (id, current_height, current_hash, last_updated_at)
-                        VALUES (1, %s, %s, %s)
+                        VALUES (1, %s, %s, NOW())
                         ON CONFLICT (id) DO UPDATE
-                        SET current_height = %s, current_hash = %s, last_updated_at = %s
-                    """, (height, block_hash, current_time, height, block_hash, current_time))
+                        SET current_height = %s, current_hash = %s, last_updated_at = NOW()
+                    """, (height, block_hash, height, block_hash))
                 except psycopg2.Error as e:
                     logger.error(f"Error updating sync_state: {str(e)}")
                     # If there's an error, try to ensure the table exists

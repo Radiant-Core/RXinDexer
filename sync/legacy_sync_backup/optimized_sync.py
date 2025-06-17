@@ -257,9 +257,20 @@ class OptimizedSync:
         with self.db.cursor() as cursor:
             with io.StringIO() as f:
                 for tx in txs_batch:
+                    # Ensure timestamp is an integer (Unix epoch seconds)
+                    timestamp = tx.get('timestamp')
+                    if timestamp is None:
+                        timestamp = 'NOW()'  # Will be handled by database function
+                    else:
+                        try:
+                            timestamp = str(int(timestamp))  # Convert to integer string
+                        except (ValueError, TypeError):
+                            logger.warning(f"Invalid timestamp for tx {tx.get('txid', 'unknown')}, using NOW()")
+                            timestamp = 'NOW()'
+                    
                     # Format as tab-separated values
                     line = f"{tx['txid']}\t{tx['block_height']}\t{tx.get('size', 0)}\t"
-                    line += f"{tx.get('timestamp', 'NOW()')}\t{tx.get('fee', 0)}\n"
+                    line += f"{timestamp}\t{tx.get('fee', 0)}\n"
                     f.write(line)
                 
                 f.seek(0)
@@ -286,9 +297,20 @@ class OptimizedSync:
         with self.db.cursor() as cursor:
             with io.StringIO() as f:
                 for block in blocks_batch:
+                    # Ensure timestamp is an integer (Unix epoch seconds)
+                    timestamp = block.get('timestamp')
+                    if timestamp is None:
+                        timestamp = 'NOW()'  # Will be handled by database function
+                    else:
+                        try:
+                            timestamp = str(int(timestamp))  # Convert to integer string
+                        except (ValueError, TypeError):
+                            logger.warning(f"Invalid timestamp for block {block.get('height')}, using NOW()")
+                            timestamp = 'NOW()'
+                    
                     # Format as tab-separated values
                     line = f"{block['height']}\t{block['hash']}\t{block.get('size', 0)}\t"
-                    line += f"{block.get('timestamp', 'NOW()')}\t{block.get('tx_count', 0)}\n"
+                    line += f"{timestamp}\t{block.get('tx_count', 0)}\n"
                     f.write(line)
                 
                 f.seek(0)
