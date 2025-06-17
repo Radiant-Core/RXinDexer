@@ -31,7 +31,7 @@ For high-traffic deployments (1000+ API requests/minute), consider horizontal sc
 
 ### Docker Deployment (Recommended)
 
-The simplest and most reliable deployment method is using Docker and docker-compose.
+The simplest and most reliable deployment method is using Docker and docker-compose. Run `docker-compose up -d` to start the containers.
 
 1. **Clone the repository**:
    ```bash

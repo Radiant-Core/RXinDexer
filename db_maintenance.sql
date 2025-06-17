@@ -199,6 +199,96 @@ BEGIN
     FROM address_balances;
     
     RAISE NOTICE 'Created temp_balance_view that redirects to the materialized view';
+
+-- ============================================================================
+-- Database Maintenance Functions
+-- ============================================================================
+
+-- Drop existing maintenance function if it exists
+DROP FUNCTION IF EXISTS perform_table_maintenance() CASCADE;
+
+-- Create maintenance history table
+CREATE TABLE IF NOT EXISTS maintenance_history (
+    table_name TEXT PRIMARY KEY,
+    last_vacuum TIMESTAMP WITH TIME ZONE,
+    last_analyze TIMESTAMP WITH TIME ZONE,
+    last_reindex TIMESTAMP WITH TIME ZONE
+);
+
+-- Initialize maintenance history for key tables
+INSERT INTO maintenance_history (table_name, last_vacuum, last_analyze, last_reindex)
+VALUES 
+    ('utxos', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'),
+    ('transactions', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'),
+    ('blocks', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'),
+    ('holders', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'),
+    ('glyph_tokens', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day')
+ON CONFLICT (table_name) DO NOTHING;
+
+-- Create a function that returns maintenance commands to execute
+CREATE OR REPLACE FUNCTION get_maintenance_commands()
+RETURNS TABLE (
+    command TEXT,
+    priority INTEGER
+) AS $$
+BEGIN
+    -- Return VACUUM commands for tables that need it
+    RETURN QUERY
+    SELECT 
+        format('VACUUM ANALYZE %I', table_name) AS command,
+        1 AS priority
+    FROM 
+        maintenance_history
+    WHERE 
+        last_vacuum IS NULL 
+        OR last_vacuum < NOW() - INTERVAL '12 hours'
+    ORDER BY 
+        last_vacuum NULLS FIRST;
+
+    -- Also check if we should refresh materialized views
+    IF EXISTS (
+        SELECT 1 
+        FROM pg_matviews 
+        WHERE schemaname = 'public' 
+        AND matviewname = 'balances'
+    ) THEN
+        RETURN QUERY
+        SELECT 
+            'REFRESH MATERIALIZED VIEW CONCURRENTLY balances' AS command,
+            2 AS priority;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Grant permissions to maintenance user
+GRANT EXECUTE ON FUNCTION get_maintenance_commands() TO maintenance;
+GRANT SELECT, INSERT, UPDATE ON maintenance_history TO maintenance;
+
+-- Create a function to update maintenance history after commands are executed
+CREATE OR REPLACE FUNCTION update_maintenance_history(p_table_name TEXT, p_operation TEXT)
+RETURNS VOID AS $$
+BEGIN
+    IF p_operation = 'VACUUM' THEN
+        INSERT INTO maintenance_history (table_name, last_vacuum)
+        VALUES (p_table_name, NOW())
+        ON CONFLICT (table_name) 
+        DO UPDATE SET last_vacuum = EXCLUDED.last_vacuum;
+    ELSIF p_operation = 'ANALYZE' THEN
+        INSERT INTO maintenance_history (table_name, last_analyze)
+        VALUES (p_table_name, NOW())
+        ON CONFLICT (table_name) 
+        DO UPDATE SET last_analyze = EXCLUDED.last_analyze;
+    ELSIF p_operation = 'REINDEX' THEN
+        INSERT INTO maintenance_history (table_name, last_reindex)
+        VALUES (p_table_name, NOW())
+        ON CONFLICT (table_name) 
+        DO UPDATE SET last_reindex = EXCLUDED.last_reindex;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Grant permissions to maintenance user
+GRANT EXECUTE ON FUNCTION update_maintenance_history(TEXT, TEXT) TO maintenance;
 END;
 $$ LANGUAGE plpgsql;
 

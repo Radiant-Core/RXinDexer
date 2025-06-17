@@ -26,7 +26,7 @@ class DatabaseMaintainer:
     """
     Handles scheduled database maintenance tasks to ensure optimal performance.
     Runs periodic tasks like materialized view refreshes, statistics updates,
-    and monitors for potential issues.
+    partition management, and monitors for potential issues.
     """
     
     def __init__(self, db_url=None):
@@ -40,7 +40,8 @@ class DatabaseMaintainer:
             'refresh_views': datetime.now() - timedelta(hours=1),
             'update_stats': datetime.now() - timedelta(hours=1),
             'vacuum': datetime.now() - timedelta(days=1),
-            'monitor': datetime.now() - timedelta(minutes=30)
+            'monitor': datetime.now() - timedelta(minutes=30),
+            'partition_maintenance': datetime.now() - timedelta(hours=1)
         }
     
     def refresh_materialized_views(self):
@@ -111,62 +112,132 @@ class DatabaseMaintainer:
             logger.error(f"Error during VACUUM operation: {str(e)}")
             return False
     
+    def maintain_partitions(self):
+        """Maintain database partitions and ensure they're properly managed"""
+        logger.info("Running partition maintenance")
+        start_time = time.time()
+        
+        try:
+            with self.engine.connect() as conn:
+                # Call the maintain_utxo_partitions function
+                result = conn.execute(text("SELECT * FROM maintain_utxo_partitions()"))
+                
+                # Get partition info for logging
+                partitions = conn.execute(
+                    text("""
+                    SELECT 
+                        partition_name, 
+                        range_start, 
+                        range_end, 
+                        row_count,
+                        pg_size_pretty(pg_total_relation_size(partition_name::regclass)) as size
+                    FROM get_utxo_partition_info()
+                    ORDER BY range_start
+                    """)
+                ).fetchall()
+                
+                # Log partition info
+                logger.info("Current UTXO partitions:")
+                for p in partitions:
+                    logger.info(f"  - {p.partition_name}: Blocks {p.range_start} to {p.range_end}, "
+                               f"{p.row_count} rows, {p.size}")
+                
+                self.last_run['partition_maintenance'] = datetime.now()
+                logger.info(f"Partition maintenance completed in {time.time() - start_time:.2f} seconds")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error during partition maintenance: {str(e)}", exc_info=True)
+            return False
+            
     def monitor_database_health(self):
-        """Check database health and performance metrics"""
+        """Monitor database health and performance"""
         logger.info("Running database health check")
+        start_time = time.time()
         
         try:
             with self.Session() as session:
                 # Check for long-running queries
-                long_queries = session.execute(text("""
-                    SELECT pid, query, EXTRACT(EPOCH FROM (NOW() - query_start)) AS duration_sec
-                    FROM pg_stat_activity
-                    WHERE state = 'active'
-                      AND query NOT LIKE '%pg_stat_activity%'
-                      AND query_start < NOW() - INTERVAL '30 seconds'
-                """)).fetchall()
+                long_queries = session.execute("""
+                    SELECT 
+                        pid, 
+                        now() - query_start as duration, 
+                        query 
+                    FROM pg_stat_activity 
+                    WHERE state = 'active' 
+                    AND query != '<IDLE>' 
+                    AND query NOT LIKE '%pg_stat_activity%'
+                    AND now() - query_start > interval '5 minutes'
+                    ORDER BY duration DESC;
+                """).fetchall()
                 
                 if long_queries:
-                    logger.warning(f"Found {len(long_queries)} long-running queries")
+                    logger.warning(f"Found {len(long_queries)} long-running queries:")
                     for query in long_queries:
-                        logger.warning(f"Query running for {query.duration_sec:.1f}s: {query.query[:100]}...")
+                        logger.warning(f"  - PID {query.pid}: {query.duration} - {query.query[:200]}...")
                 
-                # Check cache hit ratio
-                cache_stats = session.execute(text("""
+                # Check for locks
+                locks = session.execute("""
                     SELECT 
-                        sum(heap_blks_read) as heap_read,
-                        sum(heap_blks_hit) as heap_hit,
-                        sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read)) as ratio
-                    FROM pg_statio_user_tables;
-                """)).fetchone()
+                        blocked_locks.pid AS blocked_pid,
+                        blocked_activity.usename AS blocked_user,
+                        blocking_locks.pid AS blocking_pid,
+                        blocking_activity.usename AS blocking_user,
+                        blocked_activity.query AS blocked_statement,
+                        blocking_activity.query AS blocking_statement
+                    FROM pg_catalog.pg_locks blocked_locks
+                    JOIN pg_catalog.pg_stat_activity blocked_activity 
+                        ON blocked_activity.pid = blocked_locks.pid
+                    JOIN pg_catalog.pg_locks blocking_locks 
+                        ON blocking_locks.locktype = blocked_locks.locktype
+                        AND blocking_locks.DATABASE IS NOT DISTINCT FROM blocked_locks.DATABASE
+                        AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+                        AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+                        AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+                        AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+                        AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+                        AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+                        AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+                        AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+                        AND blocking_locks.pid != blocked_locks.pid
+                    JOIN pg_catalog.pg_stat_activity blocking_activity 
+                        ON blocking_activity.pid = blocking_locks.pid
+                    WHERE NOT blocked_locks.GRANTED;
+                """).fetchall()
                 
-                if cache_stats and cache_stats.ratio:
-                    logger.info(f"Cache hit ratio: {cache_stats.ratio:.2%}")
-                    if cache_stats.ratio < 0.90:
-                        logger.warning("Cache hit ratio is below 90% - consider increasing shared_buffers")
+                if locks:
+                    logger.warning(f"Found {len(locks)} blocking locks:")
+                    for lock in locks:
+                        logger.warning(f"  - Blocked PID {lock.blocked_pid} by {lock.blocking_user} (PID: {lock.blocking_pid})")
+                        logger.warning(f"    Blocked statement: {lock.blocked_statement[:200]}...")
+                        logger.warning(f"    Blocking statement: {lock.blocking_statement[:200]}...")
                 
-                # Check for bloat in tables
-                table_stats = session.execute(text("""
-                    SELECT 
-                        schemaname, 
-                        relname, 
-                        n_dead_tup, 
-                        n_live_tup,
-                        CASE WHEN n_live_tup > 0 THEN n_dead_tup::float / n_live_tup ELSE 0 END as dead_ratio
-                    FROM pg_stat_user_tables
-                    WHERE n_live_tup > 1000
-                    ORDER BY dead_ratio DESC
-                    LIMIT 5
-                """)).fetchall()
+                # Check partition status
+                try:
+                    partition_status = session.execute("""
+                        SELECT 
+                            partition_name, 
+                            range_start, 
+                            range_end, 
+                            row_count,
+                            pg_size_pretty(pg_total_relation_size(partition_name::regclass)) as size
+                        FROM get_utxo_partition_info()
+                        ORDER BY range_start
+                    """).fetchall()
+                    
+                    logger.info("Current UTXO partition status:")
+                    for p in partition_status:
+                        logger.info(f"  - {p.partition_name}: Blocks {p.range_start} to {p.range_end}, "
+                                   f"{p.row_count} rows, {p.size}")
+                except Exception as e:
+                    logger.warning(f"Could not check partition status: {str(e)}")
                 
-                for stat in table_stats:
-                    if stat.dead_ratio > 0.2:  # More than 20% dead tuples
-                        logger.warning(f"Table {stat.relname} has {stat.dead_ratio:.1%} dead tuples - consider VACUUM")
+                self.last_run['monitor'] = datetime.now()
+                logger.info(f"Database health check completed in {time.time() - start_time:.2f}s")
+                return True
                 
-            self.last_run['monitor'] = datetime.now()
-            return True
         except Exception as e:
-            logger.error(f"Error monitoring database health: {str(e)}")
+            logger.error(f"Error during database health check: {str(e)}")
             return False
     
     def run_all_maintenance(self):
@@ -177,8 +248,43 @@ class DatabaseMaintainer:
         self.update_statistics()
         self.run_vacuum()
         self.monitor_database_health()
+        self.maintain_partitions()
         
-        logger.info("Completed all database maintenance tasks")
+        # Run every hour
+        schedule.every().hour.do(self.refresh_materialized_views)
+        
+        # Run every 6 hours
+        schedule.every(6).hours.do(self.update_statistics)
+        
+        # Run daily at 2 AM
+        schedule.every().day.at("02:00").do(self.run_vacuum)
+        
+        # Run every 30 minutes
+        schedule.every(30).minutes.do(self.monitor_database_health)
+        
+        # Run partition maintenance every 6 hours
+        schedule.every(6).hours.do(self.maintain_partitions)
+        
+        logger.info("Scheduled all maintenance tasks")
+    
+    def schedule_tasks(self):
+        """Schedule all maintenance tasks"""
+        # Run every hour
+        schedule.every().hour.do(self.refresh_materialized_views)
+        
+        # Run every 6 hours
+        schedule.every(6).hours.do(self.update_statistics)
+        
+        # Run daily at 2 AM
+        schedule.every().day.at("02:00").do(self.run_vacuum)
+        
+        # Run every 30 minutes
+        schedule.every(30).minutes.do(self.monitor_database_health)
+        
+        # Run partition maintenance every 6 hours
+        schedule.every(6).hours.do(self.maintain_partitions)
+        
+        logger.info("Scheduled all maintenance tasks")
     
     def start_scheduler(self):
         """Start the maintenance scheduler in a background thread"""
@@ -186,11 +292,7 @@ class DatabaseMaintainer:
             logger.warning("Scheduler is already running")
             return False
         
-        # Schedule regular maintenance tasks
-        schedule.every(10).minutes.do(self.refresh_materialized_views)
-        schedule.every(30).minutes.do(self.update_statistics)
-        schedule.every(1).days.do(self.run_vacuum)
-        schedule.every(5).minutes.do(self.monitor_database_health)
+        self.schedule_tasks()
         
         def run_scheduler():
             self.running = True
@@ -231,7 +333,7 @@ def main():
     parser.add_argument('--update-stats', action='store_true', help='Only update statistics')
     parser.add_argument('--vacuum', action='store_true', help='Only run VACUUM')
     parser.add_argument('--monitor', action='store_true', help='Only run health monitoring')
-    
+    parser.add_argument('--partitions', action='store_true', help='Run partition maintenance only')
     args = parser.parse_args()
     maintainer = DatabaseMaintainer()
     
@@ -245,6 +347,8 @@ def main():
         maintainer.run_vacuum()
     elif args.monitor:
         maintainer.monitor_database_health()
+    elif args.partitions:
+        maintainer.maintain_partitions()
     elif args.daemon:
         maintainer.start_scheduler()
         try:

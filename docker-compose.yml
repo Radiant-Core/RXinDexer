@@ -14,7 +14,7 @@ services:
       - "0.0.0.0:8000:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/rxindexer
-      - RADIANT_RPC_URL=http://radiant:7332
+      - RADIANT_RPC_URL=http://rxindexer-radiant:7332
       - RADIANT_RPC_USER=rxin
       - RADIANT_RPC_PASSWORD=securepassword
       - REDIS_HOST=redis
@@ -48,6 +48,26 @@ services:
       retries: 5
       start_period: 60s
 
+  # Database initialization service
+  rxindexer-db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rxindexer-db-init
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/rxindexer
+      - LOG_LEVEL=INFO
+      - IN_DOCKER=true
+      - PYTHONPATH=/app
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python3 create_tables.py
+    networks:
+      - rxindexer-network
+    depends_on:
+      - db
+
   # RXinDexer Indexer service
   rxindexer-indexer:
     build:
@@ -57,20 +77,21 @@ services:
     restart: unless-stopped
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/rxindexer
-      - RADIANT_RPC_URL=http://radiant:7332
+      - RADIANT_RPC_URL=http://rxindexer-radiant:7332
       - RADIANT_RPC_USER=rxin
       - RADIANT_RPC_PASSWORD=securepassword
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - LOG_LEVEL=INFO
       - IN_DOCKER=true
-      - IN_INDEXER=true # Explicitly mark as indexer context
+      - IN_INDEXER=true
       # Reduced sync parameters to prevent RPC overload
-      - SYNC_BATCH_SIZE=1000
-      - SYNC_MAX_WORKERS=8
-      - UTXO_MAX_WORKERS=4
-      - BLOCK_PARALLEL_THRESHOLD=25
-      - RPC_RATE_LIMIT=10
+      - SYNC_BATCH_SIZE=200
+      - SYNC_MAX_WORKERS=2
+      - UTXO_MAX_WORKERS=1
+      - BLOCK_PARALLEL_THRESHOLD=50
+      - RPC_RATE_LIMIT=2
+      - RPC_MIN_REQUEST_INTERVAL=0.5
       - PROGRESSIVE_SYNC=true
       - INITIAL_SYNC_MINIMAL=true
       - USE_REDIS_CACHE=true
@@ -78,21 +99,49 @@ services:
       - RADIANT_RPC_TIMEOUT=60
       - CONNECTION_RETRY_DELAY=5
       - GLYPH_DEEP_INDEXING=true
+      - START_INDEXER=true
+      # Circuit breaker settings - more lenient to ensure sync can continue
+      - CIRCUIT_FAILURE_THRESHOLD=20
+      - CIRCUIT_RESET_TIMEOUT=10
+      - CIRCUIT_HALF_OPEN_TIMEOUT=5
     volumes:
       - ./logs:/app/logs
+      - .:/app
+    working_dir: /app
     depends_on:
-      - db
-      - redis
-      - radiant
-    command: ["python", "sync/rxindex_sync.py"] # Command is properly passed through entrypoint now
+      rxindexer-db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      radiant:
+        condition: service_healthy
+    command: >
+      bash -c "
+        # Wait for database to be ready
+        until pg_isready -h db -U postgres; do
+          echo 'Waiting for database to be ready...';
+          sleep 2;
+        done;
+        
+        # Check if database is initialized
+        until PGPASSWORD=postgres psql -h db -U postgres -d rxindexer -c 'SELECT 1' >/dev/null 2>&1; do
+          echo 'Waiting for database to be initialized...';
+          sleep 2;
+        done;
+        
+        # Start the indexer in continuous mode
+        echo 'Starting indexer in continuous mode...';
+        # Only use the --continuous flag (sync-only is false by default when not specified)
+        python -m src.indexer --continuous
+      "
     networks:
       - rxindexer-network
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "python sync/rxindex_sync.py"]
+      test: ["CMD-SHELL", "pgrep -f 'python.*src.indexer' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
 
   # PostgreSQL database with optimizations
   db:
@@ -103,36 +152,91 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=rxindexer
-      - POSTGRES_MAX_CONNECTIONS=100
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      # Disable password authentication for local connections
+      - POSTGRES_HOST_AUTH_METHOD=trust
+      # Performance tuning
+      - shared_buffers=2GB
+      - effective_cache_size=6GB
+      - maintenance_work_mem=512MB
+      - work_mem=16MB
+      - random_page_cost=1.1
+      - effective_io_concurrency=200
+      - max_worker_processes=8
+      - max_parallel_workers_per_gather=4
+      - max_parallel_workers=8
+      - max_parallel_maintenance_workers=4
+      - wal_level=logical
+      - max_wal_size=2GB
+      - min_wal_size=1GB
+      - checkpoint_completion_target=0.9
+      - default_statistics_target=100
+      - log_min_duration_statement=2000
+      - log_checkpoints=on
+      - log_connections=on
+      - log_disconnections=on
+      - log_lock_waits=on
+      - log_temp_files=0
+      - log_autovacuum_min_duration=0
+      - "log_line_prefix='%t [%p]: [%l-1] db=%d,user=%u,app=%a,client=%h '"
+      - log_statement=ddl
+      - log_min_messages=warning
+      - log_min_error_statement=error
+      - track_io_timing=on
+      - track_activity_query_size=16384
+      - idle_in_transaction_session_timeout=60000
+      - statement_timeout=30000
+      - lock_timeout=10000
+      - deadlock_timeout=1s
+      - max_locks_per_transaction=128
+      - max_connections=200
+      - shared_preload_libraries=pg_stat_statements,pg_stat_plans,pgaudit,pg_cron,pg_partman_bgw,pg_repack
+      - pg_stat_statements.track=all
+      - pg_stat_statements.max=10000
+      - pg_stat_plans.track=all
+      - pg_stat_plans.track_planning=on
+      - pg_stat_plans.max=1000
+      - cron.database_name=rxindexer
+      - pgaudit.log=all
+      - pgaudit.log_catalog=off
+      - pgaudit.log_parameter=on
+      - pgaudit.log_relation=on
+      - pgaudit.log_statement_once=on
+      - pgaudit.log_level=log
     volumes:
-      # Mount custom PostgreSQL configuration file
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/db-init-scripts:/docker-entrypoint-initdb.d
+      - ./scripts/init-db-with-partitioning.sql:/docker-entrypoint-initdb.d/00-init-db-with-partitioning.sql
+      - ./scripts/db_maintenance.sql:/docker-entrypoint-initdb.d/99-db-maintenance.sql
+      - ./docker/pg_hba_custom.conf:/etc/postgresql/pg_hba.conf
       - ./docker/postgresql.conf:/etc/postgresql/postgresql.conf
-      # Mount initialization scripts with all database optimizations
-      - ./docker/postgresql-init.sql:/docker-entrypoint-initdb.d/01-init-optimizations.sql
-      - ./fix_ambiguous_column.sql:/docker-entrypoint-initdb.d/02-fix-ambiguous-column.sql
-      - ./fix_query_stats.sql:/docker-entrypoint-initdb.d/03-fix-query-stats.sql
-      - ./final_temp_table_fix.sql:/docker-entrypoint-initdb.d/04-final-temp-table-fix.sql
-      - postgres-data:/var/lib/postgresql/data
-    command: ["-c", "config_file=/etc/postgresql/postgresql.conf"]
-    # CPU and memory constraints to prevent overwhelming the host
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4G
-        reservations:
-          cpus: '0.5'
-          memory: 1G
+      - db_backups:/backups
+    command: [
+      "postgres",
+      "-c", "hba_file=/etc/postgresql/pg_hba.conf",
+      "-c", "config_file=/etc/postgresql/postgresql.conf",
+      "-c", "log_connections=on",
+      "-c", "log_disconnections=on",
+      "-c", "log_statement=all"
+    ]
     ports:
       - "5432:5432"
     networks:
       - rxindexer-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rxindexer"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
 
   # Redis cache with optimizations
   redis:
@@ -140,7 +244,7 @@ services:
     container_name: rxindexer-redis
     restart: unless-stopped
     volumes:
-      - redis-data:/data
+      - redis_data:/data
     command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
     ports:
       - "6379:6379"
@@ -165,7 +269,7 @@ services:
     container_name: rxindexer-radiant
     restart: unless-stopped
     volumes:
-      - radiant-data:/data/.radiant
+      - radiant_data:/data/.radiant
       - ./docker/radiant.conf:/data/.radiant/radiant.conf
     ports:
       - "7332:7332"
@@ -184,28 +288,45 @@ services:
   rxindexer-db-maintenance:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile.db-maintenance
     container_name: rxindexer-db-maintenance
     restart: unless-stopped
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/rxindexer
-      - LOG_LEVEL=INFO
+    user: postgres
     depends_on:
-      - db
-    command: ["python", "-m", "src.utils.db_maintenance", "--daemon"]
+      db:
+        condition: service_healthy
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=rxindexer
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - MAINTENANCE_USER=postgres
+      - MAINTENANCE_WINDOW_START=02:00
+      - MAINTENANCE_WINDOW_END=04:00
+      - PGTZ=UTC
+    volumes:
+      - ./db_maintenance.sql:/app/db_maintenance.sql
+      - ./scripts/run_maintenance.sh:/scripts/run_maintenance.sh
+      - ./logs:/app/logs
     networks:
       - rxindexer-network
     healthcheck:
-      test: ["CMD-SHELL", "bash /tmp/db_maintenance_healthcheck.sh"]
+      test: ["CMD-SHELL", "pg_isready -h db -U postgres -d rxindexer -t 10 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 30s
+    command: >
+      sh -c "chmod +x /scripts/run_maintenance.sh && 
+             /scripts/run_maintenance.sh"
     deploy:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 1G
+        reservations:
+          cpus: '0.2'
+          memory: 256M
 
   # Monitoring dashboard
   rxindexer-monitoring:
@@ -217,7 +338,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - grafana-data:/var/lib/grafana
+      - grafana_data:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning
     networks:
       - rxindexer-network
@@ -231,22 +352,54 @@ services:
       - "9090:9090"
     volumes:
       - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - prometheus_data:/prometheus
+    command: --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --web.console.libraries=/usr/share/prometheus/console_libraries --web.console.templates=/usr/share/prometheus/consoles
     networks:
       - rxindexer-network
+
+  # Grafana service for monitoring
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: rxindexer-grafana
+    restart: unless-stopped
+    ports:
+      - "4000:3000"
+    volumes:
+      - grafana_storage:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - db
+    networks:
+      - rxindexer-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 networks:
   rxindexer-network:
     driver: bridge
 
 volumes:
-  postgres-data:
-  redis-data:
-  radiant-data:
-  grafana-data:
-  prometheus-data:
+  # Database volumes
+  postgres_data: {}
+  redis_data: {}
+  radiant_data: {}
+  
+  # Monitoring volumes
+  grafana_storage: {}
+  grafana_data: {}
+  prometheus_data: {}
+  
+  # Backup volume for database maintenance
+  db_backups: {}
+  
+  # Scripts and logs
+  db_scripts: {}
+  db_logs: {}

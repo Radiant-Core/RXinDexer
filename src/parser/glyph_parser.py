@@ -7,7 +7,7 @@ import json
 import cbor2
 from typing import Dict, List, Any, Optional, Set
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, func
 
 from src.models import UTXO, GlyphToken, Holder
 from src.sync.rpc_client import RadiantRPC
@@ -189,7 +189,7 @@ class GlyphParser:
         addresses_with_tokens = list(address_tokens.keys())
         holders_to_update = self.db.query(Holder).filter(
             Holder.address.notin_(addresses_with_tokens),
-            func.jsonb_object_length(Holder.token_balances) > 0
+            (Holder.token_balances != '{}') & (Holder.token_balances != 'null')
         ).all()
         
         for holder in holders_to_update:

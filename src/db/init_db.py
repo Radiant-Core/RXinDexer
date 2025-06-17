@@ -97,11 +97,11 @@ def apply_migrations():
                 # Reset the sync state to ensure we're not stuck
                 current_time = time.time()
                 try:
-                    # Use to_timestamp function for proper timestamp conversion
+                    # Use NOW() function for proper timestamp conversion directly in SQL
                     reset_sql = """
                     UPDATE sync_state 
                     SET is_syncing = 0, 
-                        last_updated_at = to_timestamp(extract(epoch from now())),
+                        last_updated_at = NOW(),
                         last_error = 'Reset during migration' 
                     WHERE is_syncing = 1
                     """

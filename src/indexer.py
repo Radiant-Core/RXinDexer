@@ -90,6 +90,22 @@ def main():
     """Main entry point for the indexer."""
     args = parse_args()
     
+    # Debug logging for command-line arguments
+    logger.info(f"Command-line arguments: {vars(args)}")
+    logger.info(f"sync_only flag: {args.sync_only}")
+    logger.info(f"continuous flag: {args.continuous}")
+    
+    # Check for environment variable to override flags (in Docker environment)
+    # This ensures the indexer runs continuously when deployed with Docker
+    if os.environ.get('START_INDEXER') == 'true':
+        if args.sync_only:
+            logger.info("START_INDEXER=true detected, overriding sync-only flag")
+            args.sync_only = False
+        if not args.continuous:
+            logger.info("START_INDEXER=true detected, enabling continuous mode")
+            args.continuous = True
+    
+    
     # Get database session
     db = next(get_db())
     

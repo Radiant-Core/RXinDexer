@@ -1,0 +1,57 @@
+services:
+  rxindexer-api:
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONPATH=/app
+      - SYNC_WORKERS=4
+      - RPC_POOL_SIZE=6
+      - SYNC_MAX_WORKERS=6
+      - RPC_MIN_REQUEST_INTERVAL=0.1
+      - SYNC_BATCH_SIZE=1000
+      - CHECKPOINT_INTERVAL=100
+    command: ["python", "docker-entry.py"]
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  rxindexer-indexer:
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONPATH=/app
+      - SYNC_WORKERS=4
+      - RPC_POOL_SIZE=6
+      - SYNC_MAX_WORKERS=6
+      - RPC_MIN_REQUEST_INTERVAL=0.1
+      - SYNC_BATCH_SIZE=1000
+      - CHECKPOINT_INTERVAL=100
+      - LOG_LEVEL=INFO
+    command: ["python", "docker-indexer-entry.py"]
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+
+  rxindexer-db-maintenance:
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONPATH=/app
+    command: ["sleep", "infinity"]
+
+  db:
+    environment:
+      - POSTGRES_MAX_CONNECTIONS=200
+      - POSTGRES_SHARED_BUFFERS=1GB
+      - POSTGRES_WORK_MEM=16MB
+      - POSTGRES_MAINTENANCE_WORK_MEM=256MB
+      - POSTGRES_EFFECTIVE_CACHE_SIZE=2GB
+      - POSTGRES_RANDOM_PAGE_COST=1.1
+      - POSTGRES_EFFECTIVE_IO_CONCURRENCY=200
+
+  redis:
+    command: redis-server --maxclients 10000 --maxmemory 1gb --maxmemory-policy allkeys-lru

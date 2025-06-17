@@ -798,12 +798,24 @@ class RXinDexerSync:
                         self.bloom_filter.add(tx_id)
                     return
                 
-                # Insert transaction
+                # Insert transaction with all required fields
                 cur.execute("""
-                    INSERT INTO transactions (txid, block_height, block_hash, timestamp, created_at)
-                    VALUES (%s, %s, %s, TO_TIMESTAMP(%s), NOW())
+                    INSERT INTO transactions (
+                        txid, version, block_hash, block_height, 
+                        locktime, size, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, NOW(), NOW()
+                    )
                     ON CONFLICT (txid) DO NOTHING
-                """, (tx_id, height, block_hash, tx_timestamp))
+                """, (
+                    tx_id,  # txid
+                    tx.get('version', 1),  # version
+                    block_hash,  # block_hash
+                    height,  # block_height
+                    tx.get('locktime', 0),  # locktime
+                    tx.get('size', 0) or len(tx.get('hex', '')) // 2  # size (from hex if size not provided)
+                ))
                 
                 # Process inputs (mark UTXOs as spent)
                 vin = tx.get('vin', [])
@@ -1038,12 +1050,27 @@ class RXinDexerSync:
                     logger.info(f"Block {height} already processed, skipping")
                     return True
                 
-                # Insert block
+                # Insert block with all required fields and proper defaults
                 cur.execute("""
-                    INSERT INTO blocks (height, hash, timestamp, created_at)
-                    VALUES (%s, %s, TO_TIMESTAMP(%s), NOW())
+                    INSERT INTO blocks (
+                        height, hash, version, prev_hash, merkle_root, 
+                        timestamp, bits, nonce, chainwork, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, NOW(), NOW()
+                    )
                     ON CONFLICT (hash) DO NOTHING
-                """, (height, block_hash, block_timestamp))
+                """, (
+                    height, 
+                    block_hash,
+                    block_data.get('version', 1),           # version
+                    block_data.get('previousblockhash', ''),  # prev_hash
+                    block_data.get('merkleroot', ''),         # merkle_root
+                    int(block_timestamp),                     # timestamp
+                    block_data.get('bits', ''),               # bits
+                    block_data.get('nonce', 0),               # nonce
+                    block_data.get('chainwork', '')           # chainwork
+                ))
                 
                 # Process transactions sequentially (no parallelism to prevent connection issues)
                 transactions = block_data.get('tx', [])

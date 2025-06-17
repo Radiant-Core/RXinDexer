@@ -4,9 +4,11 @@
 
 import logging
 import time
+import traceback
 from typing import Dict, List, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from src.models import get_db, GlyphToken, UTXO
 from src.utils.pagination import PaginationParams, paginate_results
@@ -89,28 +91,71 @@ async def list_tokens(
     Returns:
         List of tokens matching the criteria
     """
-    # Build query
-    query = db.query(GlyphToken)
-    
-    if token_type:
-        query = query.filter(GlyphToken.type == token_type)
-    
-    # Apply pagination
-    results, pagination_data = paginate_results(query, pagination)
-    
-    # Format tokens
-    tokens = []
-    for token in results:
-        tokens.append({
-            "ref": token.ref,
-            "type": token.type,
-            "genesis_block_height": token.genesis_block_height
-        })
-    
-    return {
-        "tokens": tokens,
-        "pagination": pagination_data
-    }
+    try:
+        # Check if glyph_tokens table exists before attempting to query
+        dialect = db.bind.dialect.name
+        table_exists = False
+        
+        try:
+            if dialect == 'postgresql':
+                table_exists = db.execute(
+                    text("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'glyph_tokens')")
+                ).scalar()
+            elif dialect == 'sqlite':
+                table_exists = db.execute(
+                    text("SELECT EXISTS (SELECT name FROM sqlite_master WHERE type='table' AND name='glyph_tokens')")
+                ).scalar()
+            else:
+                logger.warning(f"Unsupported dialect {dialect}, attempting to check table existence anyway")
+                # Fallback approach - try querying the table, will raise exception if it doesn't exist
+                db.query(GlyphToken).limit(1).all()
+                table_exists = True
+        except Exception as e:
+            logger.error(f"Error checking if glyph_tokens table exists: {str(e)}")
+            table_exists = False
+        
+        if not table_exists:
+            logger.warning("glyph_tokens table does not exist, returning empty list")
+            return {
+                "tokens": [],
+                "count": 0,
+                "message": "Token data not yet available"
+            }
+        
+        # Table exists, proceed with normal query
+        # Build query
+        query = db.query(GlyphToken)
+        
+        if token_type:
+            query = query.filter(GlyphToken.type == token_type)
+        
+        # Apply pagination
+        results, pagination_data = paginate_results(query, pagination)
+        
+        # Format tokens
+        tokens = []
+        for token in results:
+            tokens.append({
+                "ref": token.ref,
+                "type": token.type,
+                "genesis_block_height": token.genesis_block_height
+            })
+        
+        return {
+            "tokens": tokens,
+            "pagination": pagination_data
+        }
+    except Exception as e:
+        logger.error(f"Error in list_tokens: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        # Return a graceful fallback response
+        return {
+            "tokens": [],
+            "count": 0,
+            "message": "Error retrieving token data: " + str(e),
+            "error_type": type(e).__name__
+        }
 
 @router.get("/{ref}/history")
 @cache_decorator(ttl=CACHE_TTL)

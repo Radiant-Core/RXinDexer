@@ -2,6 +2,11 @@
 # This file contains all the dependencies required for the RXinDexer project.
 # It lists specific versions to ensure compatibility across development and production environments.
 
+# Core Dependencies
+psycopg2-binary>=2.9.9
+redis>=5.0.8
+python-bitcoinrpc>=1.0
+
 # Radiant Node RPC Communication
 python-bitcoinrpc==1.0
 
@@ -15,11 +20,7 @@ pydantic==2.6.1
 
 # Database ORM and Connection
 sqlalchemy==2.0.35
-psycopg2-binary==2.9.9
 alembic==1.13.1
-
-# Caching
-redis==5.0.8
 
 # Testing
 pytest==8.3.3

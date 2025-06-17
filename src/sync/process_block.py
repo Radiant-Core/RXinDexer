@@ -1,8 +1,12 @@
 # /Users/radiant/Desktop/RXinDexer/src/sync/process_block.py
 # This file contains the process_block implementation for the SyncManager class
 # It handles individual block processing with transaction safety
-from sqlalchemy import text, func
+from sqlalchemy import text
+from datetime import datetime
 import logging
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 def process_block(self, block_data, height, block_hash):
     """
@@ -24,7 +28,7 @@ def process_block(self, block_data, height, block_hash):
         with self.db.begin():
             self.sync_state.current_height = height
             self.sync_state.current_hash = block_hash
-            self.sync_state.last_updated_at = func.now()
+            self.sync_state.last_updated_at = datetime.now()
             self.db.commit()
             
         return True

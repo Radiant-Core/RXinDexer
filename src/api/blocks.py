@@ -6,7 +6,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
+from sqlalchemy import desc, text
 
 # Import security module for API key authentication
 from src.api.security import get_api_key
@@ -20,6 +20,77 @@ router = APIRouter(
     dependencies=[Depends(get_api_key)]
 )
 logger = logging.getLogger(__name__)
+
+@router.get("/recent", response_model=Dict[str, Any])
+async def get_recent_blocks(
+    limit: Optional[int] = Query(10, description="Number of recent blocks to retrieve", ge=1, le=100),
+    db: Session = Depends(get_db),
+    api_key: str = Depends(get_api_key)
+) -> Dict[str, Any]:
+    """
+    Get the most recent blocks from the blockchain.
+    
+    Returns information about the most recently added blocks including:
+    - Block height
+    - Block hash
+    - Timestamp
+    - Transaction count
+    - Block size
+    - Mining difficulty
+    
+    Returns an empty array if no blocks are available in the database.
+    """
+    try:
+        # Check if blocks table exists and has data
+        table_check = db.execute(
+            text("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'blocks')")
+        ).scalar()
+        
+        if not table_check:
+            logger.warning("Blocks table does not exist in database")
+            return {"blocks": [], "count": 0, "message": "Blockchain data not yet initialized"}
+        
+        # Use raw SQL for better performance that matches the actual database schema
+        result = db.execute(
+            text("""
+            SELECT b.height, b.hash, b.timestamp, 
+                   (SELECT COUNT(*) FROM utxos WHERE block_height = b.height) as transaction_count,
+                   b.version, b.bits
+            FROM blocks b
+            ORDER BY b.height DESC
+            LIMIT :limit
+            """),
+            {"limit": limit}
+        ).fetchall()
+        
+        blocks = []
+        for row in result:
+            # Convert timestamp to Unix timestamp for consistent API responses
+            timestamp = row[2]  # timestamp is already stored as an integer (Unix timestamp)
+            
+            blocks.append({
+                "height": row[0],
+                "hash": row[1],
+                "timestamp": timestamp,
+                "tx_count": row[3],
+                "version": row[4],
+                "bits": row[5]  # bits is related to difficulty
+            })
+        
+        if not blocks:
+            return {"blocks": [], "count": 0, "message": "No block data available"}
+            
+        return {"blocks": blocks, "count": len(blocks)}
+    except Exception as e:
+        logger.error(f"Error retrieving recent blocks: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail={
+                "error": "Error retrieving block data", 
+                "message": str(e),
+                "type": type(e).__name__
+            }
+        )
 
 @router.get("/latest")
 async def get_latest_block(
@@ -142,7 +213,7 @@ async def get_block(
                 "hash": block_data["hash"],
                 "timestamp": block_data["time"],
                 "size": block_data["size"],
-                "transactions_count": len(block_data["tx"]),
+                "transaction_count": len(block_data["tx"]),
                 "source": "rpc"
             }
         
@@ -152,8 +223,7 @@ async def get_block(
             "hash": block.hash,
             "timestamp": block.timestamp,
             "size": block.size,
-            "transactions_count": block.transactions_count,
-            "median_fee": block.median_fee,
+            "transaction_count": block.tx_count,  # Fixed attribute name to match database column
             "source": "database"
         }
         
