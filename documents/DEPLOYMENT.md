@@ -24,7 +24,7 @@ This starts all services:
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
 | RAM | 8 GB | 16 GB |
-| Storage | 200 GB SSD | 500 GB NVMe |
+| Storage | 250 GB SSD | 500 GB NVMe |
 | CPU | 4 cores | 8 cores |
 
 ### macOS Users (CRITICAL)
@@ -82,7 +82,7 @@ SELECT COUNT(*) as wallets, MAX(last_updated) as last_refresh FROM wallet_balanc
 ### Prerequisites
 - Docker & Docker Compose v2+
 - OrbStack (macOS) or Docker Desktop
-- 200+ GB free disk space
+- 250+ GB free disk space
 
 ### Fresh Install
 ```bash

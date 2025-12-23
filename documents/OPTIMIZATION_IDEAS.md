@@ -96,4 +96,4 @@ effective_io_concurrency = 200  # SSD can handle parallel I/O
 - **Live performance issues**: Apply PostgreSQL tuning
 - **Frequent re-indexing**: Consider Idea 5 (hybrid approach)
 
-Last updated: Dec 2024
+Last updated: Dec 2025
