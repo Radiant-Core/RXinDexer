@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+requests
+sqlalchemy
+pydantic
+psycopg2-binary
+alembic
+mako
+psutil
+uvloop
+httptools

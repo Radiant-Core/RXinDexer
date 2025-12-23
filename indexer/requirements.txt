@@ -1,0 +1,5 @@
+requests
+sqlalchemy
+psycopg2-binary
+cbor2
+alembic

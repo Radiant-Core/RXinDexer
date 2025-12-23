@@ -1,0 +1,22 @@
+# Local-only folders (keep docker build context small)
+explorer/
+rxd-glyph-explorer-main/
+radiant-node/
+
+# Git
+.git/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# macOS
+.DS_Store

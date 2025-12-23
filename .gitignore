@@ -1,0 +1,28 @@
+# Local-only folders (not part of the indexer repo)
+explorer/
+rxd-glyph-explorer-main/
+radiant-node/
+
+# Backups / artifacts
+*.bak
+*.prof
+alembic/versions/deprecated/
+alembic/versions/backup_*/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# Environment files
+.env
+
+# Node
+node_modules/
+
+# macOS
+.DS_Store

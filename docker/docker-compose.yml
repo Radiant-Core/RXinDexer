@@ -1,0 +1,190 @@
+services:
+  radiant-node:
+    build:
+      context: ..
+      dockerfile: docker/radiant-node.Dockerfile
+      args:
+        RADIANT_NODE_REPO: https://github.com/Radiant-Core/Radiant-Core.git
+        RADIANT_NODE_REF: master
+    image: radiant-node-git
+    container_name: radiant-node
+    ports:
+      - "7332:7332"
+      - "7333:7333"
+    restart: unless-stopped
+    volumes:
+      - ./radiant.conf:/root/.radiant/radiant.conf:ro
+      - radiant-data:/root/.radiant  # CRITICAL: Persistent blockchain data storage
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '4.0'
+        reservations:
+          memory: 2G
+          cpus: '2.0'
+    command: ["-rpcworkqueue=16", "-rpcthreads=8", "-rest", "-server", "-rpcallowip=0.0.0.0/0", "-txindex=1", "-rpcuser=dockeruser", "-rpcpassword=dockerpass", "-dbcache=1024", "-maxconnections=16"]
+
+  db:
+    image: postgres:15
+    container_name: rxindexer-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rxindexer
+      POSTGRES_USER: rxindexer
+      POSTGRES_PASSWORD: rxindexerpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-tuning.conf:/etc/postgresql/postgresql.conf:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    shm_size: 4gb
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rxindexer -d rxindexer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+    image: rxindexer-api
+    container_name: rxindexer-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - radiant-node
+      - db
+    # Restart API container on failure to ensure Alembic migrations retry until DB is ready
+    restart: on-failure
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"
+    volumes:
+      - ..:/app
+    environment:
+      - RADIANT_NODE_HOST=radiant-node
+      - RADIANT_NODE_RPCUSER=dockeruser
+      - RADIANT_NODE_RPCPASSWORD=dockerpass
+      - RADIANT_NODE_RPCPORT=7332
+      - RADIANT_NODE_RESTPORT=7333
+      - POSTGRES_DB=rxindexer
+      - POSTGRES_USER=rxindexer
+      - POSTGRES_PASSWORD=rxindexerpass
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - PYTHONUNBUFFERED=1
+
+  indexer:
+    build:
+      context: ..
+      dockerfile: indexer/Dockerfile
+    image: rxindexer-indexer
+    container_name: rxindexer-indexer
+    depends_on:
+      - radiant-node
+      - db
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"
+    environment:
+      - RADIANT_NODE_HOST=radiant-node
+      - RADIANT_NODE_RPCUSER=dockeruser
+      - RADIANT_NODE_RPCPASSWORD=dockerpass
+      - RADIANT_NODE_RPCPORT=7332
+      - RADIANT_NODE_RESTPORT=7333
+      - POSTGRES_DB=rxindexer
+      - POSTGRES_USER=rxindexer
+      - POSTGRES_PASSWORD=rxindexerpass
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - PYTHONUNBUFFERED=1
+      # Automated backfills are lag-gated and time-sliced so block sync never stalls.
+      - ENABLE_AUTOMATED_BACKFILLS=1
+      - BACKFILL_MAX_SYNC_LAG=10
+      - SPENT_BACKFILL_TIME_BUDGET_SECONDS=30
+      - BACKFILL_LOOP_SLEEP_SECONDS=60
+      - SPENT_BACKFILL_TIME_BUDGET_SECONDS_NEAR_SYNC=60
+      - BACKFILL_LOOP_SLEEP_SECONDS_NEAR_SYNC=30
+      - SPENT_BACKFILL_SLEEP_SECONDS_NEAR_SYNC=0.05
+      - SPENT_BACKFILL_BATCH_SIZE_NEAR_SYNC=20000
+      - SPENT_BACKFILL_TIME_BUDGET_SECONDS_CAUGHT_UP=200
+      - BACKFILL_LOOP_SLEEP_SECONDS_CAUGHT_UP=10
+      - SPENT_BACKFILL_SLEEP_SECONDS_CAUGHT_UP=0
+      - SPENT_BACKFILL_BATCH_SIZE_CAUGHT_UP=100000
+      - SYNC_POLL_INTERVAL_CAUGHT_UP=120
+      # Spent backfill chunking controls
+      - SPENT_BACKFILL_BATCH_SIZE=10000
+      - SPENT_BACKFILL_SLEEP_SECONDS=0.1
+      # AUTOMATIC SPENT CHECK MODE:
+      # auto = Skip spent checks when sync lag > threshold (default, recommended)
+      # 1 = Always skip (manual bulk sync mode)
+      # 0 = Never skip (always process spent checks)
+      - SKIP_SPENT_CHECK=auto
+      - SKIP_SPENT_CHECK_THRESHOLD=1000
+      # Use PostgreSQL COPY for bulk inserts (5-10x faster)
+      - USE_COPY=1
+    volumes:
+      - ..:/app
+
+  # Balance refresh service - updates wallet_balances cache every 5 minutes
+  balance-refresh:
+    build:
+      context: ..
+      dockerfile: indexer/Dockerfile
+    image: rxindexer-indexer
+    container_name: rxindexer-balance-refresh
+    depends_on:
+      - db
+      - radiant-node
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      - RADIANT_NODE_HOST=radiant-node
+      - RADIANT_NODE_RPCUSER=dockeruser
+      - RADIANT_NODE_RPCPASSWORD=dockerpass
+      - RADIANT_NODE_RPCPORT=7332
+      - POSTGRES_DB=rxindexer
+      - POSTGRES_USER=rxindexer
+      - POSTGRES_PASSWORD=rxindexerpass
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ..:/app
+    command: ["python", "/app/indexer/refresh_balances.py", "--daemon", "--interval", "5"]
+
+  # Weekly cleanup service - removes dangling images, build cache, orphaned volumes
+  cleanup:
+    image: docker:cli
+    container_name: rxindexer-cleanup
+    restart: "no"
+    profiles: ["maintenance"]  # Only runs when explicitly called
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./cleanup.sh:/cleanup.sh:ro
+    entrypoint: ["/bin/sh", "/cleanup.sh"]
+
+volumes:
+  pgdata:
+  radiant-data:  # Persistent blockchain data storage for radiant-node
