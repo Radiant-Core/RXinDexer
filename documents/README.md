@@ -99,6 +99,99 @@ For deeper development notes (testing, architecture, conventions):
 Full endpoint list (authoritative):
 - [API Reference](API.md)
 
+## API Examples
+
+### Health
+
+```bash
+curl http://localhost:8000/health
+```
+
+Example response:
+```json
+{
+  "status": "healthy",
+  "service": "rxindexer-api"
+}
+```
+
+### Recent blocks
+
+```bash
+curl "http://localhost:8000/blocks/recent?limit=5"
+```
+
+Example response:
+```json
+[
+  {
+    "hash": "<block_hash>",
+    "height": 123456,
+    "time": 1700000000,
+    "tx": [],
+    "tx_count": 1234
+  }
+]
+```
+
+### Transaction details
+
+```bash
+curl http://localhost:8000/transaction/<txid>
+```
+
+### Address UTXOs
+
+```bash
+curl "http://localhost:8000/address/<address>/utxos?page=1&limit=50"
+```
+
+### Token analytics
+
+```bash
+curl "http://localhost:8000/tokens/<token_id>/holders?limit=25&offset=0"
+curl "http://localhost:8000/tokens/<token_id>/supply"
+curl "http://localhost:8000/tokens/<token_id>/trades?limit=50"
+curl "http://localhost:8000/tokens/<token_id>/ohlcv?days=30"
+```
+
+Example supply response:
+```json
+{
+  "token_id": "<token_ref>",
+  "type": "ft",
+  "max_supply": null,
+  "circulating_supply": 123456789,
+  "burned_supply": 0,
+  "minted_supply": 123456789,
+  "percent_minted": null,
+  "holder_count": 42
+}
+```
+
+### Market
+
+```bash
+curl http://localhost:8000/market/rxd
+curl "http://localhost:8000/market/swaps?limit=25"
+curl "http://localhost:8000/market/trades?limit=25"
+curl "http://localhost:8000/market/volume?days=7"
+```
+
+## Data Freshness & Backfill Notes
+
+RXinDexer prioritizes fast initial sync and backfills certain derived data after it catches up.
+
+- **Spent backfill gating**
+  - During catchup, spent checks may be delayed and backfilled later.
+  - While this backfill is incomplete, some endpoints intentionally return conservative results to avoid serving incorrect data.
+  - Example: `GET /wallets/top` may return an empty list until spent backfill is complete.
+- **Token supply during catchup**
+  - Some token supply calculations depend on either holder-derived balances or reliable `spent=false` UTXO status.
+  - If spent backfill is incomplete, `GET /tokens/{token_id}/supply` may return `circulating_supply: null`.
+
+Operational details: see [Deployment Guide](DEPLOYMENT.md).
+
 ## Documentation
 
 | Document | Description |
