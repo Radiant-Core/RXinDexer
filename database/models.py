@@ -192,7 +192,7 @@ class GlyphToken(Base):
     # Contract fields (for dMint tokens)
     contract_references = Column(JSON)
     difficulty = Column(Integer)
-    max_height = Column(Integer, nullable=True)
+    max_height = Column(BigInteger, nullable=True)
     reward = Column(BigInteger, nullable=True)
     num_contracts = Column(Integer, nullable=True)
     
@@ -605,7 +605,7 @@ class Contract(Base):
     
     # Mining parameters
     height = Column(Integer, default=0)  # Current block height
-    max_height = Column(Integer, default=0)  # Maximum block height for mining
+    max_height = Column(BigInteger, default=0)  # Maximum block height for mining
     reward = Column(BigInteger, default=0)  # Tokens per successful mint
     target = Column(BigInteger, default=0)  # Mining difficulty target
     

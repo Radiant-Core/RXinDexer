@@ -133,12 +133,18 @@ def stats_overview(db: Session = Depends(get_db)):
                 )
             ).fetchone()
             if row and row[0] is not None:
-                total_txs = int(row[0])
+                # Postgres can return -1 when statistics are missing.
+                estimate = int(row[0])
+                total_txs = estimate if estimate > 0 else None
             else:
                 total_txs = None
         except Exception:
             db.rollback()
+            total_txs = None
+
+        if total_txs is None:
             try:
+                # Use max(id) as a fast, index-backed approximation (avoids COUNT(*)).
                 total_txs = int(db.query(func.max(Transaction.id)).scalar() or 0)
             except Exception:
                 db.rollback()
@@ -162,7 +168,9 @@ def stats_overview(db: Session = Depends(get_db)):
             total_supply = utxo_cached.get("total_amount")
         else:
             try:
-                utxo = rpc_call("gettxoutsetinfo", timeout=120)
+                # Never let /stats/overview hang on a full UTXO set scan.
+                # If the cache is cold and the node is slow, just return nulls and try again later.
+                utxo = rpc_call("gettxoutsetinfo", timeout=20)
                 utxo_txouts = int(utxo.get("txouts") or 0)
                 utxo_disk_size_bytes = int(utxo.get("disk_size") or 0)
                 total_supply = float(utxo.get("total_amount")) if utxo.get("total_amount") is not None else None
@@ -183,6 +191,18 @@ def stats_overview(db: Session = Depends(get_db)):
         try:
             # CEX volume (CoinGecko)
             market = cache.get("market:rxd")
+            if not isinstance(market, dict):
+                market = None
+
+            if market is None or (market.get("volume_24h_rxd") is None and market.get("volume_24h_usd") is None):
+                try:
+                    # Ensure stats are correct even if /market/rxd hasn't been called yet.
+                    from api.endpoints.market import get_rxd_market
+
+                    market = get_rxd_market()
+                except Exception:
+                    market = market
+
             if isinstance(market, dict):
                 cex_volume_24h_rxd = market.get("volume_24h_rxd")
                 cex_volume_24h_usd = market.get("volume_24h_usd")
@@ -241,7 +261,10 @@ def stats_overview(db: Session = Depends(get_db)):
             },
         }
 
-        cache.set(cache_key, result, CACHE_TTL_MEDIUM)  # Cache overview stats for 1 minute
+        ttl = CACHE_TTL_MEDIUM
+        if cex_volume_24h_rxd is None and cex_volume_24h_usd is None:
+            ttl = CACHE_TTL_SHORT
+        cache.set(cache_key, result, ttl)
         return result
     except Exception:
         try:

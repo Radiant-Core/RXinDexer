@@ -9,8 +9,8 @@ services:
     image: radiant-node-git
     container_name: radiant-node
     ports:
-      - "7332:7332"
-      - "7333:7333"
+      - "${RXD_BIND_IP:-127.0.0.1}:7332:7332"
+      - "${RXD_BIND_IP:-127.0.0.1}:7333:7333"
     restart: unless-stopped
     volumes:
       - ./radiant.conf:/root/.radiant/radiant.conf:ro
@@ -34,7 +34,7 @@ services:
       POSTGRES_USER: rxindexer
       POSTGRES_PASSWORD: rxindexerpass
     ports:
-      - "5432:5432"
+      - "${RXD_BIND_IP:-127.0.0.1}:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres-tuning.conf:/etc/postgresql/postgresql.conf:ro
@@ -62,7 +62,7 @@ services:
     image: rxindexer-api
     container_name: rxindexer-api
     ports:
-      - "8000:8000"
+      - "${RXD_BIND_IP:-127.0.0.1}:8000:8000"
     depends_on:
       - radiant-node
       - db

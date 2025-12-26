@@ -102,6 +102,21 @@ class FTTokenTableRowResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
+class FTDuplicateRowResponse(BaseModel):
+    ref: str
+    name: str
+    ticker: Optional[str] = None
+    height: Optional[int] = None
+    holder_count: int = 0
+    has_image: bool = False
+
+
+class FTDuplicatesResponse(BaseModel):
+    canonical: FTDuplicateRowResponse
+    duplicates: List[FTDuplicateRowResponse]
+    is_canonical: bool
+
 class GlyphTokenResponse(BaseModel):
     """Glyph token data with full metadata and ownership details.
     

@@ -79,7 +79,16 @@ def upgrade():
             
             -- Add DMINT fields
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'glyph_tokens' AND column_name = 'max_height') THEN
-                ALTER TABLE glyph_tokens ADD COLUMN max_height INTEGER;
+                ALTER TABLE glyph_tokens ADD COLUMN max_height BIGINT;
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'glyph_tokens'
+                  AND column_name = 'max_height'
+                  AND data_type = 'integer'
+            ) THEN
+                ALTER TABLE glyph_tokens ALTER COLUMN max_height TYPE BIGINT USING max_height::bigint;
             END IF;
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'glyph_tokens' AND column_name = 'reward') THEN
                 ALTER TABLE glyph_tokens ADD COLUMN reward BIGINT;

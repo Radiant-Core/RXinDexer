@@ -259,6 +259,120 @@ def reverse_ref(ref: str) -> str:
     return txid_reversed + vout_reversed
 
 
+def parse_dmint_contract_script(script_hex: str) -> dict:
+    if not script_hex or not isinstance(script_hex, str):
+        return {}
+
+    try:
+        buf = bytes.fromhex(script_hex)
+    except Exception:
+        return {}
+
+    def _read_push_int(b: bytes, i: int):
+        if i >= len(b):
+            return (None, i)
+        op = b[i]
+        i += 1
+
+        if op == 0x00:
+            return (0, i)
+        if op == 0x4f:
+            return (-1, i)
+        if 0x51 <= op <= 0x60:
+            return (op - 0x50, i)
+
+        if 1 <= op <= 75:
+            ln = op
+        elif op == 0x4c:
+            if i + 1 > len(b):
+                return (None, i)
+            ln = b[i]
+            i += 1
+        elif op == 0x4d:
+            if i + 2 > len(b):
+                return (None, i)
+            ln = int.from_bytes(b[i:i + 2], 'little')
+            i += 2
+        elif op == 0x4e:
+            if i + 4 > len(b):
+                return (None, i)
+            ln = int.from_bytes(b[i:i + 4], 'little')
+            i += 4
+        else:
+            return (None, i)
+
+        if i + ln > len(b):
+            return (None, i)
+        data = b[i:i + ln]
+        i += ln
+
+        if ln == 0:
+            return (0, i)
+
+        negative = (data[-1] & 0x80) != 0
+        if negative:
+            data = data[:-1] + bytes([data[-1] & 0x7f])
+
+        val = int.from_bytes(data, 'little', signed=False)
+        return (-val if negative else val, i)
+
+    try:
+        # Search for the core pattern anywhere in the script:
+        # d8 <36-byte contractRef> d0 <36-byte tokenRef>
+        start = -1
+        for j in range(0, max(0, len(buf) - (1 + 36 + 1 + 36))):
+            if buf[j] != 0xd8:
+                continue
+            if j + 1 + 36 + 1 + 36 > len(buf):
+                continue
+            if buf[j + 1 + 36] != 0xd0:
+                continue
+            start = j
+            break
+
+        if start < 0:
+            return {}
+
+        # Height is optionally pushed right before the d8 (Photonic uses push4bytes(height)).
+        height = None
+        try:
+            if start >= 5 and buf[start - 5] == 0x04:
+                height = int.from_bytes(buf[start - 4:start], 'little')
+        except Exception:
+            height = None
+
+        i = start + 1
+        contract_ref = buf[i:i + 36].hex()
+        i += 36
+        i += 1  # skip 0xd0
+        token_ref = buf[i:i + 36].hex()
+        i += 36
+
+        max_height, i = _read_push_int(buf, i)
+        reward, i = _read_push_int(buf, i)
+        target, i = _read_push_int(buf, i)
+
+        difficulty = None
+        try:
+            if target and isinstance(target, int) and target > 0:
+                max_target = 0x7fffffffffffffff
+                difficulty = int(max_target // int(target))
+        except Exception:
+            difficulty = None
+
+        return {
+            'height': height,
+            'contract_ref': contract_ref,
+            'token_ref': token_ref,
+            'max_height': max_height,
+            'reward': reward,
+            'target': target,
+            'difficulty': difficulty,
+        }
+    except Exception:
+        return {}
+
+
 def parse_script_chunks(script_bytes: bytes) -> list:
     """
     Parse script bytes into chunks matching the reference implementation.

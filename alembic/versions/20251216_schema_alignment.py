@@ -134,7 +134,7 @@ def upgrade():
         sa.Column('location', sa.String(), nullable=False),
         sa.Column('output_index', sa.Integer(), nullable=False),
         sa.Column('height', sa.Integer(), default=0),
-        sa.Column('max_height', sa.Integer(), default=0),
+        sa.Column('max_height', sa.BigInteger(), default=0),
         sa.Column('reward', sa.BigInteger(), default=0),
         sa.Column('target', sa.BigInteger(), default=0),
         sa.Column('script', sa.Text(), server_default=''),
