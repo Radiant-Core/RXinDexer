@@ -1,7 +1,7 @@
 """API endpoints for unified Glyph model (new glyphs table)."""
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, case
+from sqlalchemy import func, or_, case, and_
 from typing import List, Optional
 
 from api.dependencies import get_db
@@ -75,12 +75,13 @@ def list_ft_table(
     page: int = Query(1, ge=1),
     limit: int = Query(100, ge=1, le=500),
     q: Optional[str] = Query(None, description="Search query (name, ticker, description, ref)"),
+    has_image: Optional[bool] = Query(None, description="Filter by image presence"),
     sort: str = Query("holders", description="Sort by: name, ticker, holders, circulating, supply, burned, difficulty, premine, mined, height, created_at, updated_at"),
     order: str = Query("desc", description="Order: asc, desc"),
     db: Session = Depends(get_db),
 ):
     """List FT tokens as enriched table rows (no N+1), with server-side sorting."""
-    cache_key = f"glyphs:fts:table:{page}:{limit}:{q}:{sort}:{order}"
+    cache_key = f"glyphs:fts:table:{page}:{limit}:{q}:{has_image}:{sort}:{order}"
     cached = cache.get(cache_key)
     if cached is not None:
         response.headers["X-Page"] = str(page)
@@ -197,6 +198,21 @@ def list_ft_table(
         .outerjoin(legacy_subq, legacy_subq.c.token_id == Glyph.ref)
         .filter(Glyph.token_type == "FT")
     )
+
+    if has_image is True:
+        base = base.filter(
+            or_(
+                and_(Glyph.embed_data.isnot(None), Glyph.embed_data != ""),
+                and_(Glyph.remote_url.isnot(None), Glyph.remote_url != ""),
+            )
+        )
+    elif has_image is False:
+        base = base.filter(
+            and_(
+                or_(Glyph.embed_data.is_(None), Glyph.embed_data == ""),
+                or_(Glyph.remote_url.is_(None), Glyph.remote_url == ""),
+            )
+        )
 
     if q:
         like = f"%{q.strip()}%"
