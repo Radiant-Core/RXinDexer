@@ -1,7 +1,8 @@
 """API endpoints for unified Glyph model (new glyphs table)."""
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, case, and_
+from sqlalchemy import func, or_, case, and_, cast, text
+from sqlalchemy.sql.sqltypes import String
 from typing import List, Optional
 
 from api.dependencies import get_db
@@ -14,7 +15,7 @@ from api.schemas import (
 )
 from api.cache import cache, CACHE_TTL_SHORT, CACHE_TTL_MEDIUM
 from database import queries
-from database.models import Glyph, GlyphToken, TokenHolder, TokenBurn
+from database.models import Glyph, GlyphToken, TokenHolder, TokenBurn, AddressCluster
 
 router = APIRouter(prefix="/glyphs", tags=["glyphs"])
 
@@ -76,12 +77,13 @@ def list_ft_table(
     limit: int = Query(100, ge=1, le=500),
     q: Optional[str] = Query(None, description="Search query (name, ticker, description, ref)"),
     has_image: Optional[bool] = Query(None, description="Filter by image presence"),
+    holders_mode: str = Query("address", description="Holder counting mode: address | cluster"),
     sort: str = Query("holders", description="Sort by: name, ticker, holders, circulating, supply, burned, difficulty, premine, mined, height, created_at, updated_at"),
     order: str = Query("desc", description="Order: asc, desc"),
     db: Session = Depends(get_db),
 ):
     """List FT tokens as enriched table rows (no N+1), with server-side sorting."""
-    cache_key = f"glyphs:fts:table:{page}:{limit}:{q}:{has_image}:{sort}:{order}"
+    cache_key = f"glyphs:fts:table:{page}:{limit}:{q}:{has_image}:{holders_mode}:{sort}:{order}"
     cached = cache.get(cache_key)
     if cached is not None:
         response.headers["X-Page"] = str(page)
@@ -93,15 +95,65 @@ def list_ft_table(
 
     has_image_expr = or_(Glyph.embed_data.isnot(None), Glyph.remote_url.isnot(None)).label("has_image")
 
-    holders_subq = (
-        db.query(
-            TokenHolder.token_id.label("token_id"),
-            func.count(TokenHolder.id).label("holder_count"),
-            func.sum(TokenHolder.balance).label("circulating_supply"),
-        )
-        .group_by(TokenHolder.token_id)
-        .subquery()
+    holders_mode_key = (holders_mode or "address").lower()
+    if holders_mode_key == "cluster":
+        try:
+            exists = db.execute(text("SELECT to_regclass('public.address_clusters')")).scalar()
+            if not exists:
+                holders_mode_key = "address"
+        except Exception:
+            holders_mode_key = "address"
+
+    cluster_key_expr = func.coalesce(
+        func.concat('CLUSTER:', cast(AddressCluster.cluster_id, String)),
+        TokenHolder.address,
     )
+
+    if holders_mode_key == "cluster":
+        holders_subq = (
+            db.query(
+                TokenHolder.token_id.label("token_id"),
+                func.count(func.distinct(cluster_key_expr))
+                .filter(
+                    TokenHolder.balance > 0,
+                    TokenHolder.address.isnot(None),
+                    func.length(func.trim(TokenHolder.address)) > 0,
+                )
+                .label("holder_count"),
+                func.sum(TokenHolder.balance)
+                .filter(
+                    TokenHolder.balance > 0,
+                    TokenHolder.address.isnot(None),
+                    func.length(func.trim(TokenHolder.address)) > 0,
+                )
+                .label("circulating_supply"),
+            )
+            .outerjoin(AddressCluster, AddressCluster.address == TokenHolder.address)
+            .group_by(TokenHolder.token_id)
+            .subquery()
+        )
+    else:
+        holders_subq = (
+            db.query(
+                TokenHolder.token_id.label("token_id"),
+                func.count(func.distinct(TokenHolder.address))
+                .filter(
+                    TokenHolder.balance > 0,
+                    TokenHolder.address.isnot(None),
+                    func.length(func.trim(TokenHolder.address)) > 0,
+                )
+                .label("holder_count"),
+                func.sum(TokenHolder.balance)
+                .filter(
+                    TokenHolder.balance > 0,
+                    TokenHolder.address.isnot(None),
+                    func.length(func.trim(TokenHolder.address)) > 0,
+                )
+                .label("circulating_supply"),
+            )
+            .group_by(TokenHolder.token_id)
+            .subquery()
+        )
 
     burns_subq = (
         db.query(
@@ -161,12 +213,12 @@ def list_ft_table(
 
     # Canonical token selection:
     # - One row per (name, ticker)
-    # - Canonical = oldest height (lowest), tie-break by highest holders
+    # - Canonical = most holders, tie-break by oldest height (lowest)
     canonical_rank_expr = func.row_number().over(
         partition_by=(name_key_expr, ticker_key_expr),
         order_by=[
-            func.coalesce(Glyph.height, 2147483647).asc(),
             func.coalesce(holders_subq.c.holder_count, 0).desc(),
+            func.coalesce(Glyph.height, 2147483647).asc(),
             Glyph.id.asc(),
         ],
     ).label("canonical_rank")
@@ -304,7 +356,7 @@ def list_ft_table(
 
 
 @router.get("/fts/duplicates/{ref}", response_model=FTDuplicatesResponse)
-def get_ft_duplicates(ref: str, db: Session = Depends(get_db)):
+def get_ft_duplicates(ref: str, holders_mode: str = Query("address", description="Holder counting mode: address | cluster"), db: Session = Depends(get_db)):
     glyph = queries.get_glyph_by_ref(db, ref)
     if not glyph or glyph.token_type != "FT":
         raise HTTPException(status_code=404, detail=f"FT glyph {ref} not found")
@@ -326,14 +378,50 @@ def get_ft_duplicates(ref: str, db: Session = Depends(get_db)):
             "is_canonical": True,
         }
 
-    holders_subq = (
-        db.query(
-            TokenHolder.token_id.label("token_id"),
-            func.count(TokenHolder.id).label("holder_count"),
-        )
-        .group_by(TokenHolder.token_id)
-        .subquery()
+    holders_mode_key = (holders_mode or "address").lower()
+    if holders_mode_key == "cluster":
+        try:
+            exists = db.execute(text("SELECT to_regclass('public.address_clusters')")).scalar()
+            if not exists:
+                holders_mode_key = "address"
+        except Exception:
+            holders_mode_key = "address"
+    cluster_key_expr = func.coalesce(
+        func.concat('CLUSTER:', cast(AddressCluster.cluster_id, String)),
+        TokenHolder.address,
     )
+
+    if holders_mode_key == "cluster":
+        holders_subq = (
+            db.query(
+                TokenHolder.token_id.label("token_id"),
+                func.count(func.distinct(cluster_key_expr))
+                .filter(
+                    TokenHolder.balance > 0,
+                    TokenHolder.address.isnot(None),
+                    func.length(func.trim(TokenHolder.address)) > 0,
+                )
+                .label("holder_count"),
+            )
+            .outerjoin(AddressCluster, AddressCluster.address == TokenHolder.address)
+            .group_by(TokenHolder.token_id)
+            .subquery()
+        )
+    else:
+        holders_subq = (
+            db.query(
+                TokenHolder.token_id.label("token_id"),
+                func.count(func.distinct(TokenHolder.address))
+                .filter(
+                    TokenHolder.balance > 0,
+                    TokenHolder.address.isnot(None),
+                    func.length(func.trim(TokenHolder.address)) > 0,
+                )
+                .label("holder_count"),
+            )
+            .group_by(TokenHolder.token_id)
+            .subquery()
+        )
 
     has_image_expr = or_(Glyph.embed_data.isnot(None), Glyph.remote_url.isnot(None)).label("has_image")
     holder_count_expr = func.coalesce(holders_subq.c.holder_count, 0).label("holder_count")
@@ -371,9 +459,9 @@ def get_ft_duplicates(ref: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No rows found for duplicate group")
 
     def _rank_key(r):
-        height = int(r.height) if r.height is not None else 2147483647
         holders = int(r.holder_count) if r.holder_count is not None else 0
-        return (height, -holders, r.ref)
+        height = int(r.height) if r.height is not None else 2147483647
+        return (-holders, height, r.ref)
 
     rows_sorted = sorted(rows, key=_rank_key)
     canonical = rows_sorted[0]

@@ -25,8 +25,25 @@ while ! pg_isready -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" > /dev/null 2>&1; d
 done
 echo "[indexer] Database connection established."
 
-# Wait for schema to be created by API (which runs Alembic)
-echo "[indexer] Waiting for 'blocks' table (created by API migrations)..."
+# Run Alembic migrations with retries (safe if API also runs them)
+echo "[indexer] Running Alembic migrations..."
+cd /app
+MAX_ATTEMPTS=10
+ATTEMPT=1
+RETRY_DELAY=3
+until alembic upgrade head; do
+  if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
+    echo "[indexer][ERROR] Alembic migration failed after $MAX_ATTEMPTS attempts."
+    exit 1
+  fi
+  echo "[indexer][WARN] Migration attempt $ATTEMPT failed. Retrying in ${RETRY_DELAY}s..."
+  ATTEMPT=$((ATTEMPT + 1))
+  sleep $RETRY_DELAY
+done
+echo "[indexer] Alembic migrations completed successfully."
+
+# Wait for schema to be present
+echo "[indexer] Waiting for 'blocks' table..."
 MAX_SCHEMA_WAIT=120
 SCHEMA_WAIT=0
 while : ; do

@@ -336,6 +336,59 @@ def get_token(token_id: str, db: Session = Depends(get_db)):
     """
     token = get_glyph_token_by_id(db, token_id)
     if token:
+        # Some legacy rows can have null genesis_height even though it is derivable.
+        # Ensure we always provide a correct genesis_height so the explorer can
+        # compute the on-chain genesis timestamp (initial contract creation time).
+        genesis_height = getattr(token, 'genesis_height', None)
+        created_at = getattr(token, 'created_at', None)
+
+        reveal_txid = getattr(token, 'reveal_txid', None) or getattr(token, 'txid', None)
+        if (genesis_height is None or created_at is None) and reveal_txid:
+            try:
+                tx_row = (
+                    db.query(Transaction)
+                    .filter(Transaction.txid == reveal_txid)
+                    .order_by(Transaction.id.desc())
+                    .first()
+                )
+                if tx_row:
+                    if genesis_height is None:
+                        genesis_height = getattr(tx_row, 'block_height', None) or genesis_height
+                    if created_at is None:
+                        created_at = getattr(tx_row, 'created_at', None) or created_at
+            except Exception:
+                pass
+
+        if genesis_height is None:
+            try:
+                resolved_ref, glyph = _resolve_token_ref(db, token_id)
+                if glyph and getattr(glyph, 'height', None) is not None:
+                    genesis_height = getattr(glyph, 'height', None)
+                    if created_at is None:
+                        created_at = getattr(glyph, 'created_at', None)
+            except Exception:
+                pass
+
+        # If we can resolve a unified glyph row, always prefer its height as the
+        # canonical initial contract creation height. This avoids returning a
+        # stale/incorrect legacy genesis_height that can drift from the unified model.
+        try:
+            resolved_ref, glyph = _resolve_token_ref(db, token_id)
+            if glyph and getattr(glyph, 'height', None) is not None:
+                genesis_height = getattr(glyph, 'height', None)
+                if created_at is None:
+                    created_at = getattr(glyph, 'created_at', None)
+        except Exception:
+            pass
+
+        try:
+            if genesis_height is not None:
+                setattr(token, 'genesis_height', genesis_height)
+            if created_at is not None:
+                setattr(token, 'created_at', created_at)
+        except Exception:
+            pass
+
         return token
 
     resolved_ref, glyph = _resolve_token_ref(db, token_id)
@@ -651,6 +704,7 @@ def get_token_holders_api(
     token_id: str, 
     limit: int = 100, 
     offset: int = 0,
+    holders_mode: str = Query("address", description="Holder listing/counting mode: address | cluster"),
     db: Session = Depends(get_db)
 ):
     """
@@ -664,22 +718,96 @@ def get_token_holders_api(
     
     resolved_ref, _ = _resolve_token_ref(db, token_id)
 
-    # Get holders
-    result = db.execute(text("""
-        SELECT address, balance, percentage, first_acquired_at, last_updated_at
-        FROM token_holders
-        WHERE token_id = :token_id
-        ORDER BY balance DESC
-        LIMIT :limit OFFSET :offset
-    """), {'token_id': resolved_ref, 'limit': limit, 'offset': offset})
-    
-    holders = [dict(row._mapping) for row in result.fetchall()]
-    
-    # Get total count
-    count_result = db.execute(text("""
-        SELECT COUNT(*) FROM token_holders WHERE token_id = :token_id
-    """), {'token_id': resolved_ref})
-    total = count_result.scalar() or 0
+    mode = (holders_mode or "address").lower()
+
+    if mode == "cluster":
+        try:
+            exists = db.execute(text("SELECT to_regclass('public.address_clusters')")).scalar()
+            if not exists:
+                mode = "address"
+        except Exception:
+            mode = "address"
+
+    if mode == "cluster":
+        # Cluster view: group addresses into wallet-like clusters (common-input heuristic).
+        # If an address is not clustered yet, fall back to treating it as its own cluster.
+        result = db.execute(
+            text(
+                """
+                WITH clustered AS (
+                    SELECT
+                        COALESCE('CLUSTER:' || ac.cluster_id::text, th.address) AS cluster_key,
+                        th.balance AS balance
+                    FROM token_holders th
+                    LEFT JOIN address_clusters ac ON ac.address = th.address
+                    WHERE th.token_id = :token_id
+                      AND th.balance > 0
+                      AND th.address IS NOT NULL
+                      AND length(btrim(th.address)) > 0
+                ),
+                totals AS (
+                    SELECT COALESCE(SUM(balance), 0) AS total_balance FROM clustered
+                )
+                SELECT
+                    c.cluster_key AS address,
+                    SUM(c.balance)::bigint AS balance,
+                    CASE
+                        WHEN t.total_balance > 0 THEN (SUM(c.balance)::float / t.total_balance::float) * 100
+                        ELSE 0
+                    END AS percentage,
+                    NULL::timestamptz AS first_acquired_at,
+                    NULL::timestamptz AS last_updated_at
+                FROM clustered c
+                CROSS JOIN totals t
+                GROUP BY c.cluster_key, t.total_balance
+                ORDER BY SUM(c.balance) DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {'token_id': resolved_ref, 'limit': limit, 'offset': offset},
+        )
+
+        holders = [dict(row._mapping) for row in result.fetchall()]
+
+        count_result = db.execute(
+            text(
+                """
+                SELECT COUNT(DISTINCT COALESCE('CLUSTER:' || ac.cluster_id::text, th.address))
+                FROM token_holders th
+                LEFT JOIN address_clusters ac ON ac.address = th.address
+                WHERE th.token_id = :token_id
+                  AND th.balance > 0
+                  AND th.address IS NOT NULL
+                  AND length(btrim(th.address)) > 0
+                """
+            ),
+            {'token_id': resolved_ref},
+        )
+        total = count_result.scalar() or 0
+    else:
+        # Address view (current behavior)
+        result = db.execute(text("""
+            SELECT address, balance, percentage, first_acquired_at, last_updated_at
+            FROM token_holders
+            WHERE token_id = :token_id
+              AND balance > 0
+              AND address IS NOT NULL
+              AND length(btrim(address)) > 0
+            ORDER BY balance DESC
+            LIMIT :limit OFFSET :offset
+        """), {'token_id': resolved_ref, 'limit': limit, 'offset': offset})
+        
+        holders = [dict(row._mapping) for row in result.fetchall()]
+        
+        count_result = db.execute(text("""
+            SELECT COUNT(DISTINCT address)
+            FROM token_holders
+            WHERE token_id = :token_id
+              AND balance > 0
+              AND address IS NOT NULL
+              AND length(btrim(address)) > 0
+        """), {'token_id': resolved_ref})
+        total = count_result.scalar() or 0
     
     return {
         "token_id": resolved_ref,
@@ -691,7 +819,7 @@ def get_token_holders_api(
 
 
 @router.get("/tokens/{token_id}/supply", tags=["tokens"], summary="Get token supply breakdown")
-def get_token_supply_api(token_id: str, db: Session = Depends(get_db)):
+def get_token_supply_api(token_id: str, holders_mode: str = Query("address", description="Holder counting mode: address | cluster"), db: Session = Depends(get_db)):
     """
     Get supply breakdown for a token.
     
@@ -892,18 +1020,49 @@ def get_token_supply_api(token_id: str, db: Session = Depends(get_db)):
         try:
             circulating_supply = (
                 db.execute(
-                    text("SELECT COALESCE(SUM(balance), 0) FROM token_holders WHERE token_id = :token_id"),
+                    text(
+                        "SELECT COALESCE(SUM(balance), 0) "
+                        "FROM token_holders "
+                        "WHERE token_id = :token_id AND balance > 0 AND address IS NOT NULL AND length(btrim(address)) > 0"
+                    ),
                     {'token_id': resolved_ref},
                 ).scalar()
                 or 0
             )
-            holder_count = (
-                db.execute(
-                    text("SELECT COUNT(*) FROM token_holders WHERE token_id = :token_id"),
-                    {'token_id': resolved_ref},
-                ).scalar()
-                or 0
-            )
+
+            mode = (holders_mode or "address").lower()
+            if mode == "cluster":
+                try:
+                    exists = db.execute(text("SELECT to_regclass('public.address_clusters')")).scalar()
+                    if not exists:
+                        mode = "address"
+                except Exception:
+                    mode = "address"
+            if mode == "cluster":
+                holder_count = (
+                    db.execute(
+                        text(
+                            "SELECT COUNT(DISTINCT COALESCE('CLUSTER:' || ac.cluster_id::text, th.address)) "
+                            "FROM token_holders th "
+                            "LEFT JOIN address_clusters ac ON ac.address = th.address "
+                            "WHERE th.token_id = :token_id AND th.balance > 0 AND th.address IS NOT NULL AND length(btrim(th.address)) > 0"
+                        ),
+                        {'token_id': resolved_ref},
+                    ).scalar()
+                    or 0
+                )
+            else:
+                holder_count = (
+                    db.execute(
+                        text(
+                            "SELECT COUNT(DISTINCT address) "
+                            "FROM token_holders "
+                            "WHERE token_id = :token_id AND balance > 0 AND address IS NOT NULL AND length(btrim(address)) > 0"
+                        ),
+                        {'token_id': resolved_ref},
+                    ).scalar()
+                    or 0
+                )
         except Exception:
             circulating_supply = 0
             holder_count = 0

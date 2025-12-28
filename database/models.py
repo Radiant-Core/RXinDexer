@@ -354,6 +354,14 @@ class BackfillStatus(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class AddressCluster(Base):
+    __tablename__ = 'address_clusters'
+    address = Column(Text, primary_key=True)
+    cluster_id = Column(BigInteger, nullable=False, index=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 # ============================================================================
 # TOKEN HOLDER TRACKING
 # ============================================================================
