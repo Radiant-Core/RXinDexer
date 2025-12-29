@@ -70,11 +70,33 @@ def list_glyphs(
     return glyphs
 
 
+@router.post("/refresh-materialized-views", tags=["glyphs"], summary="Refresh materialized views")
+def refresh_materialized_views(db: Session = Depends(get_db)):
+    """Manually refresh materialized views for latest data."""
+    try:
+        # Use CONCURRENTLY for simple views, regular refresh for complex ones
+        db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_token_holder_stats"))
+        db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_token_burn_stats"))
+        db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_glyph_token_stats"))
+        db.execute(text("REFRESH MATERIALIZED VIEW mv_ft_glyph_summary"))  # No CONCURRENTLY for complex view
+        db.commit()
+        
+        # Clear relevant cache entries
+        from api.cache import cache
+        cache.delete("glyphs:fts:table:1:60::::holders:desc")
+        cache.delete("glyphs:fts:table:1:60::true:holders:desc")
+        
+        return {"message": "Materialized views refreshed successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error refreshing materialized views: {str(e)}")
+
+
 @router.get("/fts/table", response_model=List[FTTokenTableRowResponse])
 def list_ft_table(
     response: Response,
     page: int = Query(1, ge=1),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(60, ge=1, le=100),
     q: Optional[str] = Query(None, description="Search query (name, ticker, description, ref)"),
     has_image: Optional[bool] = Query(None, description="Filter by image presence"),
     holders_mode: str = Query("address", description="Holder counting mode: address | cluster"),
@@ -82,7 +104,7 @@ def list_ft_table(
     order: str = Query("desc", description="Order: asc, desc"),
     db: Session = Depends(get_db),
 ):
-    """List FT tokens as enriched table rows (no N+1), with server-side sorting."""
+    """List FT tokens as enriched table rows (using materialized views for speed)."""
     cache_key = f"glyphs:fts:table:{page}:{limit}:{q}:{has_image}:{holders_mode}:{sort}:{order}"
     cached = cache.get(cache_key)
     if cached is not None:
@@ -93,261 +115,91 @@ def list_ft_table(
     offset = (page - 1) * limit
     is_asc = (order or "desc").lower() == "asc"
 
-    has_image_expr = or_(Glyph.embed_data.isnot(None), Glyph.remote_url.isnot(None)).label("has_image")
+    # Build the SQL query dynamically
+    sql_query = """
+        SELECT 
+            id, ref, token_type, display_name as name, display_ticker as ticker,
+            height, created_at, updated_at, has_image, holder_count, circulating_supply,
+            max_supply, burned_supply, difficulty, premine,
+            (circulating_supply + burned_supply) as minted_supply,
+            CASE 
+                WHEN max_supply IS NOT NULL AND max_supply > 0 
+                THEN (premine * 100.0 / max_supply)
+                ELSE NULL 
+            END as premine_percent,
+            (difficulty IS NOT NULL) as is_minable,
+            CASE 
+                WHEN max_supply IS NOT NULL AND max_supply > 0 
+                THEN (GREATEST((circulating_supply + burned_supply) - premine, 0) * 100.0 / max_supply)
+                ELSE NULL 
+            END as mined_percent
+        FROM mv_ft_glyph_summary
+        WHERE canonical_rank = 1
+    """
 
-    holders_mode_key = (holders_mode or "address").lower()
-    if holders_mode_key == "cluster":
-        try:
-            exists = db.execute(text("SELECT to_regclass('public.address_clusters')")).scalar()
-            if not exists:
-                holders_mode_key = "address"
-        except Exception:
-            holders_mode_key = "address"
-
-    cluster_key_expr = func.coalesce(
-        (literal('CLUSTER:') + cast(AddressCluster.cluster_id, String)),
-        TokenHolder.address,
-    )
-
-    if holders_mode_key == "cluster":
-        holders_subq = (
-            db.query(
-                TokenHolder.token_id.label("token_id"),
-                func.count(func.distinct(cluster_key_expr))
-                .filter(
-                    TokenHolder.balance > 0,
-                    TokenHolder.address.isnot(None),
-                    func.length(func.trim(TokenHolder.address)) > 0,
-                )
-                .label("holder_count"),
-                func.sum(TokenHolder.balance)
-                .filter(
-                    TokenHolder.balance > 0,
-                    TokenHolder.address.isnot(None),
-                    func.length(func.trim(TokenHolder.address)) > 0,
-                )
-                .label("circulating_supply"),
-            )
-            .outerjoin(AddressCluster, AddressCluster.address == TokenHolder.address)
-            .group_by(TokenHolder.token_id)
-            .subquery()
-        )
-    else:
-        holders_subq = (
-            db.query(
-                TokenHolder.token_id.label("token_id"),
-                func.count(func.distinct(TokenHolder.address))
-                .filter(
-                    TokenHolder.balance > 0,
-                    TokenHolder.address.isnot(None),
-                    func.length(func.trim(TokenHolder.address)) > 0,
-                )
-                .label("holder_count"),
-                func.sum(TokenHolder.balance)
-                .filter(
-                    TokenHolder.balance > 0,
-                    TokenHolder.address.isnot(None),
-                    func.length(func.trim(TokenHolder.address)) > 0,
-                )
-                .label("circulating_supply"),
-            )
-            .group_by(TokenHolder.token_id)
-            .subquery()
-        )
-
-    burns_subq = (
-        db.query(
-            TokenBurn.token_id.label("token_id"),
-            func.sum(TokenBurn.amount).label("burned_supply"),
-        )
-        .group_by(TokenBurn.token_id)
-        .subquery()
-    )
-
-    legacy_subq = (
-        db.query(
-            GlyphToken.token_id.label("token_id"),
-            func.max(GlyphToken.max_supply).label("max_supply"),
-            func.max(GlyphToken.difficulty).label("difficulty"),
-            func.max(GlyphToken.premine).label("premine"),
-        )
-        .group_by(GlyphToken.token_id)
-        .subquery()
-    )
-
-    holder_count_expr = func.coalesce(holders_subq.c.holder_count, 0).label("holder_count")
-    circulating_expr = func.coalesce(holders_subq.c.circulating_supply, 0).label("circulating_supply")
-    burned_expr = func.coalesce(burns_subq.c.burned_supply, 0).label("burned_supply")
-    minted_supply_expr = (circulating_expr + burned_expr).label("minted_supply")
-
-    premine_expr = func.coalesce(legacy_subq.c.premine, 0)
-    is_minable_expr = (legacy_subq.c.difficulty.isnot(None)).label("is_minable")
-
-    premine_percent_expr = (
-        (premine_expr * 100.0) / func.nullif(legacy_subq.c.max_supply, 0)
-    ).label("premine_percent")
-
-    mined_amount_expr = func.greatest(minted_supply_expr - premine_expr, 0)
-    mined_percent_expr = (
-        case(
-            (
-                (legacy_subq.c.max_supply.isnot(None)) & (legacy_subq.c.max_supply > 0),
-                (mined_amount_expr * 100.0) / func.nullif(legacy_subq.c.max_supply, 0),
-            ),
-            else_=None,
-        )
-    ).label("mined_percent")
-
-    name_key_expr = func.coalesce(
-        func.nullif(func.trim(Glyph.name), ""),
-        func.nullif(func.trim(Glyph.ticker), ""),
-        Glyph.ref,
-    )
-    ticker_key_expr = func.nullif(func.trim(Glyph.ticker), "")
-
-    display_name_expr = func.coalesce(
-        func.nullif(func.trim(Glyph.name), ""),
-        func.nullif(func.trim(Glyph.ticker), ""),
-        Glyph.ref,
-    ).label("name")
-
-    # Canonical token selection:
-    # - One row per (name, ticker)
-    # - Canonical = most holders, tie-break by oldest height (lowest)
-    canonical_rank_expr = func.row_number().over(
-        partition_by=(name_key_expr, ticker_key_expr),
-        order_by=[
-            func.coalesce(holders_subq.c.holder_count, 0).desc(),
-            func.coalesce(Glyph.height, 2147483647).asc(),
-            Glyph.id.asc(),
-        ],
-    ).label("canonical_rank")
-
-    base = (
-        db.query(
-            Glyph.id.label("id"),
-            Glyph.ref.label("ref"),
-            Glyph.token_type.label("token_type"),
-            display_name_expr,
-            ticker_key_expr.label("ticker"),
-            Glyph.height.label("height"),
-            Glyph.created_at.label("created_at"),
-            Glyph.updated_at.label("updated_at"),
-            has_image_expr,
-            holder_count_expr,
-            circulating_expr,
-            legacy_subq.c.max_supply,
-            burned_expr,
-            legacy_subq.c.difficulty,
-            minted_supply_expr,
-            premine_percent_expr,
-            is_minable_expr,
-            mined_percent_expr,
-            canonical_rank_expr,
-        )
-        .outerjoin(holders_subq, holders_subq.c.token_id == Glyph.ref)
-        .outerjoin(burns_subq, burns_subq.c.token_id == Glyph.ref)
-        .outerjoin(legacy_subq, legacy_subq.c.token_id == Glyph.ref)
-        .filter(Glyph.token_type == "FT")
-    )
-
+    # Apply filters
+    params = {}
     if has_image is True:
-        base = base.filter(
-            or_(
-                and_(Glyph.embed_data.isnot(None), Glyph.embed_data != ""),
-                and_(Glyph.remote_url.isnot(None), Glyph.remote_url != ""),
-            )
-        )
+        sql_query += " AND has_image = true"
     elif has_image is False:
-        base = base.filter(
-            and_(
-                or_(Glyph.embed_data.is_(None), Glyph.embed_data == ""),
-                or_(Glyph.remote_url.is_(None), Glyph.remote_url == ""),
-            )
-        )
+        sql_query += " AND has_image = false"
 
     if q:
-        like = f"%{q.strip()}%"
-        base = base.filter(
-            (Glyph.ref.ilike(like))
-            | (Glyph.name.ilike(like))
-            | (Glyph.ticker.ilike(like))
-            | (Glyph.description.ilike(like))
-        )
+        like_term = f"%{q.strip()}%"
+        sql_query += f" AND (ref ILIKE :like_term OR display_name ILIKE :like_term OR display_ticker ILIKE :like_term)"
+        params['like_term'] = like_term
 
-    canonical_subq = base.subquery()
-
+    # Apply sorting
     sort_key = (sort or "holders").lower()
-    sort_map = {
-        "name": canonical_subq.c.name,
-        "ticker": canonical_subq.c.ticker,
-        "holders": canonical_subq.c.holder_count,
-        "circulating": canonical_subq.c.circulating_supply,
-        "supply": canonical_subq.c.max_supply,
-        "burned": canonical_subq.c.burned_supply,
-        "difficulty": canonical_subq.c.difficulty,
-        "premine": canonical_subq.c.premine_percent,
-        "mined": canonical_subq.c.mined_percent,
-        "height": canonical_subq.c.height,
-        "created_at": canonical_subq.c.created_at,
-        "updated_at": canonical_subq.c.updated_at,
+    sort_column_map = {
+        "name": "display_name",
+        "ticker": "display_ticker", 
+        "holders": "holder_count",
+        "circulating": "circulating_supply",
+        "supply": "max_supply",
+        "burned": "burned_supply",
+        "difficulty": "difficulty",
+        "premine": "premine_percent",
+        "mined": "mined_percent",
+        "height": "height",
+        "created_at": "created_at",
+        "updated_at": "updated_at",
     }
 
-    primary = sort_map.get(sort_key, canonical_subq.c.holder_count)
-    primary = primary.asc() if is_asc else primary.desc()
+    sort_column = sort_column_map.get(sort_key, "holder_count")
+    sort_direction = "ASC" if is_asc else "DESC"
+    sql_query += f" ORDER BY {sort_column} {sort_direction}, id DESC"
+    sql_query += " LIMIT :limit OFFSET :offset"
+    
+    params['limit'] = limit
+    params['offset'] = offset
 
-    rows = (
-        db.query(
-            canonical_subq.c.id,
-            canonical_subq.c.ref,
-            canonical_subq.c.token_type,
-            canonical_subq.c.name,
-            canonical_subq.c.ticker,
-            canonical_subq.c.height,
-            canonical_subq.c.created_at,
-            canonical_subq.c.updated_at,
-            canonical_subq.c.has_image,
-            canonical_subq.c.holder_count,
-            canonical_subq.c.circulating_supply,
-            canonical_subq.c.max_supply,
-            canonical_subq.c.burned_supply,
-            canonical_subq.c.difficulty,
-            canonical_subq.c.minted_supply,
-            canonical_subq.c.premine_percent,
-            canonical_subq.c.is_minable,
-            canonical_subq.c.mined_percent,
-        )
-        .filter(canonical_subq.c.canonical_rank == 1)
-        .order_by(primary, canonical_subq.c.id.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
+    # Execute the query
+    rows = db.execute(text(sql_query), params).fetchall()
 
+    # Convert to response format
     result = []
-    for r in rows:
-        result.append(
-            {
-                "id": int(r.id),
-                "ref": r.ref,
-                "token_type": r.token_type,
-                "name": r.name,
-                "ticker": r.ticker,
-                "height": int(r.height) if r.height is not None else None,
-                "created_at": r.created_at,
-                "updated_at": r.updated_at,
-                "has_image": bool(r.has_image),
-                "holder_count": int(r.holder_count) if r.holder_count is not None else 0,
-                "circulating_supply": _int_to_str(r.circulating_supply),
-                "max_supply": _int_to_str(r.max_supply),
-                "burned_supply": _int_to_str(r.burned_supply),
-                "difficulty": int(r.difficulty) if r.difficulty is not None else None,
-                "minted_supply": _int_to_str(r.minted_supply),
-                "premine_percent": float(r.premine_percent) if r.premine_percent is not None else None,
-                "is_minable": bool(r.is_minable),
-                "mined_percent": float(r.mined_percent) if r.mined_percent is not None else None,
-            }
-        )
+    for row in rows:
+        result.append({
+            "id": int(row.id),
+            "ref": row.ref,
+            "token_type": row.token_type,
+            "name": row.name,
+            "ticker": row.ticker,
+            "height": int(row.height) if row.height is not None else None,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+            "has_image": bool(row.has_image),
+            "holder_count": int(row.holder_count) if row.holder_count is not None else 0,
+            "circulating_supply": _int_to_str(row.circulating_supply),
+            "max_supply": _int_to_str(row.max_supply),
+            "burned_supply": _int_to_str(row.burned_supply),
+            "difficulty": int(row.difficulty) if row.difficulty is not None else None,
+            "minted_supply": _int_to_str(row.minted_supply),
+            "premine_percent": float(row.premine_percent) if row.premine_percent is not None else None,
+            "is_minable": bool(row.is_minable),
+            "mined_percent": float(row.mined_percent) if row.mined_percent is not None else None,
+        })
 
     response.headers["X-Page"] = str(page)
     response.headers["X-Limit"] = str(limit)

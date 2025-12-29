@@ -329,7 +329,7 @@ def get_recent_tokens(type: Optional[str] = None, limit: int = 20, db: Session =
 
 @router.get("/tokens", response_model=List[GlyphTokenResponse], tags=["tokens"])
 def list_tokens(
-    type: Optional[str] = None,
+    type: Optional[str] = Query("ft", description="Filter by token type (fungible, nft, dmint, ft)"),
     page: int = Query(1, ge=1),
     limit: int = Query(100, ge=1, le=500),
     offset: Optional[int] = Query(None, ge=0),
@@ -340,7 +340,7 @@ def list_tokens(
 ):
     """List glyph tokens with server-side filtering and sorting.
 
-    - **type**: Optional filter by token type (fungible, nft, dmint)
+    - **type**: Optional filter by token type (fungible, nft, dmint, ft). Defaults to 'ft'
     - **limit**: Max results
     - **sort**: created_at | genesis_height | holder_count | circulating_supply | max_supply | current_supply | mintable
     - **order**: asc | desc
@@ -361,7 +361,7 @@ def list_tokens(
 
     # Fallback to unified glyphs table (legacy glyph_tokens may no longer be populated).
     try:
-        tl = str(type).lower() if type is not None else ""
+        tl = str(type).lower() if type is not None else "ft"  # Default to FT
         sort_key = (sort or "created_at").lower()
         is_asc = (order or "desc").lower() == "asc"
 
@@ -369,8 +369,10 @@ def list_tokens(
             q = db.query(Glyph).filter(Glyph.token_type == tl.upper())
         elif tl == "dmint":
             q = db.query(Glyph).filter(Glyph.token_type == "FT")
+        elif tl == "fungible":
+            q = db.query(Glyph).filter(Glyph.token_type == "FT")
         else:
-            q = db.query(Glyph)
+            q = db.query(Glyph).filter(Glyph.token_type == "FT")  # Default to FT
 
         if sort_key in {"genesis_height", "height"}:
             q = q.order_by(Glyph.height.asc() if is_asc else Glyph.height.desc(), Glyph.id.desc())
