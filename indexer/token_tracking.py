@@ -320,6 +320,16 @@ def record_token_burn(db: Session, token_id: str, txid: str, amount: int,
         SET burned_supply = COALESCE(burned_supply, 0) + :amount
         WHERE token_id = :token_id
     """), {'token_id': token_id, 'amount': amount})
+
+    try:
+        with db.begin_nested():
+            db.execute(text("""
+                UPDATE glyphs
+                SET burned_supply = COALESCE(burned_supply, 0) + :amount
+                WHERE ref = :token_id
+            """), {'token_id': token_id, 'amount': amount})
+    except Exception:
+        pass
     
     return row.id if row else None
 

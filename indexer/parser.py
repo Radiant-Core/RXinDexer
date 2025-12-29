@@ -183,6 +183,9 @@ def parse_transactions(txs, db: Session, block_id=None, block_time=None, block_h
         legacy_glyph_objs = []  # Legacy GlyphToken objects (for backward compat)
         input_objs_with_txid = [] # List of (parent_txid, input_obj)
 
+        output_refs_by_txid = {}
+        tx_height_by_txid = {}
+
         # Map token_id (commit outpoint ref) -> extracted glyph metadata from reveal tx input scriptSig
         reveal_metadata_by_token_id = {}
         token_obj_by_token_id = {}
@@ -223,6 +226,11 @@ def parse_transactions(txs, db: Session, block_id=None, block_time=None, block_h
             tx_block_id = tx.get('_block_id', block_id)
             tx_block_time = tx.get('_block_time', block_time)
             tx_block_height = tx.get('_block_height', block_height)
+            try:
+                if tx_block_height is not None:
+                    tx_height_by_txid[txid] = int(tx_block_height)
+            except Exception:
+                pass
             tx_time = tx_block_time if tx_block_time else datetime.datetime.utcnow()
             txn = Transaction(
                 txid=txid,
@@ -540,6 +548,16 @@ def parse_transactions(txs, db: Session, block_id=None, block_time=None, block_h
                         # Convert ref to token_id
                         token_id = ref_to_token_id(token_ref) if token_ref else txid
                         token_owner = recipient_address or address
+
+                        try:
+                            if token_id:
+                                refs = output_refs_by_txid.get(txid)
+                                if refs is None:
+                                    refs = set()
+                                    output_refs_by_txid[txid] = refs
+                                refs.add(token_id)
+                        except Exception:
+                            pass
 
                         # Best-effort: derive the genesis txid from the ref-based token_id.
                         # ref format is 36 bytes: txid(32) + vout(4) (often little-endian).
@@ -1177,6 +1195,13 @@ def parse_transactions(txs, db: Session, block_id=None, block_time=None, block_h
         # Chunk size for processing spent keys
         # ORBSTACK MODE: Increased chunk size for better SSD performance
         CHUNK_SIZE = 2000
+
+        input_token_amounts_by_spending_txid = {}
+        burn_statement_timeout_ms = None
+        try:
+            burn_statement_timeout_ms = int(os.getenv('BURN_DETECT_STATEMENT_TIMEOUT_MS', '1500') or 1500)
+        except Exception:
+            burn_statement_timeout_ms = 1500
         for i in range(0, len(spent_keys), CHUNK_SIZE):
             chunk_keys = spent_keys[i:i + CHUNK_SIZE]
             
@@ -1184,11 +1209,48 @@ def parse_transactions(txs, db: Session, block_id=None, block_time=None, block_h
             # instead of tuple IN clause which confuses planner on partitioned tables
             chunk_txids = list(set(k[0] for k in chunk_keys))
             
-            # Fetch transaction_block_height which is part of the DB Primary Key
-            candidates = db.query(UTXO.txid, UTXO.vout, UTXO.transaction_block_height).filter(
-                UTXO.txid.in_(chunk_txids),
-                UTXO.spent == False
-            ).all()
+            candidates = None
+            try:
+                if burn_statement_timeout_ms and burn_statement_timeout_ms > 0:
+                    db.execute(text(f"SET LOCAL statement_timeout TO {int(burn_statement_timeout_ms)}"))
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
+            try:
+                candidates = db.query(
+                    UTXO.txid,
+                    UTXO.vout,
+                    UTXO.transaction_block_height,
+                    UTXO.glyph_ref,
+                    UTXO.value,
+                ).filter(
+                    UTXO.txid.in_(chunk_txids),
+                    UTXO.spent == False
+                ).all()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                candidates = db.query(
+                    UTXO.txid,
+                    UTXO.vout,
+                    UTXO.transaction_block_height,
+                ).filter(
+                    UTXO.txid.in_(chunk_txids),
+                    UTXO.spent == False
+                ).all()
+            finally:
+                try:
+                    db.execute(text("SET LOCAL statement_timeout TO 0"))
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
             
             updates_list = []
             for row in candidates:
@@ -1202,6 +1264,23 @@ def parse_transactions(txs, db: Session, block_id=None, block_time=None, block_h
                         'b_height': row.transaction_block_height,
                         'b_spent_in': spending_txid
                     })
+
+                    try:
+                        ref = getattr(row, 'glyph_ref', None)
+                        if isinstance(ref, str) and ref:
+                            amt = 0
+                            try:
+                                amt = int(float(getattr(row, 'value', 0) or 0) * 100000000)
+                            except Exception:
+                                amt = 0
+                            if amt:
+                                ref_map = input_token_amounts_by_spending_txid.get(spending_txid)
+                                if ref_map is None:
+                                    ref_map = {}
+                                    input_token_amounts_by_spending_txid[spending_txid] = ref_map
+                                ref_map[ref] = int(ref_map.get(ref, 0) or 0) + int(amt)
+                    except Exception:
+                        pass
             
             if updates_list:
                  # Use Core update with bindparam for bulk execution using the index
@@ -1214,6 +1293,38 @@ def parse_transactions(txs, db: Session, block_id=None, block_time=None, block_h
                  )
                  db.execute(stmt, updates_list)
                  total_updates += len(updates_list)
+
+        if TOKEN_TRACKING_ENABLED and input_token_amounts_by_spending_txid:
+            try:
+                from indexer.script_utils import detect_token_burn
+            except Exception:
+                detect_token_burn = None
+
+            if detect_token_burn is not None:
+                for spending_txid, ref_amounts in input_token_amounts_by_spending_txid.items():
+                    try:
+                        out_refs = output_refs_by_txid.get(spending_txid) or set()
+                        burned_refs = detect_token_burn(list(ref_amounts.keys()), list(out_refs))
+                        if not burned_refs:
+                            continue
+                        b_height = tx_height_by_txid.get(spending_txid)
+                        for burned_ref in burned_refs:
+                            amt = int(ref_amounts.get(burned_ref) or 0)
+                            if amt <= 0:
+                                continue
+                            try:
+                                record_token_burn(
+                                    db,
+                                    burned_ref,
+                                    spending_txid,
+                                    amt,
+                                    burner_address=None,
+                                    block_height=int(b_height) if b_height is not None else None,
+                                )
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
         
         db.commit()
         spent_duration = _p_time.time() - t_spent

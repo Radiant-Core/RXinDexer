@@ -121,6 +121,8 @@ class Glyph(Base):
     
     # Value tracking
     value = Column(BigInteger, nullable=True)  # Value in satoshis (for FT amounts)
+
+    burned_supply = Column(BigInteger, default=0)
     
     # Location tracking
     location = Column(String, nullable=True)  # Linked payload ref (when payload.loc is set)

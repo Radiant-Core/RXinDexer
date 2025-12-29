@@ -1,7 +1,7 @@
 """API endpoints for unified Glyph model (new glyphs table)."""
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_, case, and_, cast, text
+from sqlalchemy import func, or_, case, and_, cast, text, literal
 from sqlalchemy.sql.sqltypes import String
 from typing import List, Optional
 
@@ -105,7 +105,7 @@ def list_ft_table(
             holders_mode_key = "address"
 
     cluster_key_expr = func.coalesce(
-        func.concat('CLUSTER:', cast(AddressCluster.cluster_id, String)),
+        (literal('CLUSTER:') + cast(AddressCluster.cluster_id, String)),
         TokenHolder.address,
     )
 

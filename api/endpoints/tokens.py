@@ -9,6 +9,7 @@ import json
 import base64
 from decimal import Decimal
 from functools import lru_cache
+import hashlib
 
 from api.dependencies import get_db
 from api.schemas import (
@@ -114,6 +115,88 @@ def _spent_backfill_is_complete(db: Session) -> bool:
     except Exception:
         db.rollback()
         return False
+
+
+_B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+
+
+def _b58encode(raw: bytes) -> str:
+    n = int.from_bytes(raw, 'big')
+    out = ''
+    while n > 0:
+        n, r = divmod(n, 58)
+        out = _B58_ALPHABET[r] + out
+    pad = 0
+    for b in raw:
+        if b == 0:
+            pad += 1
+        else:
+            break
+    return ('1' * pad) + (out or '')
+
+
+def _b58check(version: int, payload: bytes) -> str:
+    data = bytes([version]) + payload
+    chk = hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
+    return _b58encode(data + chk)
+
+
+def _resolve_p2pkh_address_from_script_hex(script_hex: str) -> str | None:
+    if not isinstance(script_hex, str):
+        return None
+    s = script_hex.strip().lower()
+    if not s.startswith('76a914'):
+        return None
+    if len(s) < (6 + 40 + 4):
+        return None
+    if s[46:50] != '88ac':
+        return None
+    try:
+        h160 = bytes.fromhex(s[6:46])
+    except Exception:
+        return None
+    return _b58check(0x00, h160)
+
+
+def _parse_nonstandard_key(key: str) -> tuple[str, int] | None:
+    if not isinstance(key, str) or not key.startswith('NONSTANDARD:'):
+        return None
+    rest = key[len('NONSTANDARD:'):]
+    parts = rest.split(':')
+    if len(parts) < 2:
+        return None
+    txid = parts[0]
+    try:
+        vout = int(parts[1])
+    except Exception:
+        return None
+    if not txid:
+        return None
+    return txid, vout
+
+
+def _resolve_nonstandard_holder_address(db: Session, addr: str) -> str | None:
+    parsed = _parse_nonstandard_key(addr)
+    if not parsed:
+        return None
+    txid, vout = parsed
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT script_hex
+                FROM utxos
+                WHERE txid = :txid AND vout = :vout
+                LIMIT 1
+                """
+            ),
+            {'txid': txid, 'vout': int(vout)},
+        ).fetchone()
+        script_hex = row[0] if row else None
+        return _resolve_p2pkh_address_from_script_hex(script_hex) if script_hex else None
+    except Exception:
+        db.rollback()
+        return None
 
 
 def _resolve_reveal_txid(db: Session, token_ref: str, glyph: Glyph | None) -> str | None:
@@ -808,6 +891,14 @@ def get_token_holders_api(
               AND length(btrim(address)) > 0
         """), {'token_id': resolved_ref})
         total = count_result.scalar() or 0
+
+    resolved_addr_cache: dict[str, str] = {}
+    for h in holders:
+        a = h.get('address')
+        if isinstance(a, str) and a.startswith('NONSTANDARD:'):
+            if a not in resolved_addr_cache:
+                resolved_addr_cache[a] = _resolve_nonstandard_holder_address(db, a) or a
+            h['address'] = resolved_addr_cache[a]
     
     return {
         "token_id": resolved_ref,
@@ -887,15 +978,6 @@ def get_token_supply_api(token_id: str, holders_mode: str = Query("address", des
                 return (op - 0x50), i + 1
             data, ni = _parse_pushdata(buf, i)
             return _decode_script_num(data), ni
-
-        def _value_to_photons(v) -> int:
-            try:
-                if v is None:
-                    return 0
-                # utxos.value is numeric(20,8) in RXD-like units
-                return int(Decimal(str(v)) * Decimal('100000000'))
-            except Exception:
-                return 0
 
         def _parse_dmint_contract_script(script_hex: str):
             if not isinstance(script_hex, str):
@@ -1145,8 +1227,43 @@ def get_token_supply_api(token_id: str, holders_mode: str = Query("address", des
             "num_contracts": num_contracts,
         }
     
+    mode = (holders_mode or "address").lower()
+    if mode == "cluster":
+        try:
+            exists = db.execute(text("SELECT to_regclass('public.address_clusters')")).scalar()
+            if not exists:
+                mode = "address"
+        except Exception:
+            mode = "address"
+
+    if mode == "cluster":
+        holder_count = (
+            db.execute(
+                text(
+                    "SELECT COUNT(DISTINCT COALESCE('CLUSTER:' || ac.cluster_id::text, th.address)) "
+                    "FROM token_holders th "
+                    "LEFT JOIN address_clusters ac ON ac.address = th.address "
+                    "WHERE th.token_id = :token_id AND th.balance > 0 AND th.address IS NOT NULL AND length(btrim(th.address)) > 0"
+                ),
+                {'token_id': resolved_ref},
+            ).scalar()
+            or 0
+        )
+    else:
+        holder_count = (
+            db.execute(
+                text(
+                    "SELECT COUNT(DISTINCT address) "
+                    "FROM token_holders "
+                    "WHERE token_id = :token_id AND balance > 0 AND address IS NOT NULL AND length(btrim(address)) > 0"
+                ),
+                {'token_id': resolved_ref},
+            ).scalar()
+            or 0
+        )
+
     return {
-        "token_id": resolved_ref,
+        "token_id": token.token_id,
         "name": token.name,
         "ticker": token.ticker,
         "type": token.type,
@@ -1154,12 +1271,13 @@ def get_token_supply_api(token_id: str, holders_mode: str = Query("address", des
         "circulating_supply": token.circulating_supply,
         "burned_supply": token.burned_supply or 0,
         "premine": token.premine,
-        "holder_count": token.holder_count or 0,
+        "holder_count": int(holder_count) if holder_count is not None else 0,
         "supply_updated_at": token.supply_updated_at.isoformat() if token.supply_updated_at else None,
         # DMINT specific
         "difficulty": token.difficulty,
         "max_height": token.max_height,
         "reward": token.reward,
+        "num_contracts": token.num_contracts,
     }
 
 

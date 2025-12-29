@@ -52,6 +52,19 @@ def backfill_spent_outputs(max_seconds=None, batch_size=None, sleep_seconds=None
     if sleep_seconds is None:
         sleep_seconds = float(os.getenv("SPENT_BACKFILL_SLEEP_SECONDS", "0.1"))
 
+    include_burns = os.getenv("SPENT_BACKFILL_INCLUDE_BURNS", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+    statement_timeout_ms = None
+    try:
+        statement_timeout_ms = int(os.getenv("SPENT_BACKFILL_STATEMENT_TIMEOUT_MS", "60000") or 60000)
+    except Exception:
+        statement_timeout_ms = 60000
+
+    burn_statement_timeout_ms = None
+    try:
+        burn_statement_timeout_ms = int(os.getenv("BURN_BACKFILL_STATEMENT_TIMEOUT_MS", "15000") or 15000)
+    except Exception:
+        burn_statement_timeout_ms = 15000
+
     total_updated = 0
     
     with get_indexer_session() as db:
@@ -159,6 +172,11 @@ def backfill_spent_outputs(max_seconds=None, batch_size=None, sleep_seconds=None
             
             try:
                 batch_start_time = time.time()
+                try:
+                    if statement_timeout_ms and statement_timeout_ms > 0:
+                        db.execute(text(f"SET LOCAL statement_timeout TO {int(statement_timeout_ms)}"))
+                except Exception:
+                    db.rollback()
                 result = db.execute(stmt, {'last_id': last_id, 'batch_size': batch_size})
                 updated_count = result.rowcount
                 elapsed = time.time() - batch_start_time
@@ -177,10 +195,277 @@ def backfill_spent_outputs(max_seconds=None, batch_size=None, sleep_seconds=None
                     status.is_complete = True
                     status.completed_at = datetime.datetime.utcnow()
                     db.commit()
+
+                    if include_burns:
+                        try:
+                            db.begin_nested()
+                            try:
+                                if burn_statement_timeout_ms and burn_statement_timeout_ms > 0:
+                                    db.execute(text(f"SET LOCAL statement_timeout TO {int(burn_statement_timeout_ms)}"))
+                            except Exception:
+                                db.rollback()
+
+                            db.execute(
+                                text(
+                                    """
+                                    WITH tx_inputs AS (
+                                        SELECT
+                                            t.txid AS spending_txid,
+                                            t.block_height AS block_height,
+                                            u.glyph_ref AS token_id,
+                                            SUM((u.value * 100000000)::bigint) AS amount
+                                        FROM transaction_inputs i
+                                        JOIN transactions t ON t.id = i.transaction_id
+                                        JOIN utxos_initial u ON u.txid = i.spent_txid AND u.vout = i.spent_vout
+                                        WHERE i.id > :start_id
+                                          AND i.id <= :end_id
+                                          AND i.spent_txid IS NOT NULL
+                                          AND u.glyph_ref IS NOT NULL
+                                          AND length(btrim(u.glyph_ref)) > 0
+                                        GROUP BY t.txid, t.block_height, u.glyph_ref
+                                    ),
+                                    tx_outputs AS (
+                                        SELECT o.txid AS spending_txid, o.glyph_ref AS token_id
+                                        FROM utxos_initial o
+                                        WHERE o.txid IN (SELECT DISTINCT spending_txid FROM tx_inputs)
+                                          AND o.glyph_ref IS NOT NULL
+                                          AND length(btrim(o.glyph_ref)) > 0
+                                        GROUP BY o.txid, o.glyph_ref
+                                    ),
+                                    burns AS (
+                                        SELECT
+                                            i.token_id,
+                                            i.spending_txid AS txid,
+                                            i.block_height,
+                                            i.amount
+                                        FROM tx_inputs i
+                                        LEFT JOIN tx_outputs o
+                                          ON o.spending_txid = i.spending_txid
+                                         AND o.token_id = i.token_id
+                                        WHERE o.token_id IS NULL
+                                          AND i.amount > 0
+                                    ),
+                                    ins AS (
+                                        INSERT INTO token_burns (token_id, txid, amount, block_height)
+                                        SELECT b.token_id, b.txid, b.amount, b.block_height
+                                        FROM burns b
+                                        LEFT JOIN token_burns existing
+                                          ON existing.token_id = b.token_id
+                                         AND existing.txid = b.txid
+                                        WHERE existing.id IS NULL
+                                        RETURNING token_id, amount
+                                    )
+                                    UPDATE glyph_tokens gt
+                                    SET burned_supply = COALESCE(gt.burned_supply, 0) + ins.amount
+                                    FROM ins
+                                    WHERE gt.token_id = ins.token_id;
+                                    """
+                                ),
+                                {
+                                    'start_id': int(last_id - batch_size),
+                                    'end_id': int(last_id),
+                                },
+                            )
+                            db.commit()
+
+                            try:
+                                db.begin_nested()
+                                try:
+                                    if burn_statement_timeout_ms and burn_statement_timeout_ms > 0:
+                                        db.execute(text(f"SET LOCAL statement_timeout TO {int(burn_statement_timeout_ms)}"))
+                                except Exception:
+                                    db.rollback()
+
+                                db.execute(
+                                    text(
+                                        """
+                                        WITH tx_inputs AS (
+                                            SELECT
+                                                t.txid AS spending_txid,
+                                                u.glyph_ref AS token_id,
+                                                SUM((u.value * 100000000)::bigint) AS amount
+                                            FROM transaction_inputs i
+                                            JOIN transactions t ON t.id = i.transaction_id
+                                            JOIN utxos_initial u ON u.txid = i.spent_txid AND u.vout = i.spent_vout
+                                            WHERE i.id > :start_id
+                                              AND i.id <= :end_id
+                                              AND i.spent_txid IS NOT NULL
+                                              AND u.glyph_ref IS NOT NULL
+                                              AND length(btrim(u.glyph_ref)) > 0
+                                            GROUP BY t.txid, u.glyph_ref
+                                        ),
+                                        tx_outputs AS (
+                                            SELECT o.txid AS spending_txid, o.glyph_ref AS token_id
+                                            FROM utxos_initial o
+                                            WHERE o.txid IN (SELECT DISTINCT spending_txid FROM tx_inputs)
+                                              AND o.glyph_ref IS NOT NULL
+                                              AND length(btrim(o.glyph_ref)) > 0
+                                            GROUP BY o.txid, o.glyph_ref
+                                        ),
+                                        burns AS (
+                                            SELECT i.token_id, SUM(i.amount) AS amount
+                                            FROM tx_inputs i
+                                            LEFT JOIN tx_outputs o
+                                              ON o.spending_txid = i.spending_txid
+                                             AND o.token_id = i.token_id
+                                            WHERE o.token_id IS NULL
+                                              AND i.amount > 0
+                                            GROUP BY i.token_id
+                                        )
+                                        UPDATE glyphs g
+                                        SET burned_supply = COALESCE(g.burned_supply, 0) + b.amount
+                                        FROM burns b
+                                        WHERE g.ref = b.token_id;
+                                        """
+                                    ),
+                                    {
+                                        'start_id': int(last_id - batch_size),
+                                        'end_id': int(last_id),
+                                    },
+                                )
+                                db.commit()
+                            except Exception:
+                                db.rollback()
+                        except Exception:
+                            db.rollback()
+
                     logger.info("Backfill complete - processed all transaction inputs.")
                     break
 
                 db.commit()
+
+                if include_burns:
+                    try:
+                        db.begin_nested()
+                        try:
+                            if burn_statement_timeout_ms and burn_statement_timeout_ms > 0:
+                                db.execute(text(f"SET LOCAL statement_timeout TO {int(burn_statement_timeout_ms)}"))
+                        except Exception:
+                            db.rollback()
+
+                        db.execute(
+                            text(
+                                """
+                                WITH tx_inputs AS (
+                                    SELECT
+                                        t.txid AS spending_txid,
+                                        t.block_height AS block_height,
+                                        u.glyph_ref AS token_id,
+                                        SUM((u.value * 100000000)::bigint) AS amount
+                                    FROM transaction_inputs i
+                                    JOIN transactions t ON t.id = i.transaction_id
+                                    JOIN utxos_initial u ON u.txid = i.spent_txid AND u.vout = i.spent_vout
+                                    WHERE i.id > :start_id
+                                      AND i.id <= :end_id
+                                      AND i.spent_txid IS NOT NULL
+                                      AND u.glyph_ref IS NOT NULL
+                                      AND length(btrim(u.glyph_ref)) > 0
+                                    GROUP BY t.txid, t.block_height, u.glyph_ref
+                                ),
+                                tx_outputs AS (
+                                    SELECT o.txid AS spending_txid, o.glyph_ref AS token_id
+                                    FROM utxos_initial o
+                                    WHERE o.txid IN (SELECT DISTINCT spending_txid FROM tx_inputs)
+                                      AND o.glyph_ref IS NOT NULL
+                                      AND length(btrim(o.glyph_ref)) > 0
+                                    GROUP BY o.txid, o.glyph_ref
+                                ),
+                                burns AS (
+                                    SELECT
+                                        i.token_id,
+                                        i.spending_txid AS txid,
+                                        i.block_height,
+                                        i.amount
+                                    FROM tx_inputs i
+                                    LEFT JOIN tx_outputs o
+                                      ON o.spending_txid = i.spending_txid
+                                     AND o.token_id = i.token_id
+                                    WHERE o.token_id IS NULL
+                                      AND i.amount > 0
+                                ),
+                                ins AS (
+                                    INSERT INTO token_burns (token_id, txid, amount, block_height)
+                                    SELECT b.token_id, b.txid, b.amount, b.block_height
+                                    FROM burns b
+                                    LEFT JOIN token_burns existing
+                                      ON existing.token_id = b.token_id
+                                     AND existing.txid = b.txid
+                                    WHERE existing.id IS NULL
+                                    RETURNING token_id, amount
+                                )
+                                UPDATE glyph_tokens gt
+                                SET burned_supply = COALESCE(gt.burned_supply, 0) + ins.amount
+                                FROM ins
+                                WHERE gt.token_id = ins.token_id;
+                                """
+                            ),
+                            {
+                                'start_id': int(last_id - batch_size),
+                                'end_id': int(last_id),
+                            },
+                        )
+                        db.commit()
+
+                        try:
+                            db.begin_nested()
+                            try:
+                                if burn_statement_timeout_ms and burn_statement_timeout_ms > 0:
+                                    db.execute(text(f"SET LOCAL statement_timeout TO {int(burn_statement_timeout_ms)}"))
+                            except Exception:
+                                db.rollback()
+
+                            db.execute(
+                                text(
+                                    """
+                                    WITH tx_inputs AS (
+                                        SELECT
+                                            t.txid AS spending_txid,
+                                            u.glyph_ref AS token_id,
+                                            SUM((u.value * 100000000)::bigint) AS amount
+                                        FROM transaction_inputs i
+                                        JOIN transactions t ON t.id = i.transaction_id
+                                        JOIN utxos_initial u ON u.txid = i.spent_txid AND u.vout = i.spent_vout
+                                        WHERE i.id > :start_id
+                                          AND i.id <= :end_id
+                                          AND i.spent_txid IS NOT NULL
+                                          AND u.glyph_ref IS NOT NULL
+                                          AND length(btrim(u.glyph_ref)) > 0
+                                        GROUP BY t.txid, u.glyph_ref
+                                    ),
+                                    tx_outputs AS (
+                                        SELECT o.txid AS spending_txid, o.glyph_ref AS token_id
+                                        FROM utxos_initial o
+                                        WHERE o.txid IN (SELECT DISTINCT spending_txid FROM tx_inputs)
+                                          AND o.glyph_ref IS NOT NULL
+                                          AND length(btrim(o.glyph_ref)) > 0
+                                        GROUP BY o.txid, o.glyph_ref
+                                    ),
+                                    burns AS (
+                                        SELECT i.token_id, SUM(i.amount) AS amount
+                                        FROM tx_inputs i
+                                        LEFT JOIN tx_outputs o
+                                          ON o.spending_txid = i.spending_txid
+                                         AND o.token_id = i.token_id
+                                        WHERE o.token_id IS NULL
+                                          AND i.amount > 0
+                                        GROUP BY i.token_id
+                                    )
+                                    UPDATE glyphs g
+                                    SET burned_supply = COALESCE(g.burned_supply, 0) + b.amount
+                                    FROM burns b
+                                    WHERE g.ref = b.token_id;
+                                    """
+                                ),
+                                {
+                                    'start_id': int(last_id - batch_size),
+                                    'end_id': int(last_id),
+                                },
+                            )
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                    except Exception:
+                        db.rollback()
                 
                 time.sleep(sleep_seconds)
             except Exception as e:
