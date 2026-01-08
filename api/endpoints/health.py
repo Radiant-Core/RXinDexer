@@ -4,13 +4,31 @@ from sqlalchemy import text
 import psutil
 import time
 import os
+import logging
+from typing import Dict, Any
 
 from api.dependencies import get_db
-from api.utils import rpc_call
+from api.utils import rpc_call, check_node_connection
 from api.cache import cache
 from api.endpoints.wallets import cached_rxd_holder_count
 from api.endpoints.tokens import cached_token_holder_count
 from database.session import engine
+
+# Try to import metrics (optional)
+try:
+    from config.metrics import metrics, update_db_pool_metrics
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+
+# Try to import alert manager (optional)
+try:
+    from config.logging_config import alert_manager, AlertLevel
+    ALERTS_AVAILABLE = True
+except ImportError:
+    ALERTS_AVAILABLE = False
+
+logger = logging.getLogger("rxindexer.health")
 
 router = APIRouter()
 
@@ -177,3 +195,136 @@ def clear_cache():
     cached_rxd_holder_count.cache_clear()
     cached_token_holder_count.cache_clear()
     return {"status": "all caches cleared", "ttl_cache": "cleared", "lru_cache": "cleared"}
+
+
+@router.get("/health/services")
+def inter_service_health(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """
+    Check health of all inter-service communications.
+    Tests connectivity to radiant-node, database, and internal services.
+    """
+    services_status = {
+        "timestamp": int(time.time()),
+        "overall_status": "healthy",
+        "services": {}
+    }
+    
+    issues = []
+    
+    # 1. Database connectivity
+    try:
+        start = time.time()
+        db.execute(text("SELECT 1"))
+        latency = (time.time() - start) * 1000
+        services_status["services"]["database"] = {
+            "status": "healthy",
+            "latency_ms": round(latency, 2)
+        }
+    except Exception as e:
+        services_status["services"]["database"] = {
+            "status": "unhealthy",
+            "error": str(e)
+        }
+        issues.append(f"Database: {e}")
+    
+    # 2. Radiant Node connectivity
+    node_status = check_node_connection()
+    if node_status["connected"]:
+        services_status["services"]["radiant_node"] = {
+            "status": "healthy",
+            "latency_ms": node_status["latency_ms"],
+            "block_height": node_status["block_height"]
+        }
+    else:
+        services_status["services"]["radiant_node"] = {
+            "status": "unhealthy",
+            "error": node_status.get("error", "Connection failed")
+        }
+        issues.append(f"Radiant Node: {node_status.get('error', 'unreachable')}")
+    
+    # 3. Check sync status
+    try:
+        if services_status["services"].get("radiant_node", {}).get("status") == "healthy":
+            node_height = node_status["block_height"]
+            db_height = db.execute(text("SELECT COALESCE(MAX(height), 0) FROM blocks")).scalar()
+            sync_lag = node_height - db_height
+            
+            sync_status = "healthy" if sync_lag < 100 else "behind" if sync_lag < 1000 else "critical"
+            services_status["services"]["sync"] = {
+                "status": sync_status,
+                "node_height": node_height,
+                "db_height": db_height,
+                "lag": sync_lag
+            }
+            
+            if sync_lag > 1000:
+                issues.append(f"Sync lag critical: {sync_lag} blocks")
+    except Exception as e:
+        services_status["services"]["sync"] = {
+            "status": "unknown",
+            "error": str(e)
+        }
+    
+    # 4. Check backfill status
+    try:
+        backfill_result = db.execute(text("""
+            SELECT backfill_type, is_complete, 
+                   EXTRACT(EPOCH FROM (NOW() - updated_at)) as seconds_since_update
+            FROM backfill_status
+        """))
+        backfills = {}
+        for row in backfill_result:
+            backfill_type, is_complete, seconds_since = row
+            status = "complete" if is_complete else "in_progress"
+            if not is_complete and seconds_since and seconds_since > 3600:
+                status = "stalled"
+                issues.append(f"Backfill {backfill_type} may be stalled")
+            backfills[backfill_type] = {
+                "status": status,
+                "is_complete": is_complete,
+                "seconds_since_update": round(seconds_since) if seconds_since else None
+            }
+        services_status["services"]["backfills"] = backfills
+    except Exception as e:
+        services_status["services"]["backfills"] = {
+            "status": "unknown",
+            "error": str(e)
+        }
+    
+    # Determine overall status
+    if issues:
+        services_status["overall_status"] = "degraded"
+        services_status["issues"] = issues
+        
+        # Raise alerts for critical issues
+        if ALERTS_AVAILABLE:
+            for issue in issues:
+                if "critical" in issue.lower() or "unhealthy" in str(services_status["services"]).lower():
+                    alert_manager.alert(AlertLevel.WARNING, f"Service health issue: {issue}")
+    
+    return services_status
+
+
+@router.get("/metrics")
+def prometheus_metrics():
+    """Export Prometheus metrics."""
+    if not METRICS_AVAILABLE:
+        return {"error": "Metrics not available. Install prometheus_client."}
+    
+    from fastapi.responses import Response
+    return Response(
+        content=metrics.export(),
+        media_type=metrics.content_type()
+    )
+
+
+@router.get("/health/alerts")
+def get_recent_alerts():
+    """Get recent system alerts."""
+    if not ALERTS_AVAILABLE:
+        return {"alerts": [], "message": "Alert system not configured"}
+    
+    return {
+        "alerts": alert_manager.get_recent_alerts(20),
+        "count": len(alert_manager.alerts)
+    }

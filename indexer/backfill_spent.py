@@ -15,6 +15,82 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Try to import metrics (optional)
+try:
+    from config.metrics import record_backfill_progress
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+    def record_backfill_progress(*args, **kwargs): pass
+
+
+class ETATracker:
+    """Tracks progress and estimates time to completion."""
+    
+    def __init__(self, total_items: int, start_position: int = 0):
+        self.total_items = total_items
+        self.start_position = start_position
+        self.current_position = start_position
+        self.start_time = time.time()
+        self.samples = []  # (timestamp, position) samples for rate calculation
+        self.max_samples = 10  # Rolling window size
+    
+    def update(self, current_position: int) -> dict:
+        """Update progress and calculate ETA."""
+        now = time.time()
+        self.current_position = current_position
+        
+        # Add sample
+        self.samples.append((now, current_position))
+        if len(self.samples) > self.max_samples:
+            self.samples.pop(0)
+        
+        # Calculate progress
+        total_range = self.total_items - self.start_position
+        completed = current_position - self.start_position
+        progress_pct = (completed / total_range * 100) if total_range > 0 else 100.0
+        
+        # Calculate rate using rolling window
+        eta_seconds = None
+        rate_per_second = None
+        
+        if len(self.samples) >= 2:
+            oldest_time, oldest_pos = self.samples[0]
+            time_diff = now - oldest_time
+            pos_diff = current_position - oldest_pos
+            
+            if time_diff > 0 and pos_diff > 0:
+                rate_per_second = pos_diff / time_diff
+                remaining = self.total_items - current_position
+                eta_seconds = remaining / rate_per_second if rate_per_second > 0 else None
+        
+        return {
+            'progress_pct': round(progress_pct, 2),
+            'current': current_position,
+            'total': self.total_items,
+            'rate_per_second': round(rate_per_second, 1) if rate_per_second else None,
+            'eta_seconds': round(eta_seconds, 0) if eta_seconds else None,
+            'eta_formatted': self._format_eta(eta_seconds) if eta_seconds else None,
+            'elapsed_seconds': round(now - self.start_time, 1)
+        }
+    
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        """Format seconds as human-readable duration."""
+        if seconds is None:
+            return "unknown"
+        
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        elif seconds < 3600:
+            mins = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{mins}m {secs}s"
+        else:
+            hours = int(seconds // 3600)
+            mins = int((seconds % 3600) // 60)
+            return f"{hours}h {mins}m"
+
 BACKFILL_TYPE = 'spent'
 
 _LAST_UTXO_STATE_LOG_TS = 0.0
@@ -150,6 +226,9 @@ def backfill_spent_outputs(max_seconds=None, batch_size=None, sleep_seconds=None
 
         budget_start_time = time.time()
         
+        # Initialize ETA tracker
+        eta_tracker = ETATracker(total_items=max_input_id, start_position=last_id)
+        
         while True:
             if max_seconds is not None and (time.time() - budget_start_time) >= max_seconds:
                 return False
@@ -183,13 +262,25 @@ def backfill_spent_outputs(max_seconds=None, batch_size=None, sleep_seconds=None
                 
                 total_updated += updated_count
                 last_id += batch_size
-                progress_pct = min(100, (last_id - min_input_id) * 100 / (max_input_id - min_input_id + 1))
 
                 status.last_processed_id = last_id
                 status.total_processed = (status.total_processed or 0) + updated_count
                 status.updated_at = datetime.datetime.utcnow()
                 
-                logger.info(f"Updated {updated_count} UTXOs in {elapsed:.1f}s. Total: {total_updated:,} | Progress: {progress_pct:.1f}%")
+                # Update ETA tracker and get progress info
+                progress = eta_tracker.update(last_id)
+                eta_str = f" | ETA: {progress['eta_formatted']}" if progress['eta_formatted'] else ""
+                rate_str = f" | Rate: {progress['rate_per_second']:,.0f}/s" if progress['rate_per_second'] else ""
+                
+                logger.info(f"Updated {updated_count} UTXOs in {elapsed:.1f}s. Total: {total_updated:,} | Progress: {progress['progress_pct']:.1f}%{rate_str}{eta_str}")
+                
+                # Record metrics
+                record_backfill_progress(
+                    backfill_type='spent',
+                    progress_pct=progress['progress_pct'],
+                    items_processed=updated_count,
+                    eta_seconds=progress['eta_seconds']
+                )
 
                 if last_id >= max_input_id:
                     status.is_complete = True

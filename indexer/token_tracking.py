@@ -141,9 +141,35 @@ def get_token_holders(db: Session, token_id: str, limit: int = 100, offset: int 
 
 
 def count_token_holders(db: Session, token_id: str) -> int:
-    """Count total holders for a token."""
+    """Count total holders for a token using address clustering."""
+    # Try to use address clustering first (more accurate count)
+    try:
+        exists = db.execute(text("SELECT to_regclass('public.address_clusters')")).scalar()
+        if exists:
+            result = db.execute(text(
+                """
+                SELECT COUNT(DISTINCT COALESCE('CLUSTER:' || ac.cluster_id::text, th.address))
+                FROM token_holders th
+                LEFT JOIN address_clusters ac ON ac.address = th.address
+                WHERE th.token_id = :token_id
+                  AND th.balance > 0
+                  AND th.address IS NOT NULL
+                  AND length(btrim(th.address)) > 0
+                """
+            ), {'token_id': token_id})
+            count = result.scalar()
+            if count is not None:
+                return int(count)
+    except Exception:
+        pass
+    
+    # Fallback to simple address counting if clustering not available
     result = db.execute(text("""
-        SELECT COUNT(*) FROM token_holders WHERE token_id = :token_id
+        SELECT COUNT(*) FROM token_holders 
+        WHERE token_id = :token_id 
+          AND balance > 0 
+          AND address IS NOT NULL 
+          AND length(btrim(address)) > 0
     """), {'token_id': token_id})
     return result.scalar() or 0
 

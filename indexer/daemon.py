@@ -4,6 +4,7 @@ import os
 import logging
 import time
 import threading
+import signal
 from database.session import SessionLocal
 from indexer.sync import sync_blocks
 from indexer.parser import parse_transactions
@@ -11,8 +12,106 @@ from indexer.parser import parse_transactions
 from indexer.monitor import get_sync_lag, start_monitoring_thread, periodic_status_check
 from database.maintenance import restore_heavy_indices
 
+# Try to import metrics and alerts
+try:
+    from config.metrics import record_sync_metrics, record_blocks_synced
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+    def record_sync_metrics(*args, **kwargs): pass
+    def record_blocks_synced(*args, **kwargs): pass
+
+try:
+    from config.logging_config import alert_manager, AlertLevel, get_logger
+    ALERTS_AVAILABLE = True
+    daemon_logger = get_logger("daemon")
+except ImportError:
+    ALERTS_AVAILABLE = False
+    daemon_logger = logging.getLogger("rxindexer.daemon")
+
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+
+# Graceful shutdown handling
+_shutdown_requested = False
+_last_known_db_height = 0
+_restart_detection_threshold = 100  # Blocks regression threshold for restart detection
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global _shutdown_requested
+    signal_name = signal.Signals(signum).name
+    print(f"[daemon] Received {signal_name}, initiating graceful shutdown...")
+    sys.stdout.flush()
+    _shutdown_requested = True
+
+
+def is_shutdown_requested() -> bool:
+    """Check if shutdown has been requested."""
+    return _shutdown_requested
+
+
+def detect_node_restart(current_node_height: int, current_db_height: int) -> bool:
+    """
+    Detect if the node appears to have restarted.
+    This happens when the node tip is significantly behind the DB tip.
+    """
+    global _last_known_db_height
+    
+    if current_db_height > current_node_height + _restart_detection_threshold:
+        regression = current_db_height - current_node_height
+        print(f"[RESTART_DETECTED] Node appears to have restarted. "
+              f"DB tip: {current_db_height}, Node tip: {current_node_height}, "
+              f"Regression: {regression} blocks")
+        sys.stdout.flush()
+        return True
+    
+    _last_known_db_height = current_db_height
+    return False
+
+
+def wait_for_node_catchup(target_height: int, timeout_seconds: int = 600) -> bool:
+    """
+    Wait for the node to catch up to a target height.
+    Returns True if caught up, False if timeout.
+    """
+    print(f"[RESTART_DETECTED] Waiting for node to catch up before resuming sync...")
+    sys.stdout.flush()
+    
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout_seconds:
+        if is_shutdown_requested():
+            return False
+        
+        try:
+            from indexer.sync import rpc_call
+            node_height = rpc_call("getblockcount")
+            
+            if node_height >= target_height - 10:  # Within 10 blocks is close enough
+                print(f"[daemon] Node caught up (height: {node_height})")
+                sys.stdout.flush()
+                return True
+            
+            remaining = target_height - node_height
+            print(f"[daemon] Waiting for node... Current: {node_height}, Target: {target_height}, Remaining: {remaining}")
+            sys.stdout.flush()
+            
+        except Exception as e:
+            print(f"[daemon] Error checking node height: {e}")
+            sys.stdout.flush()
+        
+        time.sleep(10)
+    
+    print(f"[daemon] Timeout waiting for node to catch up")
+    sys.stdout.flush()
+    return False
+
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 # Start automated monitoring thread (every 5 minutes)
 start_monitoring_thread(interval=300)
@@ -159,15 +258,71 @@ def _start_backfill_worker_once():
 
 def run_daemon():
     indices_checked = False
+    consecutive_errors = 0
+    max_consecutive_errors = 10
     
-    while True:
+    print("[daemon] Starting main sync loop...")
+    sys.stdout.flush()
+    
+    while not is_shutdown_requested():
         db = SessionLocal()
+        sync_start_time = time.time()
+        
         try:
+            # Get current heights before sync
+            lag_info = get_sync_lag()
+            node_height = lag_info.get('node_height', 0) if isinstance(lag_info, dict) else 0
+            db_height = lag_info.get('db_height', 0) if isinstance(lag_info, dict) else 0
+            
+            # Check for node restart
+            if node_height > 0 and db_height > 0:
+                if detect_node_restart(node_height, db_height):
+                    # Wait for node to catch up before continuing
+                    if not wait_for_node_catchup(db_height):
+                        if is_shutdown_requested():
+                            break
+                        print("[daemon] Node did not catch up in time, continuing anyway...")
+                        sys.stdout.flush()
+            
             sync_blocks(db, parse_tx_callback=parse_transactions)
+            consecutive_errors = 0  # Reset error counter on success
+            
+            # Record metrics
+            if METRICS_AVAILABLE:
+                new_lag_info = get_sync_lag()
+                if isinstance(new_lag_info, dict):
+                    sync_duration = time.time() - sync_start_time
+                    record_sync_metrics(
+                        db_height=new_lag_info.get('db_height', 0),
+                        node_height=new_lag_info.get('node_height', 0),
+                        sync_duration=sync_duration
+                    )
+                    
         except Exception as e:
+            consecutive_errors += 1
             print(f"Sync error: {e}")
+            sys.stdout.flush()
+            
+            # Alert on repeated errors
+            if ALERTS_AVAILABLE and consecutive_errors >= 3:
+                alert_manager.alert(
+                    AlertLevel.WARNING,
+                    f"Repeated sync errors: {consecutive_errors} consecutive failures",
+                    {"last_error": str(e)}
+                )
+            
+            # Back off on repeated errors
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"[daemon] Too many consecutive errors ({consecutive_errors}), backing off...")
+                sys.stdout.flush()
+                time.sleep(60)
+                consecutive_errors = 0  # Reset after backoff
+                
         finally:
             db.close()
+        
+        if is_shutdown_requested():
+            break
         
         # Adaptive sleep based on sync lag
         lag = 1000000 # Default to high lag to prevent premature index restoration
@@ -199,13 +354,20 @@ def run_daemon():
         elif lag > 10:  # Very low lag - longer sleep
             sleep_time = 10
         else:  # Fully synced - standard sleep
-            sleep_time = _env_int("SYNC_POLL_INTERVAL_CAUGHT_UP", 30)
+            sleep_time = _env_int("SYNC_POLL_INTERVAL_CAUGHT_UP", 120)
         
         if sleep_time > 0:
             print(f"[daemon] Sync lag: {lag}. Sleeping {sleep_time}s before next sync."); sys.stdout.flush()
-            time.sleep(sleep_time)
+            # Use interruptible sleep for graceful shutdown
+            for _ in range(int(sleep_time)):
+                if is_shutdown_requested():
+                    break
+                time.sleep(1)
         else:
             print(f"[daemon] Critical sync lag: {lag}. Continuous sync mode - no sleep."); sys.stdout.flush()
+    
+    print("[daemon] Shutdown complete.")
+    sys.stdout.flush()
 
 if __name__ == "__main__":
     run_daemon()

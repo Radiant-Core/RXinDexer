@@ -3,3 +3,5 @@ sqlalchemy
 psycopg2-binary
 cbor2
 alembic
+psutil
+prometheus_client>=0.17.0

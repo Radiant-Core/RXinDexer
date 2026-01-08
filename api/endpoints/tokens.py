@@ -3,7 +3,7 @@ from fastapi.responses import Response, RedirectResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text, cast, or_
 from sqlalchemy.dialects.postgresql import JSONB
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import re
 import json
 import base64
@@ -59,7 +59,7 @@ def _glyph_to_legacy_token_dict(g: Glyph) -> dict:
     }
 
 
-def _resolve_token_ref(db: Session, token_id: str) -> tuple[str, Glyph | None]:
+def _resolve_token_ref(db: Session, token_id: str) -> Tuple[str, Optional[Glyph]]:
     if not isinstance(token_id, str):
         return token_id, None
 
@@ -141,7 +141,7 @@ def _b58check(version: int, payload: bytes) -> str:
     return _b58encode(data + chk)
 
 
-def _resolve_p2pkh_address_from_script_hex(script_hex: str) -> str | None:
+def _resolve_p2pkh_address_from_script_hex(script_hex: str) -> Optional[str]:
     if not isinstance(script_hex, str):
         return None
     s = script_hex.strip().lower()
@@ -158,7 +158,7 @@ def _resolve_p2pkh_address_from_script_hex(script_hex: str) -> str | None:
     return _b58check(0x00, h160)
 
 
-def _parse_nonstandard_key(key: str) -> tuple[str, int] | None:
+def _parse_nonstandard_key(key: str) -> Optional[Tuple[str, int]]:
     if not isinstance(key, str) or not key.startswith('NONSTANDARD:'):
         return None
     rest = key[len('NONSTANDARD:'):]
@@ -175,7 +175,7 @@ def _parse_nonstandard_key(key: str) -> tuple[str, int] | None:
     return txid, vout
 
 
-def _resolve_nonstandard_holder_address(db: Session, addr: str) -> str | None:
+def _resolve_nonstandard_holder_address(db: Session, addr: str) -> Optional[str]:
     parsed = _parse_nonstandard_key(addr)
     if not parsed:
         return None
@@ -199,7 +199,7 @@ def _resolve_nonstandard_holder_address(db: Session, addr: str) -> str | None:
         return None
 
 
-def _resolve_reveal_txid(db: Session, token_ref: str, glyph: Glyph | None) -> str | None:
+def _resolve_reveal_txid(db: Session, token_ref: str, glyph: Optional[Glyph]) -> Optional[str]:
     try:
         rop = getattr(glyph, 'reveal_outpoint', None) if glyph is not None else None
         if isinstance(rop, str) and ':' in rop:
@@ -677,7 +677,7 @@ def get_token_image(token_id: str, db: Session = Depends(get_db)):
     """
     file = None
 
-    def _is_image_mime(mime: str | None) -> bool:
+    def _is_image_mime(mime: Optional[str]) -> bool:
         return bool(mime) and mime.startswith('image/')
 
     # Try common image keys

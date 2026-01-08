@@ -18,7 +18,7 @@ import hashlib
 import os
 import sys
 import time
-from typing import List
+from typing import List, Optional, Tuple
 
 
 # Add repo root to path
@@ -60,7 +60,7 @@ def _b58check(version: int, payload: bytes) -> str:
     return _b58encode(data + chk)
 
 
-def _resolve_p2pkh_address_from_script_hex(script_hex: str) -> str | None:
+def _resolve_p2pkh_address_from_script_hex(script_hex: str) -> Optional[str]:
     if not isinstance(script_hex, str):
         return None
     s = script_hex.strip().lower()
@@ -78,7 +78,7 @@ def _resolve_p2pkh_address_from_script_hex(script_hex: str) -> str | None:
     return _b58check(0x00, h160)
 
 
-def _parse_nonstandard_key(key: str) -> tuple[str, int] | None:
+def _parse_nonstandard_key(key: str) -> Optional[Tuple[str, int]]:
     if not isinstance(key, str) or not key.startswith('NONSTANDARD:'):
         return None
     rest = key[len('NONSTANDARD:'):]
@@ -310,7 +310,7 @@ def _fetch_nonstandard_holder_rows(db, last_id: int, limit: int):
     return [(int(r[0]), str(r[1])) for r in rows if r and r[0] is not None and r[1] is not None]
 
 
-def _resolve_holder_to_canonical_address(db, holder_key: str) -> str | None:
+def _resolve_holder_to_canonical_address(db, holder_key: str) -> Optional[str]:
     parsed = _parse_nonstandard_key(holder_key)
     if not parsed:
         return None
@@ -337,7 +337,7 @@ def _resolve_holder_to_canonical_address(db, holder_key: str) -> str | None:
     return None
 
 
-def run_holders_backfill(db, time_budget_seconds: float | None, start_time: float, batch_size: int = 2000) -> tuple[int, int]:
+def run_holders_backfill(db, time_budget_seconds: Optional[float], start_time: float, batch_size: int = 2000) -> Tuple[int, int]:
     status = _get_or_create_holders_status(db)
     processed = 0
     updated = 0
@@ -374,7 +374,7 @@ def run_holders_backfill(db, time_budget_seconds: float | None, start_time: floa
     return processed, updated
 
 
-def run_backfill(batch_size: int, max_inputs: int, commit_every: int, start_from: int | None, include_token_holders: bool, holders_batch_size: int, only_token_holders: bool):
+def run_backfill(batch_size: int, max_inputs: int, commit_every: int, start_from: Optional[int], include_token_holders: bool, holders_batch_size: int, only_token_holders: bool):
     total_merges = 0
     total_txs = 0
 

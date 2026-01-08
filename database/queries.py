@@ -1,4 +1,5 @@
 # Optimized queries for RXinDexer database
+from typing import Optional
 from .models import Block, Transaction, UTXO, GlyphToken, UserProfile, Glyph, GlyphAction
 from sqlalchemy.orm import Session
 from sqlalchemy import func, case
@@ -63,10 +64,49 @@ def get_unique_wallet_holder_count(db: Session):
 def get_token_holder_count(db: Session, token_id: str):
     """
     Returns the number of unique holders of a given Glyph token (by token_id).
+    Uses address clustering to count multiple addresses belonging to the same wallet as a single holder.
     """
-    from .models import GlyphToken
-    holders = db.query(GlyphToken.owner).filter(GlyphToken.token_id == token_id).distinct().all()
-    return len(holders)
+    from sqlalchemy import text
+    
+    # Try to use address clustering first (more accurate count)
+    try:
+        exists = db.execute(text("SELECT to_regclass('public.address_clusters')")).scalar()
+        if exists:
+            result = db.execute(text(
+                """
+                SELECT COUNT(DISTINCT 
+                    CASE 
+                        WHEN ac.cluster_id IS NOT NULL THEN 'CLUSTER:' || ac.cluster_id::text
+                        ELSE th.address 
+                    END
+                )
+                FROM token_holders th
+                LEFT JOIN address_clusters ac ON ac.address = th.address
+                WHERE th.token_id = :token_id
+                  AND th.balance > 0
+                  AND th.address IS NOT NULL
+                  AND length(btrim(th.address)) > 0
+                """
+            ), {"token_id": token_id})
+            count = result.scalar()
+            if count is not None:
+                return int(count)
+    except Exception:
+        pass
+    
+    # Fallback to simple address counting if clustering not available
+    from sqlalchemy import text, func
+    result = db.execute(text(
+        """
+        SELECT COUNT(DISTINCT address)
+        FROM token_holders 
+        WHERE token_id = :token_id
+          AND balance > 0
+          AND address IS NOT NULL
+          AND length(btrim(address)) > 0
+        """
+    ), {"token_id": token_id})
+    return result.scalar() or 0
 
 
 def get_top_wallets(db: Session, limit: int = 100):
@@ -219,7 +259,7 @@ def list_glyph_tokens(
     token_type: str = None,
     sort: str = "created_at",
     order: str = "desc",
-    mintable: bool | None = None,
+    mintable: Optional[bool] = None,
 ):
     # Performance note:
     # The previous DISTINCT ON strategy is correct if glyph_tokens truly stores
@@ -361,15 +401,15 @@ def get_glyphs(
     db: Session,
     limit: int = 100,
     offset: int = 0,
-    query: str | None = None,
+    query: Optional[str] = None,
     token_type: str = None,
-    author: str | None = None,
-    container: str | None = None,
+    author: Optional[str] = None,
+    container: Optional[str] = None,
     sort: str = "created_at",
     order: str = "desc",
     spent: bool = None,
     is_container: bool = None,
-    has_image: bool | None = None,
+    has_image: Optional[bool] = None,
 ):
     """List glyphs with filtering and sorting."""
     q = db.query(Glyph)

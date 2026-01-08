@@ -1,12 +1,6 @@
 services:
   radiant-node:
-    build:
-      context: ..
-      dockerfile: docker/radiant-node.Dockerfile
-      args:
-        RADIANT_NODE_REPO: https://github.com/Radiant-Core/Radiant-Core.git
-        RADIANT_NODE_REF: master
-    image: radiant-node-git
+    image: radiant-node-local
     container_name: radiant-node
     ports:
       - "${RXD_BIND_IP:-127.0.0.1}:7332:7332"
