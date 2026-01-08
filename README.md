@@ -18,7 +18,7 @@ RXinDexer runs as a small set of Docker services:
 
 | Service | Purpose | Default Ports |
 |--------|---------|---------------|
-| `radiant-node` | Radiant full node (RPC + REST enabled) | `7332`, `7333` |
+| `radiant-node` | Radiant full node ([radiant-core](https://github.com/Radiant-Core/Radiant-Core)) | `7332`, `7333` |
 | `rxindexer-db` | PostgreSQL database | `5432` |
 | `rxindexer-indexer` | Block sync + parse + token/backfill workers | (internal) |
 | `rxindexer-api` | FastAPI API server | `8000` |

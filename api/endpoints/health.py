@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 import psutil
 import time
@@ -7,7 +8,7 @@ import os
 import logging
 from typing import Dict, Any
 
-from api.dependencies import get_db
+from api.dependencies import get_db, get_async_db
 from api.utils import rpc_call, check_node_connection
 from api.cache import cache
 from api.endpoints.wallets import cached_rxd_holder_count
@@ -32,14 +33,14 @@ logger = logging.getLogger("rxindexer.health")
 
 router = APIRouter()
 
-@router.get("/health")
+@router.get("/health", summary="Basic health check", tags=["health"])
 def basic_health():
     """Basic health check - returns OK if API is running"""
     return {"status": "healthy", "service": "rxindexer-api"}
 
-@router.get("/health/detailed")
-def detailed_health_check(db: Session = Depends(get_db)):
-    """Comprehensive health check for production monitoring"""
+@router.get("/health/detailed", summary="Detailed health check", tags=["health"])
+async def detailed_health_check(db: AsyncSession = Depends(get_async_db)):
+    """Comprehensive health check for production monitoring (async)"""
 
     # Cache detailed health briefly to avoid hammering DB/RPC and to keep the
     # explorer homepage responsive even if the node is slow.
@@ -52,14 +53,16 @@ def detailed_health_check(db: Session = Depends(get_db)):
         "status": "healthy",
         "timestamp": int(time.time()),
         "service": "rxindexer-api",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "async_enabled": True
     }
     
-    # Database health check
+    # Database health check (async)
     try:
-        db.execute(text("SELECT 1"))
+        await db.execute(text("SELECT 1"))
         # Test a simple query
-        latest_block = db.execute(text("SELECT MAX(height) FROM blocks")).scalar()
+        result = await db.execute(text("SELECT MAX(height) FROM blocks"))
+        latest_block = result.scalar()
         health_status["database"] = {
             "status": "healthy",
             "latest_block": latest_block or 0,
@@ -158,25 +161,25 @@ def detailed_health_check(db: Session = Depends(get_db)):
     cache.set(cache_key, health_status, 30)  # Cache health for 30 seconds
     return health_status
 
-@router.get("/db-health")
-def db_health(db: Session = Depends(get_db)):
-    """Dedicated database health check endpoint"""
+@router.get("/db-health", summary="Database health check", tags=["health"])
+async def db_health(db: AsyncSession = Depends(get_async_db)):
+    """Dedicated database health check endpoint (async)"""
     try:
-        db.execute(text("SELECT 1"))
-        return {"status": "healthy", "database": "connected"}
+        await db.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected", "async": True}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unhealthy: {str(e)}")
 
-@router.get("/health/db")
-def health_db(db: Session = Depends(get_db)):
-    """Database health check endpoint (alternative path for monitoring)"""
+@router.get("/health/db", summary="Database health (alternative path)", tags=["health"])
+async def health_db(db: AsyncSession = Depends(get_async_db)):
+    """Database health check endpoint (alternative path for monitoring, async)"""
     try:
-        db.execute(text("SELECT 1"))
-        return {"status": "healthy", "database": "connected"}
+        await db.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected", "async": True}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database unhealthy: {str(e)}")
 
-@router.get("/status")
+@router.get("/status", summary="Node status", tags=["health"])
 def status():
     try:
         info = rpc_call("getblockchaininfo")
@@ -197,24 +200,25 @@ def clear_cache():
     return {"status": "all caches cleared", "ttl_cache": "cleared", "lru_cache": "cleared"}
 
 
-@router.get("/health/services")
-def inter_service_health(db: Session = Depends(get_db)) -> Dict[str, Any]:
+@router.get("/health/services", summary="Inter-service health check", tags=["health"])
+async def inter_service_health(db: AsyncSession = Depends(get_async_db)) -> Dict[str, Any]:
     """
-    Check health of all inter-service communications.
+    Check health of all inter-service communications (async).
     Tests connectivity to radiant-node, database, and internal services.
     """
     services_status = {
         "timestamp": int(time.time()),
         "overall_status": "healthy",
+        "async_enabled": True,
         "services": {}
     }
     
     issues = []
     
-    # 1. Database connectivity
+    # 1. Database connectivity (async)
     try:
         start = time.time()
-        db.execute(text("SELECT 1"))
+        await db.execute(text("SELECT 1"))
         latency = (time.time() - start) * 1000
         services_status["services"]["database"] = {
             "status": "healthy",
@@ -242,11 +246,12 @@ def inter_service_health(db: Session = Depends(get_db)) -> Dict[str, Any]:
         }
         issues.append(f"Radiant Node: {node_status.get('error', 'unreachable')}")
     
-    # 3. Check sync status
+    # 3. Check sync status (async)
     try:
         if services_status["services"].get("radiant_node", {}).get("status") == "healthy":
             node_height = node_status["block_height"]
-            db_height = db.execute(text("SELECT COALESCE(MAX(height), 0) FROM blocks")).scalar()
+            result = await db.execute(text("SELECT COALESCE(MAX(height), 0) FROM blocks"))
+            db_height = result.scalar()
             sync_lag = node_height - db_height
             
             sync_status = "healthy" if sync_lag < 100 else "behind" if sync_lag < 1000 else "critical"
@@ -265,9 +270,9 @@ def inter_service_health(db: Session = Depends(get_db)) -> Dict[str, Any]:
             "error": str(e)
         }
     
-    # 4. Check backfill status
+    # 4. Check backfill status (async)
     try:
-        backfill_result = db.execute(text("""
+        backfill_result = await db.execute(text("""
             SELECT backfill_type, is_complete, 
                    EXTRACT(EPOCH FROM (NOW() - updated_at)) as seconds_since_update
             FROM backfill_status
@@ -305,7 +310,7 @@ def inter_service_health(db: Session = Depends(get_db)) -> Dict[str, Any]:
     return services_status
 
 
-@router.get("/metrics")
+@router.get("/metrics", summary="Prometheus metrics export", tags=["health"])
 def prometheus_metrics():
     """Export Prometheus metrics."""
     if not METRICS_AVAILABLE:
@@ -318,7 +323,7 @@ def prometheus_metrics():
     )
 
 
-@router.get("/health/alerts")
+@router.get("/health/alerts", summary="Get recent system alerts", tags=["health"])
 def get_recent_alerts():
     """Get recent system alerts."""
     if not ALERTS_AVAILABLE:

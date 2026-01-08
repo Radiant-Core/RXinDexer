@@ -2,7 +2,7 @@ FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RADIANT_NODE_REPO=https://github.com/Radiant-Core/Radiant-Core.git
-ARG RADIANT_NODE_REF=master
+ARG RADIANT_NODE_REF=main
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
@@ -21,6 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libzmq3-dev \
   libdb-dev \
   libdb++-dev \
+  python3 \
+  python3-dev \
+  help2man \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS utxos (
     txid VARCHAR(64) NOT NULL,
     vout INTEGER NOT NULL,
     address VARCHAR(128),
-    value NUMERIC(20, 8) NOT NULL,
+    value BIGINT NOT NULL,  -- Satoshis (integer for precision)
     spent BOOLEAN DEFAULT FALSE,
     spent_in_txid VARCHAR(64),
     transaction_id INTEGER,
@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS glyphs (
     sealed BOOLEAN DEFAULT FALSE,
     swap_pending BOOLEAN DEFAULT FALSE,
     value BIGINT,
+    burned_supply BIGINT DEFAULT 0,
     location VARCHAR,
     reveal_outpoint VARCHAR,
     last_txo_id INTEGER,
@@ -114,7 +115,25 @@ CREATE TABLE IF NOT EXISTS glyphs (
     remote_hash VARCHAR,
     remote_hash_sig VARCHAR,
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
+    -- Additional fields for full compatibility (previously in legacy tables)
+    owner VARCHAR,                      -- Current owner address
+    max_supply BIGINT,                  -- Maximum token supply
+    current_supply BIGINT,              -- Current minted supply
+    circulating_supply BIGINT,          -- Circulating supply (minted - burned)
+    genesis_height INTEGER,             -- Block height of token creation
+    current_txid VARCHAR(64),           -- Current UTXO txid
+    current_vout INTEGER,               -- Current UTXO vout
+    holder_count INTEGER DEFAULT 0,     -- Cached holder count
+    deploy_method VARCHAR(20),          -- Deployment method (direct, dmint, etc)
+    -- DMINT contract fields
+    difficulty INTEGER,
+    max_height BIGINT,
+    reward BIGINT,
+    num_contracts INTEGER,
+    -- Resolved author info (cached)
+    author_name VARCHAR(255),
+    author_ref_type VARCHAR(20)         -- Type of author ref (user, container, etc)
 );
 
 -- ============================================================================
@@ -229,97 +248,54 @@ CREATE TABLE IF NOT EXISTS import_state (
 );
 
 -- ============================================================================
--- LEGACY TABLES (Backward Compatibility)
+-- LEGACY TABLES (kept for materialized view compatibility)
 -- ============================================================================
+-- glyph_tokens and nfts tables have been consolidated into the unified 'glyphs' table.
+-- All token data is now stored in 'glyphs' with the following token_type values:
+--   - NFT: Non-fungible tokens
+--   - FT: Fungible tokens
+--   - DAT: Data tokens
+--   - CONTAINER: Container/collection tokens
+--   - USER: User identity tokens
 
--- Glyph Tokens (legacy - use glyphs table for new data)
+-- Legacy glyph_tokens table (kept for materialized views)
 CREATE TABLE IF NOT EXISTS glyph_tokens (
     id SERIAL PRIMARY KEY,
-    token_id VARCHAR NOT NULL,
-    txid VARCHAR NOT NULL,
-    type VARCHAR,
-    owner VARCHAR,
-    token_metadata JSON,
-    protocols JSON,
-    protocol_type INTEGER,
-    name VARCHAR(255),
-    description TEXT,
-    token_type_name VARCHAR(100),
-    immutable BOOLEAN DEFAULT TRUE,
-    license VARCHAR(255),
-    attrs JSON,
-    location VARCHAR,
-    max_supply BIGINT,
-    current_supply BIGINT,
-    premine BIGINT,
-    circulating_supply BIGINT,
-    burned_supply BIGINT DEFAULT 0,
-    contract_references JSON,
-    difficulty INTEGER,
-    max_height BIGINT,
-    reward BIGINT,
-    num_contracts INTEGER,
-    container VARCHAR,
-    author VARCHAR,
-    ticker VARCHAR(50),
-    author_name VARCHAR(255),
-    author_image_url VARCHAR(500),
-    author_image_data TEXT,
-    icon_mime_type VARCHAR(100),
-    icon_url VARCHAR(500),
-    icon_data TEXT,
-    genesis_height INTEGER,
-    latest_height INTEGER,
-    current_txid VARCHAR,
-    current_vout INTEGER,
-    reveal_txid VARCHAR(64),
-    reveal_vout INTEGER,
-    spent BOOLEAN DEFAULT FALSE,
-    fresh BOOLEAN DEFAULT TRUE,
-    melted BOOLEAN DEFAULT FALSE,
-    sealed BOOLEAN DEFAULT FALSE,
-    swap_pending BOOLEAN DEFAULT FALSE,
-    value BIGINT,
-    deploy_method VARCHAR(20),
-    holder_count INTEGER DEFAULT 0,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    supply_updated_at TIMESTAMP
-);
-
--- NFTs table (legacy - use glyphs table for new data)
-CREATE TABLE IF NOT EXISTS nfts (
-    id SERIAL PRIMARY KEY,
-    token_id VARCHAR NOT NULL,
+    token_id VARCHAR(72) NOT NULL,
     txid VARCHAR(64),
-    type VARCHAR(50),
-    token_type_name VARCHAR(100),
-    name VARCHAR(255),
+    type VARCHAR(20),
     ticker VARCHAR(50),
-    description TEXT,
-    nft_metadata JSON,
-    attrs JSON,
-    author VARCHAR,
-    container VARCHAR,
-    protocols JSON,
-    protocol_type INTEGER,
-    immutable BOOLEAN DEFAULT TRUE,
-    location VARCHAR,
-    owner VARCHAR,
-    collection VARCHAR,
+    max_supply BIGINT,
+    difficulty INTEGER,
+    premine BIGINT,
     genesis_height INTEGER,
     latest_height INTEGER,
-    reveal_txid VARCHAR(64),
-    reveal_vout INTEGER,
-    current_txid VARCHAR(64),
-    current_vout INTEGER,
     icon_mime_type VARCHAR(100),
-    icon_url VARCHAR(500),
     icon_data TEXT,
-    holder_count INTEGER DEFAULT 1,
-    created_at TIMESTAMP,
+    icon_url VARCHAR(500),
+    container VARCHAR,
+    created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_glyph_tokens_token_id ON glyph_tokens(token_id);
+
+-- Address Clusters (for wallet clustering analysis)
+CREATE SEQUENCE IF NOT EXISTS address_cluster_id_seq;
+CREATE TABLE IF NOT EXISTS address_clusters (
+    address TEXT PRIMARY KEY,
+    cluster_id BIGINT NOT NULL DEFAULT nextval('address_cluster_id_seq'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_address_clusters_cluster_id ON address_clusters (cluster_id);
+
+-- System State (key-value store for tracking)
+CREATE TABLE IF NOT EXISTS system_state (
+    key VARCHAR(255) PRIMARY KEY,
+    value TEXT,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_system_state_key ON system_state(key);
 
 -- User Profiles
 CREATE TABLE IF NOT EXISTS user_profiles (
@@ -479,6 +455,24 @@ CREATE TABLE IF NOT EXISTS wallet_balances (
 );
 
 -- ============================================================================
+-- FOREIGN KEY CONSTRAINTS
+-- ============================================================================
+
+-- Note: FK to partitioned table (utxos) not supported in PostgreSQL.
+-- glyphs.last_txo_id is a logical reference, enforced at application level.
+
+-- ============================================================================
+-- JSON SIZE CONSTRAINTS (Prevent bloat)
+-- ============================================================================
+
+ALTER TABLE glyphs ADD CONSTRAINT check_glyphs_attrs_size 
+    CHECK (attrs IS NULL OR octet_length(attrs::text) < 65536);
+ALTER TABLE glyphs ADD CONSTRAINT check_glyphs_p_size 
+    CHECK (p IS NULL OR octet_length(p::text) < 4096);
+ALTER TABLE glyph_actions ADD CONSTRAINT check_glyph_actions_metadata_size 
+    CHECK (metadata IS NULL OR octet_length(metadata::text) < 16384);
+
+-- ============================================================================
 -- INDEXES
 -- ============================================================================
 
@@ -518,6 +512,15 @@ CREATE INDEX IF NOT EXISTS idx_glyphs_height ON glyphs(height);
 CREATE INDEX IF NOT EXISTS idx_glyphs_spent_fresh ON glyphs(spent, fresh);
 CREATE INDEX IF NOT EXISTS idx_glyphs_spent_token_type ON glyphs(spent, token_type);
 
+-- Composite indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_glyphs_spent_type_created ON glyphs(spent, token_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_utxos_address_spent ON utxos(address, spent);
+
+-- Partial indexes for performance
+CREATE INDEX IF NOT EXISTS idx_glyphs_unspent_nfts ON glyphs(token_type, id) WHERE spent = false AND token_type = 'NFT';
+CREATE INDEX IF NOT EXISTS idx_utxos_unspent_by_address ON utxos(address, txid, vout) WHERE spent = false;
+CREATE INDEX IF NOT EXISTS idx_token_holders_token_balance_desc ON token_holders(token_id, balance DESC);
+
 -- Glyph Actions
 CREATE INDEX IF NOT EXISTS idx_glyph_actions_ref ON glyph_actions(ref);
 CREATE INDEX IF NOT EXISTS idx_glyph_actions_type ON glyph_actions(type);
@@ -533,15 +536,9 @@ CREATE INDEX IF NOT EXISTS idx_contract_list_base_ref ON contract_list(base_ref)
 CREATE INDEX IF NOT EXISTS idx_glyph_likes_glyph_ref ON glyph_likes(glyph_ref);
 CREATE INDEX IF NOT EXISTS idx_glyph_likes_user_address ON glyph_likes(user_address);
 
--- Legacy indexes
-CREATE INDEX IF NOT EXISTS idx_glyph_tokens_token_id ON glyph_tokens(token_id);
-CREATE INDEX IF NOT EXISTS idx_glyph_tokens_type ON glyph_tokens(type);
-CREATE INDEX IF NOT EXISTS idx_glyph_tokens_owner ON glyph_tokens(owner);
-CREATE INDEX IF NOT EXISTS idx_glyph_tokens_container ON glyph_tokens(container);
-CREATE INDEX IF NOT EXISTS idx_glyph_tokens_ticker ON glyph_tokens(ticker);
-CREATE INDEX IF NOT EXISTS idx_nfts_token_id ON nfts(token_id);
-CREATE INDEX IF NOT EXISTS idx_nfts_owner ON nfts(owner);
-CREATE INDEX IF NOT EXISTS idx_nfts_token_type_name ON nfts(token_type_name);
+-- Additional glyphs indexes for owner and genesis_height
+CREATE INDEX IF NOT EXISTS idx_glyphs_owner ON glyphs(owner);
+CREATE INDEX IF NOT EXISTS idx_glyphs_genesis_height ON glyphs(genesis_height);
 CREATE INDEX IF NOT EXISTS idx_token_files_token_id ON token_files(token_id);
 CREATE INDEX IF NOT EXISTS idx_containers_container_id ON containers(container_id);
 CREATE INDEX IF NOT EXISTS idx_token_holders_token_id ON token_holders(token_id);
@@ -557,8 +554,149 @@ INSERT INTO stats (id, glyphs_total, blocks_count) VALUES (1, 0, 0) ON CONFLICT 
 -- Initialize import state
 INSERT INTO import_state (id, last_block_height, last_block_hash, is_importing) VALUES (1, 0, '', false) ON CONFLICT DO NOTHING;
 
--- Mark schema version (skip alembic migrations)
+-- ============================================================================
+-- MATERIALIZED VIEWS (Expensive Aggregations)
+-- ============================================================================
+
+-- Token holder statistics
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_token_holder_stats AS
+SELECT 
+    th.token_id,
+    COUNT(DISTINCT th.address) as holder_count,
+    SUM(th.balance) as circulating_supply,
+    COUNT(*) as holder_entries
+FROM token_holders th
+WHERE th.balance > 0 
+    AND th.address IS NOT NULL 
+    AND length(trim(th.address)) > 0
+GROUP BY th.token_id
+WITH NO DATA;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_token_holder_stats_token_id 
+    ON mv_token_holder_stats(token_id);
+
+-- Token burn statistics
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_token_burn_stats AS
+SELECT 
+    token_id,
+    SUM(amount) as burned_supply,
+    COUNT(*) as burn_count
+FROM token_burns
+GROUP BY token_id
+WITH NO DATA;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_token_burn_stats_token_id 
+    ON mv_token_burn_stats(token_id);
+
+-- Glyph token legacy stats (for compatibility)
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_glyph_token_stats AS
+SELECT 
+    token_id,
+    MAX(max_supply) as max_supply,
+    MAX(difficulty) as difficulty,
+    MAX(premine) as premine,
+    COUNT(*) as token_entries
+FROM glyph_tokens
+GROUP BY token_id
+WITH NO DATA;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_glyph_token_stats_token_id 
+    ON mv_glyph_token_stats(token_id);
+
+-- FT glyph summary view
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_ft_glyph_summary AS
+SELECT 
+    g.id,
+    g.ref,
+    g.token_type,
+    COALESCE(NULLIF(trim(g.name), ''), NULLIF(trim(g.ticker), ''), g.ref) as display_name,
+    NULLIF(trim(g.ticker), '') as display_ticker,
+    g.height,
+    g.created_at,
+    g.updated_at,
+    (g.embed_data IS NOT NULL OR g.remote_url IS NOT NULL) as has_image,
+    COALESCE(ths.holder_count, 0) as holder_count,
+    COALESCE(ths.circulating_supply, 0) as circulating_supply,
+    gts.max_supply,
+    COALESCE(tbs.burned_supply, 0) as burned_supply,
+    gts.difficulty,
+    gts.premine
+FROM glyphs g
+LEFT JOIN mv_token_holder_stats ths ON ths.token_id = g.ref
+LEFT JOIN mv_token_burn_stats tbs ON tbs.token_id = g.ref
+LEFT JOIN mv_glyph_token_stats gts ON gts.token_id = g.ref
+WHERE g.token_type = 'FT'
+WITH NO DATA;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_ft_glyph_summary_id
+    ON mv_ft_glyph_summary(id);
+CREATE INDEX IF NOT EXISTS idx_mv_ft_glyph_summary_ref 
+    ON mv_ft_glyph_summary(ref);
+CREATE INDEX IF NOT EXISTS idx_mv_ft_glyph_summary_holder_count 
+    ON mv_ft_glyph_summary(holder_count DESC, ref);
+
+-- Function to refresh all materialized views
+CREATE OR REPLACE FUNCTION refresh_materialized_views()
+RETURNS void AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_token_holder_stats;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_token_burn_stats;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_glyph_token_stats;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_ft_glyph_summary;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- PARTITION MANAGEMENT (Data Retention Policies)
+-- ============================================================================
+
+-- Partition configuration table for automated partition management
+CREATE TABLE IF NOT EXISTS partition_config (
+    id SERIAL PRIMARY KEY,
+    table_name VARCHAR(100) NOT NULL UNIQUE,
+    partition_type VARCHAR(20) NOT NULL DEFAULT 'monthly',
+    retention_months INTEGER DEFAULT 48,
+    auto_create BOOLEAN DEFAULT true,
+    last_partition_created TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Insert default partition configuration
+INSERT INTO partition_config (table_name, partition_type, retention_months)
+VALUES 
+    ('glyph_actions', 'monthly', 48),
+    ('token_price_history', 'monthly', 48), 
+    ('token_volume_daily', 'monthly', 48)
+ON CONFLICT (table_name) DO NOTHING;
+
+-- Function to create new partitions automatically
+CREATE OR REPLACE FUNCTION create_monthly_partitions()
+RETURNS void AS $$
+DECLARE
+    v_table_name TEXT;
+    v_partition_name TEXT;
+    v_start_date DATE;
+    v_end_date DATE;
+    v_month_ahead INTERVAL := '1 month';
+    v_months_to_create INTEGER := 3;
+BEGIN
+    FOR i IN 0..v_months_to_create-1 LOOP
+        v_start_date := date_trunc('month', CURRENT_DATE + (v_month_ahead * i));
+        v_end_date := v_start_date + v_month_ahead;
+        
+        -- Note: For production, partitioned tables are created via migration
+        -- This function is a placeholder for future partition maintenance
+        RAISE NOTICE 'Would create partition for % to %', v_start_date, v_end_date;
+    END LOOP;
+    
+    RAISE NOTICE 'Monthly partitions check complete';
+END;
+$$ LANGUAGE plpgsql;
+
+-- Mark schema version (skip alembic migrations for fresh installs)
+-- This schema includes all production-ready constraints from migrations through 20260108
 CREATE TABLE IF NOT EXISTS alembic_version (
     version_num VARCHAR(32) NOT NULL PRIMARY KEY
 );
-INSERT INTO alembic_version (version_num) VALUES ('20251216_schema_alignment') ON CONFLICT DO NOTHING;
+INSERT INTO alembic_version (version_num) VALUES ('20260108_mv_index') ON CONFLICT DO NOTHING;

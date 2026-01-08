@@ -6,7 +6,7 @@ import requests
 router = APIRouter()
 
 
-@router.get("/market/rxd", tags=["market"])
+@router.get("/market/rxd", tags=["market"], summary="Get RXD market information")
 def get_rxd_market():
     cache_key = "market:rxd"
     cached = cache.get(cache_key)

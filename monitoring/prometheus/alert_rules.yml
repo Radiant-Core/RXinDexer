@@ -1,0 +1,153 @@
+groups:
+  - name: rxindexer.rules
+    rules:
+      # Sync health alerts
+      - alert: SyncLagHigh
+        expr: rxindexer_sync_lag_blocks > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RXinDexer sync lag is high"
+          description: "RXinDexer is {{ $value }} blocks behind the node"
+
+      - alert: SyncLagCritical
+        expr: rxindexer_sync_lag_blocks > 50000
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RXinDexer sync lag is critical"
+          description: "RXinDexer is {{ $value }} blocks behind the node"
+
+      - alert: SyncLagIncreasing
+        expr: increase(rxindexer_sync_lag_blocks[30m]) > 500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sync lag is increasing"
+          description: "Sync lag has increased by {{ $value }} blocks in the last 30 minutes"
+
+      - alert: SyncStalled
+        expr: increase(rxindexer_db_height_blocks[15m]) == 0 and rxindexer_sync_lag_blocks > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer sync has stalled"
+          description: "No new blocks indexed in 15 minutes while {{ $value }} blocks behind"
+
+      # Cache health alerts
+      - alert: CacheHitRatioLow
+        expr: rxindexer_cache_hit_ratio < 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache hit ratio is low"
+          description: "Cache hit ratio is {{ $value | humanizePercentage }}, consider increasing cache TTL or size"
+
+      # API health alerts
+      - alert: APIHighErrorRate
+        expr: rate(rxindexer_api_errors_total[5m]) / rate(rxindexer_api_requests_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API error rate"
+          description: "API error rate is {{ $value | humanizePercentage }}"
+
+      - alert: APILatencyHigh
+        expr: histogram_quantile(0.95, rate(rxindexer_api_latency_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API latency"
+          description: "95th percentile latency is {{ $value }}s"
+
+      # Database alerts
+      - alert: DatabaseConnectionPoolExhausted
+        expr: rxindexer_db_connections_active / rxindexer_db_pool_size > 0.9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection pool nearly exhausted"
+          description: "{{ $value | humanizePercentage }} of connections in use"
+
+      - alert: DatabaseSlowQueries
+        expr: rate(rxindexer_db_slow_queries_total[5m]) > 10
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High number of slow database queries"
+          description: "{{ $value }} slow queries per second"
+
+      # RPC alerts
+      - alert: RPCHighErrorRate
+        expr: rate(rxindexer_rpc_calls_total{status="error"}[5m]) / rate(rxindexer_rpc_calls_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High RPC error rate"
+          description: "RPC error rate is {{ $value | humanizePercentage }}"
+
+      - alert: RPCLatencyHigh
+        expr: histogram_quantile(0.95, rate(rxindexer_rpc_latency_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High RPC latency"
+          description: "95th percentile RPC latency is {{ $value }}s"
+
+      # Backfill alerts
+      - alert: BackfillStalled
+        expr: increase(rxindexer_backfill_items_processed_total[1h]) == 0
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backfill appears stalled"
+          description: "No backfill progress in the last hour"
+
+      # System alerts
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service is down"
+          description: "{{ $labels.job }} has been down for more than 1 minute"
+
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is {{ $value | humanizePercentage }}"
+
+      - alert: HighDiskUsage
+        expr: (node_filesystem_size_bytes - node_filesystem_free_bytes) / node_filesystem_size_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High disk usage"
+          description: "Disk usage is {{ $value | humanizePercentage }}"
+
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage"
+          description: "CPU usage is {{ $value }}%"

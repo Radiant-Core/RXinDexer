@@ -5,7 +5,7 @@ from sqlalchemy import func, or_, case, and_, cast, text, literal
 from sqlalchemy.sql.sqltypes import String
 from typing import List, Optional
 
-from api.dependencies import get_db
+from api.dependencies import get_db, get_current_authenticated_user
 from api.schemas import (
     GlyphResponse,
     GlyphActionResponse,
@@ -32,7 +32,7 @@ def _int_to_str(value) -> str | None:
             return None
 
 
-@router.get("", response_model=List[GlyphResponse])
+@router.get("", response_model=List[GlyphResponse], summary="List all glyphs", tags=["glyphs"])
 def list_glyphs(
     response: Response,
     page: int = Query(1, ge=1),
@@ -47,6 +47,7 @@ def list_glyphs(
     is_container: Optional[bool] = Query(None, description="Filter containers only"),
     has_image: Optional[bool] = Query(None, description="Filter by image presence"),
     db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user),
 ):
     """List glyphs with filtering and sorting."""
     offset = (page - 1) * limit
@@ -74,11 +75,11 @@ def list_glyphs(
 def refresh_materialized_views(db: Session = Depends(get_db)):
     """Manually refresh materialized views for latest data."""
     try:
-        # Use CONCURRENTLY for simple views, regular refresh for complex ones
+        # All views now support CONCURRENT refresh
         db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_token_holder_stats"))
         db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_token_burn_stats"))
         db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_glyph_token_stats"))
-        db.execute(text("REFRESH MATERIALIZED VIEW mv_ft_glyph_summary"))  # No CONCURRENTLY for complex view
+        db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_ft_glyph_summary"))
         db.commit()
         
         # Clear relevant cache entries
@@ -92,7 +93,7 @@ def refresh_materialized_views(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Error refreshing materialized views: {str(e)}")
 
 
-@router.get("/fts/table", response_model=List[FTTokenTableRowResponse])
+@router.get("/fts/table", response_model=List[FTTokenTableRowResponse], summary="List FT tokens in table format", tags=["glyphs"])
 def list_ft_table(
     response: Response,
     page: int = Query(1, ge=1),
@@ -116,8 +117,9 @@ def list_ft_table(
     is_asc = (order or "desc").lower() == "asc"
 
     # Build the SQL query dynamically
+    # Using DISTINCT ON to get the canonical (first) record for each token group
     sql_query = """
-        SELECT 
+        SELECT DISTINCT ON (COALESCE(NULLIF(trim(display_name), ''), NULLIF(trim(display_ticker), ''), ref), NULLIF(trim(display_ticker), ''))
             id, ref, token_type, display_name as name, display_ticker as ticker,
             height, created_at, updated_at, has_image, holder_count, circulating_supply,
             max_supply, burned_supply, difficulty, premine,
@@ -134,7 +136,6 @@ def list_ft_table(
                 ELSE NULL 
             END as mined_percent
         FROM mv_ft_glyph_summary
-        WHERE canonical_rank = 1
     """
 
     # Apply filters
@@ -168,7 +169,15 @@ def list_ft_table(
 
     sort_column = sort_column_map.get(sort_key, "holder_count")
     sort_direction = "ASC" if is_asc else "DESC"
-    sql_query += f" ORDER BY {sort_column} {sort_direction}, id DESC"
+    
+    # DISTINCT ON requires ORDER BY to start with the DISTINCT expression
+    # We need to order by the grouping columns first, then by our desired sort
+    sql_query += f" ORDER BY COALESCE(NULLIF(trim(display_name), ''), NULLIF(trim(display_ticker), ''), ref), NULLIF(trim(display_ticker), ''),"
+    sql_query += f" holder_count DESC, height ASC, id DESC"
+    
+    # Apply final sorting with a subquery
+    inner_query = sql_query
+    sql_query = f"SELECT * FROM ({inner_query}) t ORDER BY {sort_column} {sort_direction}"
     sql_query += " LIMIT :limit OFFSET :offset"
     
     params['limit'] = limit
@@ -207,7 +216,7 @@ def list_ft_table(
     return result
 
 
-@router.get("/fts/duplicates/{ref}", response_model=FTDuplicatesResponse)
+@router.get("/fts/duplicates/{ref}", response_model=FTDuplicatesResponse, summary="Get FT token duplicates", tags=["glyphs"])
 def get_ft_duplicates(ref: str, holders_mode: str = Query("address", description="Holder counting mode: address | cluster"), db: Session = Depends(get_db)):
     glyph = queries.get_glyph_by_ref(db, ref)
     if not glyph or glyph.token_type != "FT":
@@ -343,7 +352,7 @@ def get_ft_duplicates(ref: str, holders_mode: str = Query("address", description
     }
 
 
-@router.get("/recent", response_model=List[GlyphResponse])
+@router.get("/recent", response_model=List[GlyphResponse], summary="Get recent glyphs", tags=["glyphs"])
 def get_recent_glyphs(
     token_type: Optional[str] = Query(None, description="Filter by token type"),
     limit: int = Query(20, ge=1, le=100),
@@ -360,7 +369,7 @@ def get_recent_glyphs(
     return glyphs
 
 
-@router.get("/stats", response_model=GlyphStatsResponse)
+@router.get("/stats", response_model=GlyphStatsResponse, summary="Get glyph statistics", tags=["glyphs"])
 def get_glyph_stats(db: Session = Depends(get_db)):
     """Get statistics about glyphs."""
     cache_key = "glyphs:stats"
@@ -373,7 +382,7 @@ def get_glyph_stats(db: Session = Depends(get_db)):
     return stats
 
 
-@router.get("/search", response_model=List[GlyphResponse])
+@router.get("/search", response_model=List[GlyphResponse], summary="Search glyphs", tags=["glyphs"])
 def search_glyphs(
     q: Optional[str] = Query(None, description="Search query (name, ticker, description)"),
     token_type: Optional[str] = Query(None, description="Filter by token type"),
@@ -394,7 +403,7 @@ def search_glyphs(
     return glyphs
 
 
-@router.get("/containers", response_model=List[GlyphResponse])
+@router.get("/containers", response_model=List[GlyphResponse], summary="Get container glyphs", tags=["glyphs"])
 def get_containers(
     response: Response,
     page: int = Query(1, ge=1),
@@ -425,7 +434,7 @@ def get_containers(
     return glyphs
 
 
-@router.get("/users", response_model=List[GlyphResponse])
+@router.get("/users", response_model=List[GlyphResponse], summary="Get user glyphs", tags=["glyphs"])
 def get_users(
     response: Response,
     page: int = Query(1, ge=1),
@@ -455,7 +464,7 @@ def get_users(
     return glyphs
 
 
-@router.get("/{ref}", response_model=GlyphResponse)
+@router.get("/{ref}", response_model=GlyphResponse, summary="Get glyph by ref", tags=["glyphs"])
 def get_glyph(ref: str, db: Session = Depends(get_db)):
     """Get a glyph by its ref."""
     glyph = queries.get_glyph_by_ref(db, ref)
@@ -464,7 +473,7 @@ def get_glyph(ref: str, db: Session = Depends(get_db)):
     return glyph
 
 
-@router.get("/{ref}/actions", response_model=List[GlyphActionResponse])
+@router.get("/{ref}/actions", response_model=List[GlyphActionResponse], summary="Get glyph actions", tags=["glyphs"])
 def get_glyph_actions(
     ref: str,
     limit: int = Query(50, ge=1, le=200),
@@ -479,7 +488,7 @@ def get_glyph_actions(
     return actions
 
 
-@router.get("/by-author/{author_ref}", response_model=List[GlyphResponse])
+@router.get("/by-author/{author_ref}", response_model=List[GlyphResponse], summary="Get glyphs by author", tags=["glyphs"])
 def get_glyphs_by_author(
     author_ref: str,
     limit: int = Query(100, ge=1, le=500),
@@ -489,7 +498,7 @@ def get_glyphs_by_author(
     return queries.get_glyphs_by_author(db, author_ref, limit=limit)
 
 
-@router.get("/in-container/{container_ref}", response_model=List[GlyphResponse])
+@router.get("/in-container/{container_ref}", response_model=List[GlyphResponse], summary="Get glyphs in container", tags=["glyphs"])
 def get_glyphs_in_container(
     container_ref: str,
     limit: int = Query(100, ge=1, le=500),

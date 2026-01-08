@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from functools import lru_cache
 from typing import List
 
-from api.dependencies import get_db
+from api.dependencies import get_db, get_current_authenticated_user
 from api.schemas import WalletResponse, TopWalletResponse, HolderCountResponse
 from api.cache import cache, CACHE_TTL_LONG, CACHE_TTL_VERY_LONG
 from database.models import Transaction, UTXO
@@ -34,7 +34,8 @@ def _is_spent_backfill_complete(db: Session) -> bool:
         return False
 
 @router.get("/wallets/top", response_model=List[TopWalletResponse], summary="Top 100 RXD wallets by balance")
-def get_top_wallets_api(db: Session = Depends(get_db)):
+def get_top_wallets_api(db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     # Cache rich list for 5 minutes (expensive query, doesn't change rapidly)
     cache_key = "wallets:top"
 
@@ -51,8 +52,9 @@ def get_top_wallets_api(db: Session = Depends(get_db)):
     cache.set(cache_key, result, CACHE_TTL_LONG)
     return result
 
-@router.get("/wallet/{address}", response_model=WalletResponse)
-def get_wallet(address: str, db: Session = Depends(get_db)):
+@router.get("/wallet/{address}", response_model=WalletResponse, summary="Get wallet details by address", tags=["wallets"])
+def get_wallet(address: str, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     try:
         balance = get_balance_by_address(db, address)
         recent_txs = db.query(Transaction).filter(
@@ -68,7 +70,7 @@ def get_wallet(address: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to fetch wallet data: {str(e)}")
 
 # UTXO endpoint - Critical for wallet functionality
-@router.get("/address/{address}/utxos")
+@router.get("/address/{address}/utxos", summary="Get UTXOs for an address", tags=["wallets"])
 def get_address_utxos(
     address: str,
     page: int = Query(1, ge=1),

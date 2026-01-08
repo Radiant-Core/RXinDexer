@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, distinct, func
-from typing import List
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import or_, distinct, func, select
+from typing import List, Optional
 from datetime import datetime, timedelta
 
-from api.dependencies import get_db
+from api.dependencies import get_db, get_async_db, get_current_authenticated_user
 from api.schemas import TransactionResponse
 from api.cache import cache, CACHE_TTL_SHORT, CACHE_TTL_MEDIUM
 from api.utils import rpc_call
@@ -26,45 +27,94 @@ def _to_iso_time(value):
         except Exception:
             return None
 
-@router.get("/transactions/recent", response_model=List[TransactionResponse], summary="Recent transactions")
-def get_recent_transactions_api(
+@router.get("/transactions/recent", summary="Recent transactions")
+async def get_recent_transactions_api(
     limit: int = Query(10, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
+    cursor: Optional[str] = Query(None, description="Cursor for cursor-based pagination (use instead of offset)"),
+    db: AsyncSession = Depends(get_async_db),
 ):
-    # Cache recent transactions for 10 seconds
-    cache_key = f"transactions:recent:{limit}:{offset}"
+    """
+    Get recent transactions with pagination (async).
+    
+    - **limit**: Maximum transactions to return
+    - **cursor**: Cursor for efficient pagination (preferred over offset)
+    - **offset**: Legacy offset-based pagination
+    
+    When using cursor, returns paginated response with next_cursor/prev_cursor.
+    """
+    from api.pagination import decode_cursor, encode_cursor
+    
+    cursor_info = decode_cursor(cursor) if cursor else None
+    
+    # Cache key includes cursor
+    cache_key = f"transactions:recent:{limit}:{offset}:{cursor or ''}"
     cached = cache.get(cache_key)
     if cached:
         return cached
     
     try:
-        txs = get_recent_transactions(db, limit=limit, offset=offset)
+        # Build async query with cursor support
+        stmt = select(Transaction)
+        
+        if cursor_info:
+            if cursor_info.direction == "after":
+                stmt = stmt.where(Transaction.id < cursor_info.id)
+            else:
+                stmt = stmt.where(Transaction.id > cursor_info.id)
+        elif offset > 0:
+            stmt = stmt.offset(offset)
+        
+        stmt = stmt.order_by(Transaction.id.desc())
+        
+        # Fetch one extra to detect has_next
+        fetch_limit = limit + 1 if cursor_info else limit
+        stmt = stmt.limit(fetch_limit)
+        
+        result = await db.execute(stmt)
+        txs = result.scalars().all()
+        
+        has_next = len(txs) > limit if cursor_info else False
+        if has_next:
+            txs = txs[:limit]
 
-        # Aggregate output sums in one query to avoid loading tx.utxos per tx.
+        # Aggregate output sums in one async query
         txids = [tx.txid for tx in txs]
         sums = {}
         if txids:
-            rows = (
-                db.query(UTXO.txid, func.sum(UTXO.value))
-                .filter(UTXO.txid.in_(txids))
+            sum_stmt = (
+                select(UTXO.txid, func.sum(UTXO.value))
+                .where(UTXO.txid.in_(txids))
                 .group_by(UTXO.txid)
-                .all()
             )
-            sums = {txid: float(total or 0) for txid, total in rows}
+            sum_result = await db.execute(sum_stmt)
+            sums = {txid: float(total or 0) for txid, total in sum_result.all()}
 
-        result = [TransactionResponse(
+        items = [TransactionResponse(
             txid=tx.txid,
             block_id=tx.block_id,
             amount=sums.get(tx.txid),
             time=_to_iso_time(getattr(tx, 'created_at', None))
         ) for tx in txs]
 
-        cache.set(cache_key, result, 30)  # Cache recent transactions for 30 seconds
+        # Return cursor-based response if cursor was used
+        if cursor_info or cursor is not None:
+            result = {
+                "items": items,
+                "limit": limit,
+                "has_next": has_next,
+                "has_prev": bool(cursor_info),
+                "next_cursor": encode_cursor(txs[-1].id, "after") if has_next and txs else None,
+                "prev_cursor": encode_cursor(txs[0].id, "before") if txs else None,
+            }
+        else:
+            result = items
+
+        cache.set(cache_key, result, 30)
         return result
     except Exception:
         try:
-            db.rollback()
+            await db.rollback()
         except Exception:
             pass
         result = []
@@ -150,7 +200,8 @@ def get_transaction_stats_timeseries(
 
 
 @router.get("/transactions/stats", tags=["transactions"], summary="Transaction statistics")
-def get_transaction_stats(db: Session = Depends(get_db)):
+def get_transaction_stats(db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     cache_key = "transactions:stats"
     cached = cache.get(cache_key)
     if cached is not None:
@@ -190,8 +241,9 @@ def get_transaction_stats(db: Session = Depends(get_db)):
     return result
 
 # Transaction details endpoint - Critical for explorers and wallets
-@router.get("/transaction/{txid}")
-def get_transaction_details(txid: str, db: Session = Depends(get_db)):
+@router.get("/transaction/{txid}", summary="Get transaction details by ID", tags=["transactions"])
+def get_transaction_details(txid: str, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Get detailed transaction information including inputs and outputs.
     Essential for transaction tracking and wallet functionality.
@@ -252,12 +304,13 @@ def get_transaction_details(txid: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to fetch transaction details: {str(e)}")
 
 # Address transaction history - Critical for wallets and explorers
-@router.get("/address/{address}/transactions")
+@router.get("/address/{address}/transactions", summary="Get transactions for an address", tags=["transactions"])
 def get_address_transactions(
     address: str, 
     page: int = 1, 
     limit: int = 50,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)
 ):
     """
     Get transaction history for an address with pagination.

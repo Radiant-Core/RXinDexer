@@ -1,5 +1,8 @@
 services:
   radiant-node:
+    build:
+      context: .
+      dockerfile: radiant-node.Dockerfile
     image: radiant-node-local
     container_name: radiant-node
     ports:
@@ -17,7 +20,40 @@ services:
         reservations:
           memory: 2G
           cpus: '2.0'
-    command: ["-rpcworkqueue=16", "-rpcthreads=8", "-rest", "-server", "-rpcallowip=0.0.0.0/0", "-txindex=1", "-rpcuser=dockeruser", "-rpcpassword=dockerpass", "-dbcache=1024", "-maxconnections=16"]
+    command: ["-rpcworkqueue=16", "-rpcthreads=8", "-rest", "-server", "-rpcallowip=0.0.0.0/0", "-txindex=1", "-rpcuser=${RADIANT_NODE_RPCUSER}", "-rpcpassword=${RADIANT_NODE_RPCPASSWORD}", "-dbcache=1024", "-maxconnections=16"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"
+
+  redis:
+    image: redis:7-alpine
+    container_name: rxindexer-redis
+    restart: unless-stopped
+    ports:
+      - "${RXD_BIND_IP:-127.0.0.1}:6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
+          cpus: '0.25'
 
   db:
     image: postgres:15
@@ -26,7 +62,7 @@ services:
     environment:
       POSTGRES_DB: rxindexer
       POSTGRES_USER: rxindexer
-      POSTGRES_PASSWORD: rxindexerpass
+      POSTGRES_PASSWORD: dsUEZPX1mqwPhRlicEGbjhERjioXqgdcvoEKCZMkwLc=
     ports:
       - "${RXD_BIND_IP:-127.0.0.1}:5432:5432"
     volumes:
@@ -43,6 +79,10 @@ services:
       resources:
         limits:
           memory: 10G
+          cpus: '4.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rxindexer -d rxindexer"]
       interval: 10s
@@ -60,6 +100,7 @@ services:
     depends_on:
       - radiant-node
       - db
+      - redis
     # Restart API container on failure to ensure Alembic migrations retry until DB is ready
     restart: on-failure
     logging:
@@ -71,16 +112,26 @@ services:
       - ..:/app
     environment:
       - RADIANT_NODE_HOST=radiant-node
-      - RADIANT_NODE_RPCUSER=dockeruser
-      - RADIANT_NODE_RPCPASSWORD=dockerpass
+      - RADIANT_NODE_RPCUSER=${RADIANT_NODE_RPCUSER}
+      - RADIANT_NODE_RPCPASSWORD=${RADIANT_NODE_RPCPASSWORD}
       - RADIANT_NODE_RPCPORT=7332
       - RADIANT_NODE_RESTPORT=7333
       - POSTGRES_DB=rxindexer
       - POSTGRES_USER=rxindexer
-      - POSTGRES_PASSWORD=rxindexerpass
+      - POSTGRES_PASSWORD=dsUEZPX1mqwPhRlicEGbjhERjioXqgdcvoEKCZMkwLc=
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
 
   indexer:
     build:
@@ -99,13 +150,13 @@ services:
         max-file: "10"
     environment:
       - RADIANT_NODE_HOST=radiant-node
-      - RADIANT_NODE_RPCUSER=dockeruser
-      - RADIANT_NODE_RPCPASSWORD=dockerpass
+      - RADIANT_NODE_RPCUSER=${RADIANT_NODE_RPCUSER}
+      - RADIANT_NODE_RPCPASSWORD=${RADIANT_NODE_RPCPASSWORD}
       - RADIANT_NODE_RPCPORT=7332
       - RADIANT_NODE_RESTPORT=7333
       - POSTGRES_DB=rxindexer
       - POSTGRES_USER=rxindexer
-      - POSTGRES_PASSWORD=rxindexerpass
+      - POSTGRES_PASSWORD=dsUEZPX1mqwPhRlicEGbjhERjioXqgdcvoEKCZMkwLc=
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - PYTHONUNBUFFERED=1
@@ -136,6 +187,50 @@ services:
       - USE_COPY=1
     volumes:
       - ..:/app
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '3.0'
+        reservations:
+          memory: 1G
+          cpus: '1.0'
+
+  # ARQ Worker - Background task queue processor
+  worker:
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+    image: rxindexer-api
+    container_name: rxindexer-worker
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"
+    environment:
+      - POSTGRES_DB=rxindexer
+      - POSTGRES_USER=rxindexer
+      - POSTGRES_PASSWORD=dsUEZPX1mqwPhRlicEGbjhERjioXqgdcvoEKCZMkwLc=
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ..:/app
+    entrypoint: ["python", "-m", "arq", "api.tasks.worker.WorkerSettings"]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
 
   # Balance refresh service - updates wallet_balances cache every 5 minutes
   balance-refresh:
@@ -151,22 +246,30 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "50m"
-        max-file: "3"
+        max-size: "200m"
+        max-file: "10"
     environment:
       - RADIANT_NODE_HOST=radiant-node
-      - RADIANT_NODE_RPCUSER=dockeruser
-      - RADIANT_NODE_RPCPASSWORD=dockerpass
+      - RADIANT_NODE_RPCUSER=${RADIANT_NODE_RPCUSER}
+      - RADIANT_NODE_RPCPASSWORD=${RADIANT_NODE_RPCPASSWORD}
       - RADIANT_NODE_RPCPORT=7332
       - POSTGRES_DB=rxindexer
       - POSTGRES_USER=rxindexer
-      - POSTGRES_PASSWORD=rxindexerpass
+      - POSTGRES_PASSWORD=dsUEZPX1mqwPhRlicEGbjhERjioXqgdcvoEKCZMkwLc=
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - PYTHONUNBUFFERED=1
     volumes:
       - ..:/app
     command: ["python", "/app/indexer/refresh_balances.py", "--daemon", "--interval", "5"]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
 
   # Weekly cleanup service - removes dangling images, build cache, orphaned volumes
   cleanup:
@@ -178,7 +281,89 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./cleanup.sh:/cleanup.sh:ro
     entrypoint: ["/bin/sh", "/cleanup.sh"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+          cpus: '0.1'
+
+  # MinIO object storage for token files
+  minio:
+    image: minio/minio:latest
+    container_name: rxindexer-minio
+    restart: unless-stopped
+    ports:
+      - "${RXD_BIND_IP:-127.0.0.1}:9000:9000"
+      - "${RXD_BIND_IP:-127.0.0.1}:9001:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-rxindexer}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_BROWSER_REDIRECT_URL=http://localhost:9001
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  # Automated PostgreSQL backup service - runs daily at 2am
+  backup:
+    image: postgres:15
+    container_name: rxindexer-backup
+    restart: "no"
+    profiles: ["backup"]  # Only runs when explicitly called or scheduled
+    depends_on:
+      - db
+    environment:
+      - PGHOST=db
+      - PGPORT=5432
+      - PGDATABASE=${POSTGRES_DB}
+      - PGUSER=${POSTGRES_USER}
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - ../scripts:/scripts:ro
+      - backup-data:/backups
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Starting backup at $$(date)"
+        pg_dump -Fc --no-owner --no-acl > /backups/rxindexer_$$(date +%Y%m%d_%H%M%S).dump
+        echo "Cleaning backups older than 30 days..."
+        find /backups -name "*.dump" -mtime +30 -delete
+        echo "Backup completed at $$(date)"
+        ls -lh /backups/
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 volumes:
   pgdata:
   radiant-data:  # Persistent blockchain data storage for radiant-node
+  backup-data:   # Persistent backup storage
+  minio-data:    # Persistent object storage for MinIO
+  redis-data:    # Persistent Redis cache data

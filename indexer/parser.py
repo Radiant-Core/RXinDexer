@@ -1162,7 +1162,9 @@ def parse_transactions(txs, db: Session, block_id=None, block_time=None, block_h
                 db.commit()
 
     except Exception as e:
+        import traceback
         print(f"[parse_transactions][EXCEPTION][BULK] Exception occurred: {e}"); sys.stdout.flush()
+        print(f"[parse_transactions][EXCEPTION][BULK] Full traceback: {traceback.format_exc()}"); sys.stdout.flush()
         db.rollback()
     finally:
         pass

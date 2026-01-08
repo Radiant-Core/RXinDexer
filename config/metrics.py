@@ -147,6 +147,47 @@ class MetricsRegistry:
             registry=self._registry
         )
         
+        self._metrics['db_pool_overflow'] = Gauge(
+            f'{prefix}_db_pool_overflow',
+            'Number of overflow connections in use',
+            registry=self._registry
+        )
+        
+        self._metrics['db_pool_checkedout'] = Gauge(
+            f'{prefix}_db_pool_checkedout',
+            'Number of connections currently checked out from pool',
+            registry=self._registry
+        )
+        
+        # ============== CACHE METRICS ==============
+        self._metrics['cache_hits'] = Counter(
+            f'{prefix}_cache_hits_total',
+            'Total cache hits',
+            ['cache_type'],
+            registry=self._registry
+        )
+        
+        self._metrics['cache_misses'] = Counter(
+            f'{prefix}_cache_misses_total',
+            'Total cache misses',
+            ['cache_type'],
+            registry=self._registry
+        )
+        
+        self._metrics['cache_hit_ratio'] = Gauge(
+            f'{prefix}_cache_hit_ratio',
+            'Cache hit ratio (0-1)',
+            ['cache_type'],
+            registry=self._registry
+        )
+        
+        self._metrics['cache_size'] = Gauge(
+            f'{prefix}_cache_size_keys',
+            'Number of keys in cache',
+            ['cache_type'],
+            registry=self._registry
+        )
+        
         # ============== BACKFILL METRICS ==============
         self._metrics['backfill_progress'] = Gauge(
             f'{prefix}_backfill_progress_percent',
@@ -320,13 +361,40 @@ def record_alert(level: str):
         metrics.get('alerts_total').labels(level=level).inc()
 
 
-def update_db_pool_metrics(active: int, pool_size: int):
+def update_db_pool_metrics(active: int, pool_size: int, overflow: int = 0, checkedout: int = 0):
     """Update database connection pool metrics."""
     if not metrics.enabled:
         return
     
     metrics.get('db_connections_active').set(active)
     metrics.get('db_pool_size').set(pool_size)
+    metrics.get('db_pool_overflow').set(overflow)
+    metrics.get('db_pool_checkedout').set(checkedout)
+
+
+def record_cache_hit(cache_type: str = "api"):
+    """Record a cache hit."""
+    if metrics.enabled:
+        metrics.get('cache_hits').labels(cache_type=cache_type).inc()
+
+
+def record_cache_miss(cache_type: str = "api"):
+    """Record a cache miss."""
+    if metrics.enabled:
+        metrics.get('cache_misses').labels(cache_type=cache_type).inc()
+
+
+def update_cache_metrics(cache_type: str, hits: int, misses: int, size: int = 0):
+    """Update cache metrics including hit ratio."""
+    if not metrics.enabled:
+        return
+    
+    total = hits + misses
+    if total > 0:
+        ratio = hits / total
+        metrics.get('cache_hit_ratio').labels(cache_type=cache_type).set(ratio)
+    
+    metrics.get('cache_size').labels(cache_type=cache_type).set(size)
 
 
 def update_token_metrics(total_tokens: int, total_utxos: int, unspent_utxos: int):

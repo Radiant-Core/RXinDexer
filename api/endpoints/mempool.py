@@ -53,7 +53,7 @@ def _feerate_photons_per_vb(fee: float, vbytes: int) -> float:
     return _feerate_atoms_per_vb(fee, vbytes)
 
 
-@router.get("/mempool/info", tags=["mempool"])
+@router.get("/mempool/info", tags=["mempool"], summary="Get mempool information")
 def mempool_info() -> Dict[str, Any]:
     cached = cache.get("mempool:info")
     if cached is not None:
@@ -63,7 +63,7 @@ def mempool_info() -> Dict[str, Any]:
     return info
 
 
-@router.get("/mempool/txs", tags=["mempool"])
+@router.get("/mempool/txs", tags=["mempool"], summary="Get mempool transactions")
 def mempool_txs(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -109,7 +109,7 @@ def mempool_txs(
     return {"total": total, "limit": limit, "offset": offset, "sort": sort, "txs": page}
 
 
-@router.get("/mempool/blocks", tags=["mempool"])
+@router.get("/mempool/blocks", tags=["mempool"], summary="Get projected mempool blocks")
 def mempool_blocks(
     blocks: int = Query(6, ge=1, le=12),
     block_vsize: int = Query(1_000_000, ge=100_000, le=4_000_000),

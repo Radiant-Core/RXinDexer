@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 
 from api.cache import cache, CACHE_TTL_SHORT, CACHE_TTL_MEDIUM
-from api.dependencies import get_db
+from api.dependencies import get_db, get_current_authenticated_user
 from api.utils import rpc_call
 from database.models import Block, Transaction, TokenVolumeDaily
 
@@ -39,7 +39,8 @@ def _format_chainwork(chainwork_hex: str) -> int | None:
 
 
 @router.get("/stats/overview", tags=["stats"], summary="Explorer overview statistics")
-def stats_overview(db: Session = Depends(get_db)):
+def stats_overview(db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     cache_key = "stats:overview"
     cached = cache.get(cache_key)
     if cached is not None:

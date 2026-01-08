@@ -12,7 +12,7 @@ docker compose up -d
 ```
 
 This starts all services:
-- **radiant-node** - Radiant blockchain node
+- **radiant-node** - Radiant blockchain node (built from [radiant-core](https://github.com/Radiant-Core/Radiant-Core))
 - **rxindexer-db** - PostgreSQL database
 - **rxindexer-api** - FastAPI REST API (port 8000)
 - **rxindexer-indexer** - Blockchain indexer

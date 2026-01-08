@@ -1,0 +1,238 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "RXinDexer Overview",
+    "tags": ["rxindexer"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Sync Status",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "rxindexer_sync_lag_blocks",
+            "legendFormat": "Blocks Behind"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 100},
+                {"color": "red", "value": 1000}
+              ]
+            },
+            "unit": "short"
+          }
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 6,
+          "x": 0,
+          "y": 0
+        }
+      },
+      {
+        "id": 2,
+        "title": "Block Height",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "rxindexer_db_height_blocks",
+            "legendFormat": "DB Height"
+          },
+          {
+            "expr": "rxindexer_node_height_blocks",
+            "legendFormat": "Node Height"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          }
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 6,
+          "x": 6,
+          "y": 0
+        }
+      },
+      {
+        "id": 3,
+        "title": "API Request Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(rxindexer_api_requests_total[5m])",
+            "legendFormat": "{{method}} {{endpoint}}"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Requests/sec"
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 0
+        }
+      },
+      {
+        "id": 4,
+        "title": "API Latency (95th percentile)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(rxindexer_api_latency_seconds_bucket[5m]))",
+            "legendFormat": "{{endpoint}}"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Seconds",
+            "max": 5
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 8
+        }
+      },
+      {
+        "id": 5,
+        "title": "Database Connections",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rxindexer_db_connections_active",
+            "legendFormat": "Active"
+          },
+          {
+            "expr": "rxindexer_db_pool_size",
+            "legendFormat": "Pool Size"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Connections"
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 8
+        }
+      },
+      {
+        "id": 6,
+        "title": "RPC Call Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(rxindexer_rpc_calls_total[5m])",
+            "legendFormat": "{{method}}"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Calls/sec"
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 16
+        }
+      },
+      {
+        "id": 7,
+        "title": "Token Metrics",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "rxindexer_tokens_total",
+            "legendFormat": "Total Tokens"
+          },
+          {
+            "expr": "rxindexer_utxos_unspent",
+            "legendFormat": "Unspent UTXOs"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          }
+        },
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 16
+        }
+      },
+      {
+        "id": 8,
+        "title": "System Memory",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100",
+            "legendFormat": "Memory Usage %"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Percent",
+            "max": 100
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 0,
+          "y": 24
+        }
+      },
+      {
+        "id": 9,
+        "title": "System CPU",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+            "legendFormat": "CPU Usage %"
+          }
+        ],
+        "yAxes": [
+          {
+            "label": "Percent",
+            "max": 100
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 24
+        }
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "30s"
+  }
+}

@@ -1,14 +1,37 @@
 """
-Simple in-memory cache with TTL for API responses.
-For production at scale, consider Redis instead.
+Hybrid cache with Redis support and in-memory fallback.
+Automatically uses Redis if REDIS_URL is configured, otherwise falls back to TTLCache.
 """
 import time
+import os
+import json
+import logging
 from typing import Any, Optional, Callable
 from functools import wraps
 import threading
 
+logger = logging.getLogger(__name__)
+
+# Import metrics functions (lazy import to avoid circular imports)
+_metrics_imported = False
+_record_cache_hit = None
+_record_cache_miss = None
+
+def _ensure_metrics():
+    global _metrics_imported, _record_cache_hit, _record_cache_miss
+    if not _metrics_imported:
+        try:
+            from config.metrics import record_cache_hit, record_cache_miss
+            _record_cache_hit = record_cache_hit
+            _record_cache_miss = record_cache_miss
+        except ImportError:
+            _record_cache_hit = lambda x: None
+            _record_cache_miss = lambda x: None
+        _metrics_imported = True
+
+
 class TTLCache:
-    """Thread-safe TTL cache for API responses."""
+    """Thread-safe in-memory TTL cache for API responses."""
     
     def __init__(self):
         self._cache: dict[str, tuple[Any, float]] = {}
@@ -16,13 +39,18 @@ class TTLCache:
     
     def get(self, key: str) -> Optional[Any]:
         """Get value if exists and not expired."""
+        _ensure_metrics()
         with self._lock:
             if key in self._cache:
                 value, expires_at = self._cache[key]
                 if time.time() < expires_at:
+                    if _record_cache_hit:
+                        _record_cache_hit("memory")
                     return value
                 else:
                     del self._cache[key]
+            if _record_cache_miss:
+                _record_cache_miss("memory")
             return None
     
     def set(self, key: str, value: Any, ttl_seconds: int = 60):
@@ -47,10 +75,107 @@ class TTLCache:
             expired = [k for k, (_, exp) in self._cache.items() if now >= exp]
             for k in expired:
                 del self._cache[k]
+    
+    @property
+    def backend(self) -> str:
+        return "memory"
+    
+    @property
+    def size(self) -> int:
+        """Return number of non-expired entries."""
+        with self._lock:
+            now = time.time()
+            return sum(1 for _, (_, exp) in self._cache.items() if now < exp)
 
 
-# Global cache instance
-cache = TTLCache()
+class RedisCache:
+    """Redis-backed cache with automatic serialization."""
+    
+    def __init__(self, redis_url: str):
+        import redis
+        self._redis = redis.from_url(redis_url, decode_responses=True)
+        self._prefix = "rxindexer:"
+        # Test connection
+        self._redis.ping()
+        logger.info("Redis cache connected successfully")
+    
+    def get(self, key: str) -> Optional[Any]:
+        """Get value from Redis."""
+        _ensure_metrics()
+        try:
+            value = self._redis.get(self._prefix + key)
+            if value:
+                if _record_cache_hit:
+                    _record_cache_hit("redis")
+                return json.loads(value)
+            if _record_cache_miss:
+                _record_cache_miss("redis")
+            return None
+        except Exception as e:
+            logger.warning(f"Redis get error: {e}")
+            return None
+    
+    def set(self, key: str, value: Any, ttl_seconds: int = 60):
+        """Set value in Redis with TTL."""
+        try:
+            self._redis.setex(
+                self._prefix + key,
+                ttl_seconds,
+                json.dumps(value, default=str)
+            )
+        except Exception as e:
+            logger.warning(f"Redis set error: {e}")
+    
+    def delete(self, key: str):
+        """Delete a key from Redis."""
+        try:
+            self._redis.delete(self._prefix + key)
+        except Exception as e:
+            logger.warning(f"Redis delete error: {e}")
+    
+    def clear(self):
+        """Clear all cache keys with our prefix."""
+        try:
+            keys = self._redis.keys(self._prefix + "*")
+            if keys:
+                self._redis.delete(*keys)
+        except Exception as e:
+            logger.warning(f"Redis clear error: {e}")
+    
+    def cleanup(self):
+        """Redis handles TTL automatically, no-op."""
+        pass
+    
+    @property
+    def backend(self) -> str:
+        return "redis"
+    
+    @property
+    def size(self) -> int:
+        """Return approximate number of keys."""
+        try:
+            keys = self._redis.keys(self._prefix + "*")
+            return len(keys) if keys else 0
+        except Exception:
+            return 0
+
+
+def _create_cache():
+    """Create cache instance based on environment configuration."""
+    redis_url = os.getenv("REDIS_URL")
+    
+    if redis_url:
+        try:
+            return RedisCache(redis_url)
+        except Exception as e:
+            logger.warning(f"Failed to connect to Redis ({e}), falling back to in-memory cache")
+    
+    logger.info("Using in-memory TTL cache")
+    return TTLCache()
+
+
+# Global cache instance - automatically selects Redis or in-memory
+cache = _create_cache()
 
 
 def cached(ttl_seconds: int = 60, key_prefix: str = ""):

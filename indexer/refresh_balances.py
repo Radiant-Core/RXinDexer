@@ -130,16 +130,16 @@ def refresh_wallet_balances_incremental() -> int:
             
             # Find addresses with changed UTXOs in the block range
             # This includes: new UTXOs created, UTXOs spent
-            result = db.execute(text("""
+            sql = f"""
                 WITH changed_addresses AS (
                     SELECT DISTINCT address FROM utxos_initial
-                    WHERE block_height > :last_block
+                    WHERE transaction_block_height > {last_block}
                       AND address IS NOT NULL
                       AND address NOT LIKE 'NONSTANDARD:%'
                     UNION
                     SELECT DISTINCT u.address FROM utxos_initial u
                     JOIN transactions t ON u.spent_in_txid = t.txid
-                    WHERE t.block_height > :last_block
+                    WHERE t.block_height > {last_block}
                       AND u.address IS NOT NULL
                       AND u.address NOT LIKE 'NONSTANDARD:%'
                 ),
@@ -160,7 +160,8 @@ def refresh_wallet_balances_incremental() -> int:
                     utxo_count = EXCLUDED.utxo_count,
                     last_updated = NOW()
                 RETURNING address
-            """), {"last_block": last_block})
+            """
+            result = db.execute(text(sql))
             
             updated_count = len(result.fetchall())
             

@@ -7,7 +7,7 @@ echo "=== RXINDEXER API ENTRYPOINT ==="
 DB_HOST="${POSTGRES_HOST:-db}"
 DB_USER="${POSTGRES_USER:-rxindexer}"
 DB_NAME="${POSTGRES_DB:-rxindexer}"
-DB_PASS="${POSTGRES_PASSWORD:-rxindexerpass}"
+DB_PASS="${POSTGRES_PASSWORD:-dsUEZPX1mqwPhRlicEGbjhERjioXqgdcvoEKCZMkwLc=}"
 export PGPASSWORD="$DB_PASS"
 
 # Wait for database to be ready

@@ -1,6 +1,7 @@
 requests
 sqlalchemy
 psycopg2-binary
+asyncpg
 cbor2
 alembic
 psutil

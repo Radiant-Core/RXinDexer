@@ -11,14 +11,14 @@ from decimal import Decimal
 from functools import lru_cache
 import hashlib
 
-from api.dependencies import get_db
+from api.dependencies import get_db, get_current_authenticated_user
 from api.schemas import (
     GlyphTokenResponse, NFTResponse, NFTCollectionResponse, 
     HolderCountResponse, TopGlyphUserResponse, TopGlyphContainerResponse,
     TokenFileResponse, ContainerResponse
 )
 from api.cache import cache, CACHE_TTL_SHORT, CACHE_TTL_MEDIUM, CACHE_TTL_LONG
-from database.models import NFT, TokenFile, Container, GlyphToken, Glyph, Transaction, TransactionInput
+from database.models import TokenFile, Container, Glyph, Transaction, TransactionInput
 from database import queries
 from database.queries import (
     get_top_nft_collections, search_nfts, get_recent_glyph_tokens,
@@ -247,8 +247,9 @@ def _resolve_reveal_txid(db: Session, token_ref: str, glyph: Optional[Glyph]) ->
 
     return None
 
-@router.get("/tokens/search", response_model=List[GlyphTokenResponse], tags=["tokens"])
-def search_tokens(owner: Optional[str] = None, type: Optional[str] = None, metadata: Optional[str] = None, limit: int = 100, db: Session = Depends(get_db)):
+@router.get("/tokens/search", response_model=List[GlyphTokenResponse], tags=["tokens"], summary="Search tokens by owner, type, or metadata")
+def search_tokens(owner: Optional[str] = None, type: Optional[str] = None, metadata: Optional[str] = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Search for glyph tokens by owner, type, or metadata.
     
@@ -267,8 +268,9 @@ def search_tokens(owner: Optional[str] = None, type: Optional[str] = None, metad
     tokens = queries.search_glyph_tokens(db, owner, type, metadata_query, limit)
     return tokens
 
-@router.get("/tokens/recent", response_model=List[GlyphTokenResponse], tags=["tokens"])
-def get_recent_tokens(type: Optional[str] = None, limit: int = 20, db: Session = Depends(get_db)):
+@router.get("/tokens/recent", response_model=List[GlyphTokenResponse], tags=["tokens"], summary="Get recently created tokens")
+def get_recent_tokens(type: Optional[str] = None, limit: int = Query(20, ge=1, le=100), db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Get the most recently created glyph tokens.
     
@@ -327,12 +329,13 @@ def get_recent_tokens(type: Optional[str] = None, limit: int = 20, db: Session =
         return []
 
 
-@router.get("/tokens", response_model=List[GlyphTokenResponse], tags=["tokens"])
+@router.get("/tokens", tags=["tokens"], summary="List all tokens with filtering and sorting")
 def list_tokens(
     type: Optional[str] = Query("ft", description="Filter by token type (fungible, nft, dmint, ft)"),
     page: int = Query(1, ge=1),
     limit: int = Query(100, ge=1, le=500),
     offset: Optional[int] = Query(None, ge=0),
+    cursor: Optional[str] = Query(None, description="Cursor for cursor-based pagination (use instead of offset for better performance)"),
     sort: str = "created_at",
     order: str = "desc",
     mintable: Optional[bool] = None,
@@ -342,26 +345,36 @@ def list_tokens(
 
     - **type**: Optional filter by token type (fungible, nft, dmint, ft). Defaults to 'ft'
     - **limit**: Max results
+    - **cursor**: Cursor for efficient pagination (preferred over offset for large datasets)
+    - **offset**: Legacy offset-based pagination (use cursor for better performance)
     - **sort**: created_at | genesis_height | holder_count | circulating_supply | max_supply | current_supply | mintable
     - **order**: asc | desc
     - **mintable**: true/false to filter mintable tokens (dmint OR supply not maxed)
+    
+    Returns paginated response with next_cursor/prev_cursor for efficient navigation.
     """
+    from api.pagination import decode_cursor, encode_cursor, build_paginated_response
+    
+    cursor_info = decode_cursor(cursor) if cursor else None
     effective_offset = offset if offset is not None else (page - 1) * limit
-    tokens = queries.list_glyph_tokens(
-        db,
-        limit=limit,
-        offset=effective_offset,
-        token_type=type,
-        sort=sort,
-        order=order,
-        mintable=mintable,
-    )
-    if tokens:
-        return tokens
+    
+    # Try queries module first
+    if not cursor_info:
+        tokens = queries.list_glyph_tokens(
+            db,
+            limit=limit,
+            offset=effective_offset,
+            token_type=type,
+            sort=sort,
+            order=order,
+            mintable=mintable,
+        )
+        if tokens:
+            return tokens
 
-    # Fallback to unified glyphs table (legacy glyph_tokens may no longer be populated).
+    # Fallback to unified glyphs table with cursor support
     try:
-        tl = str(type).lower() if type is not None else "ft"  # Default to FT
+        tl = str(type).lower() if type is not None else "ft"
         sort_key = (sort or "created_at").lower()
         is_asc = (order or "desc").lower() == "asc"
 
@@ -372,7 +385,20 @@ def list_tokens(
         elif tl == "fungible":
             q = db.query(Glyph).filter(Glyph.token_type == "FT")
         else:
-            q = db.query(Glyph).filter(Glyph.token_type == "FT")  # Default to FT
+            q = db.query(Glyph).filter(Glyph.token_type == "FT")
+
+        # Apply cursor filter if provided
+        if cursor_info:
+            if cursor_info.direction == "after":
+                if is_asc:
+                    q = q.filter(Glyph.id > cursor_info.id)
+                else:
+                    q = q.filter(Glyph.id < cursor_info.id)
+            else:  # before
+                if is_asc:
+                    q = q.filter(Glyph.id < cursor_info.id)
+                else:
+                    q = q.filter(Glyph.id > cursor_info.id)
 
         if sort_key in {"genesis_height", "height"}:
             q = q.order_by(Glyph.height.asc() if is_asc else Glyph.height.desc(), Glyph.id.desc())
@@ -381,23 +407,54 @@ def list_tokens(
         else:
             q = q.order_by(Glyph.id.asc() if is_asc else Glyph.id.desc())
 
-        # For DMINT we filter in Python since it's protocol-based, not token_type.
+        # For DMINT we filter in Python since it's protocol-based
         if tl == "dmint":
             scan_limit = min(max((effective_offset + limit) * 50, limit), 5000)
             rows = q.limit(scan_limit).all()
             dmints = [g for g in rows if isinstance(getattr(g, 'p', None), list) and (4 in g.p or '4' in g.p)]
-            page_rows = dmints[effective_offset:effective_offset + limit]
-            return [_glyph_to_legacy_token_dict(g) for g in page_rows]
+            if cursor_info:
+                page_rows = dmints[:limit + 1]
+            else:
+                page_rows = dmints[effective_offset:effective_offset + limit + 1]
+            
+            has_next = len(page_rows) > limit
+            items = [_glyph_to_legacy_token_dict(g) for g in page_rows[:limit]]
+            
+            return {
+                "items": items,
+                "limit": limit,
+                "has_next": has_next,
+                "has_prev": bool(cursor_info) or effective_offset > 0,
+                "next_cursor": encode_cursor(page_rows[limit - 1].id, "after") if has_next and page_rows else None,
+                "prev_cursor": encode_cursor(page_rows[0].id, "before") if page_rows else None,
+            }
 
-        glyphs = q.offset(effective_offset).limit(limit).all()
-        return [_glyph_to_legacy_token_dict(g) for g in glyphs]
+        # Non-cursor path (backward compatibility)
+        if not cursor_info:
+            glyphs = q.offset(effective_offset).limit(limit).all()
+            return [_glyph_to_legacy_token_dict(g) for g in glyphs]
+        
+        # Cursor path - fetch limit+1 to detect has_next
+        glyphs = q.limit(limit + 1).all()
+        has_next = len(glyphs) > limit
+        items = [_glyph_to_legacy_token_dict(g) for g in glyphs[:limit]]
+        
+        return {
+            "items": items,
+            "limit": limit,
+            "has_next": has_next,
+            "has_prev": bool(cursor_info),
+            "next_cursor": encode_cursor(glyphs[limit - 1].id, "after") if has_next and glyphs else None,
+            "prev_cursor": encode_cursor(glyphs[0].id, "before") if glyphs else None,
+        }
     except Exception:
         db.rollback()
         return []
 
 
-@router.get("/tokens/stats", tags=["tokens"])
-def get_token_stats(db: Session = Depends(get_db)):
+@router.get("/tokens/stats", tags=["tokens"], summary="Get token usage statistics")
+def get_token_stats(db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Get statistics about glyph token usage.
     
@@ -412,8 +469,9 @@ def get_token_stats(db: Session = Depends(get_db)):
     return stats
 
 
-@router.get("/tokens/{token_id}", response_model=GlyphTokenResponse, tags=["tokens"])
-def get_token(token_id: str, db: Session = Depends(get_db)):
+@router.get("/tokens/{token_id}", response_model=GlyphTokenResponse, tags=["tokens"], summary="Get token details by ID")
+def get_token(token_id: str, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Get detailed information about a specific glyph token.
     
@@ -522,8 +580,9 @@ def get_token(token_id: str, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/tokens/protocol/{protocol_id}", response_model=List[GlyphTokenResponse], tags=["tokens"])
-def get_tokens_by_protocol(protocol_id: int, limit: int = 100, db: Session = Depends(get_db)):
+@router.get("/tokens/protocol/{protocol_id}", response_model=List[GlyphTokenResponse], tags=["tokens"], summary="Get tokens by protocol ID")
+def get_tokens_by_protocol(protocol_id: int, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Get tokens that use a specific protocol ID.
     
@@ -534,8 +593,9 @@ def get_tokens_by_protocol(protocol_id: int, limit: int = 100, db: Session = Dep
     return tokens
 
 
-@router.get("/tokens/{token_id}/history", tags=["tokens"])
-def get_token_history(token_id: str, limit: int = 50, db: Session = Depends(get_db)):
+@router.get("/tokens/{token_id}/history", tags=["tokens"], summary="Get token transaction history")
+def get_token_history(token_id: str, limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Get transaction history for a specific token.
     
@@ -552,20 +612,22 @@ def get_token_history(token_id: str, limit: int = 50, db: Session = Depends(get_
 # NFT Endpoints
 
 @router.get("/nft/collections/top", response_model=List[NFTCollectionResponse], summary="Top NFT collections by NFT count")
-def get_top_nft_collections_api(db: Session = Depends(get_db)):
+def get_top_nft_collections_api(db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     return get_top_nft_collections(db)
 
-@router.get("/nft/search", response_model=List[NFTResponse], summary="Search NFTs")
+@router.get("/nft/search", response_model=List[dict], summary="Search NFTs")
 def search_nfts_api(
     owner: Optional[str] = None,
     collection: Optional[str] = None,
     token_type_name: Optional[str] = None,
-    limit: int = 100,
+    limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user),
     metadata_key: Optional[str] = None,
     metadata_value: Optional[str] = None
 ):
-    """Search NFTs with optional filters.
+    """Search NFTs with optional filters using unified glyphs table.
     
     - **owner**: Filter by owner address
     - **collection**: Filter by collection/container
@@ -573,67 +635,73 @@ def search_nfts_api(
     - **metadata_key/metadata_value**: Filter by metadata field
     """
     metadata_query = {metadata_key: metadata_value} if metadata_key and metadata_value else None
-    nfts = search_nfts(db, owner=owner, collection=collection, metadata_query=metadata_query, limit=limit)
+    glyphs = search_nfts(db, owner=owner, collection=collection, metadata_query=metadata_query, limit=limit)
     
     # Filter by token_type_name if provided
     if token_type_name:
-        nfts = [n for n in nfts if getattr(n, 'token_type_name', None) == token_type_name]
+        glyphs = [g for g in glyphs if getattr(g, 'type', None) == token_type_name]
     
-    return [NFTResponse.model_validate(nft) for nft in nfts]
+    return [_glyph_to_legacy_token_dict(g) for g in glyphs]
 
-@router.get("/nfts/recent", response_model=List[NFTResponse], summary="Recent NFTs")
+@router.get("/nfts/recent", response_model=List[dict], summary="Recent NFTs")
 def get_recent_nfts_api(
     token_type_name: Optional[str] = None,
-    limit: int = 100,
-    db: Session = Depends(get_db)
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)
 ):
     """Get recent NFTs with optional type filter.
     
     - **token_type_name**: Filter by type: 'user', 'container', or null for objects
     """
     try:
-        query = db.query(NFT)
+        query = db.query(Glyph).filter(Glyph.token_type == 'NFT')
         if token_type_name:
-            query = query.filter(NFT.token_type_name == token_type_name)
-        nfts = query.order_by(NFT.created_at.desc()).limit(limit).all()
+            query = query.filter(Glyph.type == token_type_name)
+        glyphs = query.order_by(Glyph.created_at.desc()).limit(limit).all()
     except Exception:
-        nfts = []
-    return [NFTResponse.model_validate(nft) for nft in nfts]
+        glyphs = []
+    return [_glyph_to_legacy_token_dict(g) for g in glyphs]
 
-@router.get("/nfts/users", response_model=List[NFTResponse], summary="Get User NFTs")
-def get_user_nfts_api(limit: int = 100, db: Session = Depends(get_db)):
-    """Get NFTs with token_type_name = 'user'."""
+@router.get("/nfts/users", response_model=List[dict], summary="Get User NFTs")
+def get_user_nfts_api(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
+    """Get glyphs with token_type = 'USER'."""
     try:
-        nfts = db.query(NFT).filter(NFT.token_type_name == 'user').order_by(NFT.created_at.desc()).limit(limit).all()
+        glyphs = db.query(Glyph).filter(Glyph.token_type == 'USER').order_by(Glyph.created_at.desc()).limit(limit).all()
     except Exception:
-        nfts = []
-    return [NFTResponse.model_validate(nft) for nft in nfts]
+        glyphs = []
+    return [_glyph_to_legacy_token_dict(g) for g in glyphs]
 
-@router.get("/nfts/containers", response_model=List[NFTResponse], summary="Get Container NFTs")
-def get_container_nfts_api(limit: int = 100, db: Session = Depends(get_db)):
-    """Get NFTs with token_type_name = 'container'."""
+@router.get("/nfts/containers", response_model=List[dict], summary="Get Container NFTs")
+def get_container_nfts_api(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
+    """Get glyphs with token_type = 'CONTAINER'."""
     try:
-        nfts = db.query(NFT).filter(NFT.token_type_name == 'container').order_by(NFT.created_at.desc()).limit(limit).all()
+        glyphs = db.query(Glyph).filter(Glyph.token_type == 'CONTAINER').order_by(Glyph.created_at.desc()).limit(limit).all()
     except Exception:
-        nfts = []
-    return [NFTResponse.model_validate(nft) for nft in nfts]
+        glyphs = []
+    return [_glyph_to_legacy_token_dict(g) for g in glyphs]
 
-@router.get("/nfts/{token_id}", response_model=NFTResponse, summary="Get NFT by ID")
-def get_nft_by_id_api(token_id: str, db: Session = Depends(get_db)):
-    """Get detailed information about a specific NFT."""
-    nft = db.query(NFT).filter(NFT.token_id == token_id).first()
-    if not nft:
-        raise HTTPException(status_code=404, detail=f"NFT {token_id} not found")
-    return NFTResponse.model_validate(nft)
+@router.get("/nfts/{token_id}", response_model=dict, summary="Get NFT by ID")
+def get_nft_by_id_api(token_id: str, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
+    """Get detailed information about a specific glyph."""
+    glyph = db.query(Glyph).filter(Glyph.ref == token_id).first()
+    if not glyph:
+        raise HTTPException(status_code=404, detail=f"Token {token_id} not found")
+    return _glyph_to_legacy_token_dict(glyph)
 
 # Glyph Analytics
 
 @router.get("/glyph/users/top", response_model=List[TopGlyphUserResponse], summary="Top 100 Glyph users by token count")
-def get_top_glyph_users_api(db: Session = Depends(get_db)):
+def get_top_glyph_users_api(db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     return get_top_glyph_users(db)
 
 @router.get("/glyph/containers/top", response_model=List[TopGlyphContainerResponse], summary="Top 100 Glyph containers by user count")
-def get_top_glyph_containers_api(db: Session = Depends(get_db)):
+def get_top_glyph_containers_api(db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     return get_top_glyph_containers(db)
 
 # Caching logic for holders
@@ -653,13 +721,15 @@ def get_token_holder_count_api(token_id: str):
 # Token Files Endpoints
 
 @router.get("/tokens/{token_id}/files", response_model=List[TokenFileResponse], tags=["tokens"], summary="Get files/images for a token")
-def get_token_files(token_id: str, db: Session = Depends(get_db)):
+def get_token_files(token_id: str, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get all files (images, etc.) associated with a token."""
     files = db.query(TokenFile).filter(TokenFile.token_id == token_id).all()
     return files
 
 @router.get("/tokens/{token_id}/files/{file_key}", tags=["tokens"], summary="Get specific file by key")
-def get_token_file_by_key(token_id: str, file_key: str, db: Session = Depends(get_db)):
+def get_token_file_by_key(token_id: str, file_key: str, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get a specific file by its key (e.g., 'icon', 'image')."""
     file = db.query(TokenFile).filter(
         TokenFile.token_id == token_id,
@@ -670,7 +740,8 @@ def get_token_file_by_key(token_id: str, file_key: str, db: Session = Depends(ge
     return TokenFileResponse.model_validate(file)
 
 @router.get("/tokens/{token_id}/image", tags=["tokens"], summary="Get token image as binary")
-def get_token_image(token_id: str, db: Session = Depends(get_db)):
+def get_token_image(token_id: str, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Get the primary image for a token as binary data.
     Returns the image with proper Content-Type header for direct display.
@@ -759,13 +830,15 @@ def get_token_image(token_id: str, db: Session = Depends(get_db)):
 # Container Endpoints
 
 @router.get("/containers", response_model=List[ContainerResponse], tags=["containers"], summary="List all containers")
-def list_containers(limit: int = 100, db: Session = Depends(get_db)):
+def list_containers(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get all containers/collections, ordered by token count."""
     containers = db.query(Container).order_by(Container.token_count.desc()).limit(limit).all()
     return containers
 
 @router.get("/containers/{container_id}", response_model=ContainerResponse, tags=["containers"], summary="Get container details")
-def get_container(container_id: str, db: Session = Depends(get_db)):
+def get_container(container_id: str, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get details for a specific container/collection."""
     container = db.query(Container).filter(Container.container_id == container_id).first()
     if not container:
@@ -773,7 +846,8 @@ def get_container(container_id: str, db: Session = Depends(get_db)):
     return container
 
 @router.get("/containers/{container_id}/tokens", response_model=List[GlyphTokenResponse], tags=["containers"], summary="Get tokens in container")
-def get_container_tokens(container_id: str, limit: int = 100, db: Session = Depends(get_db)):
+def get_container_tokens(container_id: str, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get all tokens belonging to a container/collection."""
     from database.models import GlyphToken
     tokens = db.query(GlyphToken).filter(GlyphToken.container == container_id).limit(limit).all()
@@ -1284,7 +1358,8 @@ def get_token_supply_api(token_id: str, holders_mode: str = Query("address", des
 
 
 @router.get("/tokens/{token_id}/contracts", tags=["tokens"], summary="Get DMINT minting contracts")
-def get_token_contracts_api(token_id: str, limit: int = 500, db: Session = Depends(get_db)):
+def get_token_contracts_api(token_id: str, limit: int = 500, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     resolved_ref, glyph = _resolve_token_ref(db, token_id)
     protocols = getattr(glyph, 'p', None)
     is_dmint = isinstance(protocols, list) and (4 in protocols or '4' in protocols)
@@ -1449,7 +1524,8 @@ def get_token_contracts_api(token_id: str, limit: int = 500, db: Session = Depen
 def get_token_trades_api(
     token_id: str, 
     limit: int = 50,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)
 ):
     """
     Get trade history for a token.
@@ -1480,7 +1556,8 @@ def get_token_trades_api(
 
 
 @router.get("/tokens/{token_id}/burns", tags=["tokens"], summary="Get token burn history")
-def get_token_burns_api(token_id: str, limit: int = 50, db: Session = Depends(get_db)):
+def get_token_burns_api(token_id: str, limit: int = 50, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get burn (melt) history for a token."""
     from sqlalchemy import text
     
@@ -1502,7 +1579,8 @@ def get_token_burns_api(token_id: str, limit: int = 50, db: Session = Depends(ge
 
 
 @router.get("/tokens/{token_id}/price", tags=["tokens"], summary="Get token price history")
-def get_token_price_api(token_id: str, limit: int = 100, db: Session = Depends(get_db)):
+def get_token_price_api(token_id: str, limit: int = 100, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get price history for a token."""
     from sqlalchemy import text
     
@@ -1527,7 +1605,8 @@ def get_token_price_api(token_id: str, limit: int = 100, db: Session = Depends(g
 
 
 @router.get("/tokens/{token_id}/ohlcv", tags=["tokens"], summary="Get daily OHLCV data")
-def get_token_ohlcv_api(token_id: str, days: int = 30, db: Session = Depends(get_db)):
+def get_token_ohlcv_api(token_id: str, days: int = 30, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get daily OHLCV (Open, High, Low, Close, Volume) data for charts."""
     from sqlalchemy import text
     
@@ -1556,7 +1635,8 @@ def get_token_ohlcv_api(token_id: str, days: int = 30, db: Session = Depends(get
 def get_active_swaps_api(
     token_id: Optional[str] = None,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)
 ):
     """
     Get active (pending) swap offers.
@@ -1594,7 +1674,8 @@ def get_active_swaps_api(
 def get_recent_trades_api(
     token_id: Optional[str] = None,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)
 ):
     """
     Get recently completed trades.
@@ -1629,7 +1710,8 @@ def get_recent_trades_api(
 
 
 @router.get("/market/volume", tags=["market"], summary="Get trading volume stats")
-def get_market_volume_api(days: int = 7, db: Session = Depends(get_db)):
+def get_market_volume_api(days: int = 7, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """
     Get aggregated trading volume statistics.
     
@@ -1676,7 +1758,8 @@ def get_market_volume_api(days: int = 7, db: Session = Depends(get_db)):
 # ============================================================================
 
 @router.get("/tokens/{token_id}/mints", tags=["tokens"], summary="Get mint events for DMINT token")
-def get_token_mints_api(token_id: str, limit: int = 50, db: Session = Depends(get_db)):
+def get_token_mints_api(token_id: str, limit: int = 50, db: Session = Depends(get_db),
+    current_user = Depends(get_current_authenticated_user)):
     """Get mint history for a DMINT token."""
     from sqlalchemy import text
     

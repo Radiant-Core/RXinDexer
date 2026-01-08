@@ -59,7 +59,7 @@ class UTXO(Base):
     txid = Column(String, nullable=False, index=True)
     vout = Column(Integer, nullable=False)
     address = Column(String, nullable=True, index=True)
-    value = Column(Float, nullable=False)  # In satoshis
+    value = Column(BigInteger, nullable=False)  # In satoshis (integer for precision)
     spent = Column(Boolean, default=False, index=True)
     spent_in_txid = Column(String, nullable=True)
     transaction_id = Column(Integer, ForeignKey('transactions.id'))
@@ -147,6 +147,27 @@ class Glyph(Base):
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     
+    # Additional fields for full compatibility (previously in legacy tables)
+    owner = Column(String, nullable=True, index=True)  # Current owner address
+    max_supply = Column(BigInteger, nullable=True)  # Maximum token supply
+    current_supply = Column(BigInteger, nullable=True)  # Current minted supply
+    circulating_supply = Column(BigInteger, nullable=True)  # Circulating supply
+    genesis_height = Column(Integer, nullable=True, index=True)  # Block height of creation
+    current_txid = Column(String(64), nullable=True)  # Current UTXO txid
+    current_vout = Column(Integer, nullable=True)  # Current UTXO vout
+    holder_count = Column(Integer, default=0)  # Cached holder count
+    deploy_method = Column(String(20), nullable=True)  # Deployment method
+    
+    # DMINT contract fields
+    difficulty = Column(Integer, nullable=True)
+    max_height = Column(BigInteger, nullable=True)
+    reward = Column(BigInteger, nullable=True)
+    num_contracts = Column(Integer, nullable=True)
+    
+    # Resolved author info (cached)
+    author_name = Column(String(255), nullable=True)
+    author_ref_type = Column(String(20), nullable=True)
+    
     # Indexes for common query patterns (matching reference)
     __table_args__ = (
         Index('ix_glyphs_token_type', 'token_type'),
@@ -157,146 +178,23 @@ class Glyph(Base):
         Index('ix_glyphs_spent_is_container', 'spent', 'is_container'),
         Index('ix_glyphs_author', 'author'),
         Index('ix_glyphs_token_type_id', 'token_type', 'id'),
+        Index('ix_glyphs_owner', 'owner'),
+        Index('ix_glyphs_genesis_height', 'genesis_height'),
     )
 
 
-# Keep GlyphToken as alias for backward compatibility during migration
-# TODO: Remove after full migration to unified Glyph model
-class GlyphToken(Base):
-    __tablename__ = 'glyph_tokens'
-    id = Column(Integer, primary_key=True)
-    token_id = Column(String, nullable=False, index=True)
-    txid = Column(String, nullable=False, index=True)
-    type = Column(String, index=True)
-    owner = Column(String, index=True)
-    token_metadata = Column(JSON)
-    
-    # Protocol information
-    protocols = Column(JSON)
-    protocol_type = Column(Integer)
-    
-    # Core metadata fields
-    name = Column(String(255), nullable=True, index=True)
-    description = Column(Text, nullable=True)
-    token_type_name = Column(String(100), nullable=True, index=True)
-    immutable = Column(Boolean, default=True)
-    license = Column(String(255), nullable=True)
-    attrs = Column(JSON, nullable=True)
-    location = Column(String, nullable=True)
-    
-    # Token supply fields
-    max_supply = Column(BigInteger)
-    current_supply = Column(BigInteger)
-    premine = Column(BigInteger, nullable=True)
-    circulating_supply = Column(BigInteger, nullable=True)
-    burned_supply = Column(BigInteger, default=0)
-    
-    # Contract fields (for dMint tokens)
-    contract_references = Column(JSON)
-    difficulty = Column(Integer)
-    max_height = Column(BigInteger, nullable=True)
-    reward = Column(BigInteger, nullable=True)
-    num_contracts = Column(Integer, nullable=True)
-    
-    # Author and container
-    container = Column(String, index=True, nullable=True)
-    author = Column(String, index=True, nullable=True)
-    ticker = Column(String(50), nullable=True, index=True)
-    
-    # Resolved author info
-    author_name = Column(String(255), nullable=True)
-    author_image_url = Column(String(500), nullable=True)
-    author_image_data = Column(Text, nullable=True)
-    
-    # Icon/image data
-    icon_mime_type = Column(String(100), nullable=True)
-    icon_url = Column(String(500), nullable=True)
-    icon_data = Column(Text, nullable=True)
-    
-    # Location and history tracking
-    genesis_height = Column(Integer, index=True)
-    latest_height = Column(Integer, index=True)
-    current_txid = Column(String)
-    current_vout = Column(Integer)
-    reveal_txid = Column(String, nullable=True, index=True)
-    reveal_vout = Column(Integer, nullable=True)
-    
-    # New fields from reference
-    spent = Column(Boolean, default=False, index=True)
-    fresh = Column(Boolean, default=True)
-    melted = Column(Boolean, default=False)
-    sealed = Column(Boolean, default=False)
-    swap_pending = Column(Boolean, default=False)
-    value = Column(BigInteger, nullable=True)  # Satoshi value
-    
-    # Deploy method
-    deploy_method = Column(String(20), nullable=True)
-    holder_count = Column(Integer, default=0)
-    
-    # Timestamps
-    created_at = Column(DateTime)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
-    supply_updated_at = Column(DateTime, nullable=True)
+# ============================================================================
+# LEGACY MODEL ALIASES (Deprecated - use Glyph instead)
+# ============================================================================
+# These aliases are provided for backward compatibility only.
+# All new code should use the unified Glyph model directly.
+# The legacy glyph_tokens and nfts tables have been removed from the schema.
 
-# NFT model (for NFT metadata and collections)
-class NFT(Base):
-    __tablename__ = 'nfts'
-    id = Column(Integer, primary_key=True)
-    token_id = Column(String, nullable=False, index=True)  # Relaxed unique constraint
-    txid = Column(String, nullable=True, index=True)  # Genesis txid
-    type = Column(String(50), index=True)  # Script-derived: nft, mutable_nft, delegate
-    
-    # Payload type from reveal (user, container, object/null)
-    token_type_name = Column(String(100), nullable=True, index=True)
-    
-    # Core metadata (extracted from CBOR for fast queries)
-    name = Column(String(255), nullable=True, index=True)
-    ticker = Column(String(50), nullable=True, index=True)  # Token ticker (from 'ticker')
-    description = Column(Text, nullable=True)
-    nft_metadata = Column(JSON)  # Full CBOR-decoded metadata (raw payload)
-    attrs = Column(JSON, nullable=True)  # Custom attributes from payload.attrs
-    
-    # Author and container refs (from payload.by and payload.in)
-    author = Column(String, index=True, nullable=True)
-    container = Column(String, index=True, nullable=True)
-    
-    # Protocol information
-    protocols = Column(JSON)  # List of protocol numbers from the 'p' field
-    protocol_type = Column(Integer)  # Primary protocol: 2=NFT, 5=MUT
-    
-    # Mutability (true if NOT both NFT and MUT protocols present)
-    immutable = Column(Boolean, default=True)
-    
-    # Linked payload location (when payload.loc points to another ref)
-    location = Column(String, nullable=True)
-    
-    # Owner and collection
-    owner = Column(String, index=True)
-    collection = Column(String, index=True)  # Legacy field, use container instead
-    
-    # Block height tracking
-    genesis_height = Column(Integer, index=True)
-    latest_height = Column(Integer, index=True)
-    
-    # Reveal transaction tracking
-    reveal_txid = Column(String, nullable=True, index=True)
-    reveal_vout = Column(Integer, nullable=True)
-    
-    # Current location
-    current_txid = Column(String, nullable=True)
-    current_vout = Column(Integer, nullable=True)
-    
-    # Icon/image fields
-    icon_mime_type = Column(String(100), nullable=True)
-    icon_url = Column(String(500), nullable=True)
-    icon_data = Column(Text, nullable=True)  # Base64 encoded embedded data
-    
-    # Holder count (cached, always 1 for NFTs unless fractionalized)
-    holder_count = Column(Integer, default=1)
-    
-    # Timestamps
-    created_at = Column(DateTime)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+# Alias GlyphToken to Glyph for backward compatibility
+GlyphToken = Glyph
+
+# Alias NFT to Glyph for backward compatibility  
+NFT = Glyph
 
 # UserProfile model
 class UserProfile(Base):

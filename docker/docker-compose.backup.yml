@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  postgres-backup:
+    image: postgres:14-alpine
+    container_name: rxindexer-postgres-backup
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=rxindexer
+      - DB_USER=postgres
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - BACKUP_DIR=/backups
+      - RETENTION_DAYS=30
+      - S3_BUCKET=${S3_BUCKET:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+    volumes:
+      - ./scripts/backup_postgres.sh:/backup.sh:ro
+      - postgres_backups:/backups
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: >
+      sh -c "
+        # Install AWS CLI if needed
+        apk add --no-cache aws-cli &&
+        # Create cron job for daily backups at 2 AM
+        echo '0 2 * * * /backup.sh >> /backups/backup.log 2>&1' > /etc/crontabs/root &&
+        # Run backup immediately on start
+        /backup.sh &&
+        # Start cron daemon
+        crond -f -l 2
+      "
+    depends_on:
+      - postgres
+    networks:
+      - rxindexer-net
+    restart: unless-stopped
+
+volumes:
+  postgres_backups:
+    driver: local
+
+networks:
+  rxindexer-net:
+    external: true

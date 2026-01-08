@@ -7,7 +7,7 @@ echo "=== RXINDEXER API WAIT_FOR_SCHEMA START ==="
 DB_HOST="db"
 DB_USER="rxindexer"
 DB_NAME="rxindexer"
-DB_PASS="rxindexerpass"
+DB_PASS="dsUEZPX1mqwPhRlicEGbjhERjioXqgdcvoEKCZMkwLc="
 
 export PGPASSWORD="$DB_PASS"
 echo "[wait_for_schema] Waiting for DB to accept connections..."
