@@ -69,6 +69,17 @@ def rpc_call(method, params=None, timeout=None):
                 print(f"[rpc_call] {method} attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             continue
+        except requests.exceptions.HTTPError as e:
+            # Retry on 5xx server errors (node overloaded/restarting)
+            if e.response is not None and 500 <= e.response.status_code < 600:
+                last_error = e
+                wait_time = RPC_RETRY_BACKOFF ** attempt
+                if attempt < RPC_MAX_RETRIES - 1:
+                    print(f"[rpc_call] {method} attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                continue
+            # Non-5xx HTTP errors are not retried
+            raise e
         except Exception as e:
             # Non-retryable error
             raise e

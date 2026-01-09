@@ -13,7 +13,7 @@ from alembic import op
 from sqlalchemy import text
 
 revision = '20260108_bulk_constraints'
-down_revision = '20260108_glyphs_columns'
+down_revision = '4e2b5d8cfb56'
 branch_labels = None
 depends_on = None
 

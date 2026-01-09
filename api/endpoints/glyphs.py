@@ -47,7 +47,6 @@ def list_glyphs(
     is_container: Optional[bool] = Query(None, description="Filter containers only"),
     has_image: Optional[bool] = Query(None, description="Filter by image presence"),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user),
 ):
     """List glyphs with filtering and sorting."""
     offset = (page - 1) * limit
@@ -136,6 +135,7 @@ def list_ft_table(
                 ELSE NULL 
             END as mined_percent
         FROM mv_ft_glyph_summary
+        WHERE 1=1
     """
 
     # Apply filters

@@ -39,8 +39,7 @@ def _format_chainwork(chainwork_hex: str) -> int | None:
 
 
 @router.get("/stats/overview", tags=["stats"], summary="Explorer overview statistics")
-def stats_overview(db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def stats_overview(db: Session = Depends(get_db)):
     cache_key = "stats:overview"
     cached = cache.get(cache_key)
     if cached is not None:

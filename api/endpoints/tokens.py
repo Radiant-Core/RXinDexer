@@ -248,8 +248,7 @@ def _resolve_reveal_txid(db: Session, token_ref: str, glyph: Optional[Glyph]) ->
     return None
 
 @router.get("/tokens/search", response_model=List[GlyphTokenResponse], tags=["tokens"], summary="Search tokens by owner, type, or metadata")
-def search_tokens(owner: Optional[str] = None, type: Optional[str] = None, metadata: Optional[str] = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def search_tokens(owner: Optional[str] = None, type: Optional[str] = None, metadata: Optional[str] = None, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
     """
     Search for glyph tokens by owner, type, or metadata.
     
@@ -269,8 +268,7 @@ def search_tokens(owner: Optional[str] = None, type: Optional[str] = None, metad
     return tokens
 
 @router.get("/tokens/recent", response_model=List[GlyphTokenResponse], tags=["tokens"], summary="Get recently created tokens")
-def get_recent_tokens(type: Optional[str] = None, limit: int = Query(20, ge=1, le=100), db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_recent_tokens(type: Optional[str] = None, limit: int = Query(20, ge=1, le=100), db: Session = Depends(get_db)):
     """
     Get the most recently created glyph tokens.
     
@@ -453,8 +451,7 @@ def list_tokens(
 
 
 @router.get("/tokens/stats", tags=["tokens"], summary="Get token usage statistics")
-def get_token_stats(db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_token_stats(db: Session = Depends(get_db)):
     """
     Get statistics about glyph token usage.
     
@@ -470,8 +467,7 @@ def get_token_stats(db: Session = Depends(get_db),
 
 
 @router.get("/tokens/{token_id}", response_model=GlyphTokenResponse, tags=["tokens"], summary="Get token details by ID")
-def get_token(token_id: str, db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_token(token_id: str, db: Session = Depends(get_db)):
     """
     Get detailed information about a specific glyph token.
     
@@ -594,8 +590,7 @@ def get_tokens_by_protocol(protocol_id: int, limit: int = Query(100, ge=1, le=50
 
 
 @router.get("/tokens/{token_id}/history", tags=["tokens"], summary="Get token transaction history")
-def get_token_history(token_id: str, limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_token_history(token_id: str, limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
     """
     Get transaction history for a specific token.
     
@@ -684,8 +679,7 @@ def get_container_nfts_api(limit: int = Query(100, ge=1, le=500), db: Session = 
     return [_glyph_to_legacy_token_dict(g) for g in glyphs]
 
 @router.get("/nfts/{token_id}", response_model=dict, summary="Get NFT by ID")
-def get_nft_by_id_api(token_id: str, db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_nft_by_id_api(token_id: str, db: Session = Depends(get_db)):
     """Get detailed information about a specific glyph."""
     glyph = db.query(Glyph).filter(Glyph.ref == token_id).first()
     if not glyph:
@@ -721,15 +715,13 @@ def get_token_holder_count_api(token_id: str):
 # Token Files Endpoints
 
 @router.get("/tokens/{token_id}/files", response_model=List[TokenFileResponse], tags=["tokens"], summary="Get files/images for a token")
-def get_token_files(token_id: str, db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_token_files(token_id: str, db: Session = Depends(get_db)):
     """Get all files (images, etc.) associated with a token."""
     files = db.query(TokenFile).filter(TokenFile.token_id == token_id).all()
     return files
 
 @router.get("/tokens/{token_id}/files/{file_key}", tags=["tokens"], summary="Get specific file by key")
-def get_token_file_by_key(token_id: str, file_key: str, db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_token_file_by_key(token_id: str, file_key: str, db: Session = Depends(get_db)):
     """Get a specific file by its key (e.g., 'icon', 'image')."""
     file = db.query(TokenFile).filter(
         TokenFile.token_id == token_id,
@@ -740,8 +732,7 @@ def get_token_file_by_key(token_id: str, file_key: str, db: Session = Depends(ge
     return TokenFileResponse.model_validate(file)
 
 @router.get("/tokens/{token_id}/image", tags=["tokens"], summary="Get token image as binary")
-def get_token_image(token_id: str, db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_token_image(token_id: str, db: Session = Depends(get_db)):
     """
     Get the primary image for a token as binary data.
     Returns the image with proper Content-Type header for direct display.
@@ -830,15 +821,13 @@ def get_token_image(token_id: str, db: Session = Depends(get_db),
 # Container Endpoints
 
 @router.get("/containers", response_model=List[ContainerResponse], tags=["containers"], summary="List all containers")
-def list_containers(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def list_containers(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
     """Get all containers/collections, ordered by token count."""
     containers = db.query(Container).order_by(Container.token_count.desc()).limit(limit).all()
     return containers
 
 @router.get("/containers/{container_id}", response_model=ContainerResponse, tags=["containers"], summary="Get container details")
-def get_container(container_id: str, db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_container(container_id: str, db: Session = Depends(get_db)):
     """Get details for a specific container/collection."""
     container = db.query(Container).filter(Container.container_id == container_id).first()
     if not container:
@@ -846,8 +835,7 @@ def get_container(container_id: str, db: Session = Depends(get_db),
     return container
 
 @router.get("/containers/{container_id}/tokens", response_model=List[GlyphTokenResponse], tags=["containers"], summary="Get tokens in container")
-def get_container_tokens(container_id: str, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_container_tokens(container_id: str, limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
     """Get all tokens belonging to a container/collection."""
     from database.models import GlyphToken
     tokens = db.query(GlyphToken).filter(GlyphToken.container == container_id).limit(limit).all()

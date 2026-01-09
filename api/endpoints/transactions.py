@@ -200,8 +200,7 @@ def get_transaction_stats_timeseries(
 
 
 @router.get("/transactions/stats", tags=["transactions"], summary="Transaction statistics")
-def get_transaction_stats(db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_transaction_stats(db: Session = Depends(get_db)):
     cache_key = "transactions:stats"
     cached = cache.get(cache_key)
     if cached is not None:
@@ -242,8 +241,7 @@ def get_transaction_stats(db: Session = Depends(get_db),
 
 # Transaction details endpoint - Critical for explorers and wallets
 @router.get("/transaction/{txid}", summary="Get transaction details by ID", tags=["transactions"])
-def get_transaction_details(txid: str, db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_transaction_details(txid: str, db: Session = Depends(get_db)):
     """
     Get detailed transaction information including inputs and outputs.
     Essential for transaction tracking and wallet functionality.
@@ -310,7 +308,6 @@ def get_address_transactions(
     page: int = 1, 
     limit: int = 50,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)
 ):
     """
     Get transaction history for an address with pagination.

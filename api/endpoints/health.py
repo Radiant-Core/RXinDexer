@@ -137,9 +137,9 @@ async def detailed_health_check(db: AsyncSession = Depends(get_async_db)):
     # Cache status
     cache.cleanup()  # Clean expired entries
     health_status["cache"] = {
-        "type": "in-memory-ttl",
+        "type": cache.backend,
         "status": "active",
-        "entries": len(cache._cache)
+        "entries": cache.size
     }
     
     # Connection pool status

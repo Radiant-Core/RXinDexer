@@ -34,8 +34,7 @@ def _is_spent_backfill_complete(db: Session) -> bool:
         return False
 
 @router.get("/wallets/top", response_model=List[TopWalletResponse], summary="Top 100 RXD wallets by balance")
-def get_top_wallets_api(db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_top_wallets_api(db: Session = Depends(get_db)):
     # Cache rich list for 5 minutes (expensive query, doesn't change rapidly)
     cache_key = "wallets:top"
 
@@ -53,8 +52,7 @@ def get_top_wallets_api(db: Session = Depends(get_db),
     return result
 
 @router.get("/wallet/{address}", response_model=WalletResponse, summary="Get wallet details by address", tags=["wallets"])
-def get_wallet(address: str, db: Session = Depends(get_db),
-    current_user = Depends(get_current_authenticated_user)):
+def get_wallet(address: str, db: Session = Depends(get_db)):
     try:
         balance = get_balance_by_address(db, address)
         recent_txs = db.query(Transaction).filter(
