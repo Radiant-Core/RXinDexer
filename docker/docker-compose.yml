@@ -20,7 +20,7 @@ services:
         reservations:
           memory: 2G
           cpus: '2.0'
-    command: ["-rpcworkqueue=16", "-rpcthreads=8", "-rest", "-server", "-rpcallowip=0.0.0.0/0", "-txindex=1", "-rpcuser=${RADIANT_NODE_RPCUSER}", "-rpcpassword=${RADIANT_NODE_RPCPASSWORD}", "-dbcache=1024", "-maxconnections=16"]
+    command: ["-rpcworkqueue=64", "-rpcthreads=16", "-rest", "-server", "-rpcallowip=0.0.0.0/0", "-txindex=1", "-rpcuser=${RADIANT_NODE_RPCUSER}", "-rpcpassword=${RADIANT_NODE_RPCPASSWORD}", "-dbcache=1024", "-maxconnections=32"]
     logging:
       driver: "json-file"
       options:
