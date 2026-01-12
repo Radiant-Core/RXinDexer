@@ -11,13 +11,22 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from script_utils import (
-    detect_token_from_script,
-    detect_token_burn,
-    detect_psrt_signature,
-    parse_ft_script,
-    parse_nft_script,
-)
+try:
+    from script_utils import (
+        detect_token_from_script,
+        detect_token_burn,
+        detect_psrt_signature,
+        parse_ft_script,
+        parse_nft_script,
+    )
+except ImportError:
+    from indexer.script_utils import (
+        detect_token_from_script,
+        detect_token_burn,
+        detect_psrt_signature,
+        parse_ft_script,
+        parse_nft_script,
+    )
 
 logger = logging.getLogger(__name__)
 

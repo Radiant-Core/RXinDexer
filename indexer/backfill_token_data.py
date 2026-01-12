@@ -696,7 +696,7 @@ def backfill_holder_balances(batch_size: int = 100) -> int:
             SELECT
                 u.glyph_ref AS token_id,
                 u.address AS address,
-                SUM((u.value * 100000000)::bigint) AS balance,
+                SUM(u.value) AS balance,
                 NOW() AS first_acquired_at,
                 NOW() AS last_updated_at
             FROM utxos u

@@ -131,7 +131,7 @@ def list_ft_table(
             (difficulty IS NOT NULL) as is_minable,
             CASE 
                 WHEN max_supply IS NOT NULL AND max_supply > 0 
-                THEN (GREATEST((circulating_supply + burned_supply) - premine, 0) * 100.0 / max_supply)
+                THEN LEAST((GREATEST((circulating_supply + burned_supply) - COALESCE(premine, 0), 0) * 100.0 / max_supply), 100.0)
                 ELSE NULL 
             END as mined_percent
         FROM mv_ft_glyph_summary
