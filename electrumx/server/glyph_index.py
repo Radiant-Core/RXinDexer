@@ -19,6 +19,7 @@ from electrumx.lib.glyph import (
     parse_glyph_metadata,
     extract_token_info,
     get_token_type_id,
+    get_token_type,
     contains_glyph_magic,
     parse_glyph_from_output,
     format_ref,
@@ -318,9 +319,6 @@ class GlyphIndex:
             if not contains_glyph_magic(script):
                 continue
             
-            # DEBUG: Log when we find glyph magic in an input
-            self.logger.info(f'Found Glyph magic in tx {hash_to_hex_str(tx_hash)} input {vin_idx}, script len={len(script)}')
-            
             # Try to parse as Glyph envelope
             envelope = parse_glyph_envelope(script)
             if not envelope:
@@ -333,6 +331,11 @@ class GlyphIndex:
             metadata = parse_glyph_metadata(envelope)
             if not metadata:
                 continue
+            
+            # Log only after full validation confirms this is a real Glyph token
+            protocols = metadata.get('p', [])
+            token_type = get_token_type(protocols)
+            self.logger.info(f'Glyph token found: tx={hash_to_hex_str(tx_hash)} input={vin_idx} type={token_type} protocols={protocols}')
             
             # Store first envelope found for return (for WAVE/Swap chaining)
             if result_envelope is None:
