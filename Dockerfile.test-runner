@@ -1,0 +1,30 @@
+# RXinDexer Test Runner Dockerfile
+# Runs integration tests against RXinDexer
+
+FROM python:3.11-slim
+
+LABEL description="RXinDexer integration test runner"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    netcat-openbsd \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install test dependencies
+RUN pip install --no-cache-dir \
+    aiohttp \
+    pytest \
+    pytest-asyncio \
+    websockets
+
+# Copy test files
+COPY tests/ /app/tests/
+
+# Create results directory
+RUN mkdir -p /app/test_results
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python3", "/app/tests/integration/run_tests.py"]

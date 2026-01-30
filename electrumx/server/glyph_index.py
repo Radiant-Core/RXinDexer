@@ -1,0 +1,1095 @@
+"""
+Glyph Token Index for RXinDexer
+
+This module provides database storage and indexing for Glyph v1/v2 tokens.
+Handles token registration, balance tracking, and history.
+"""
+
+import struct
+from typing import Optional, Dict, Any, List, Tuple, Set
+from collections import defaultdict
+
+from electrumx.lib import util
+from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256, HASHX_LEN
+from electrumx.lib.glyph import (
+    GLYPH_MAGIC,
+    GlyphProtocol,
+    GlyphTokenType,
+    parse_glyph_envelope,
+    parse_glyph_metadata,
+    extract_token_info,
+    get_token_type_id,
+    contains_glyph_magic,
+    parse_glyph_from_output,
+    format_ref,
+    parse_ref,
+)
+
+try:
+    import cbor2
+    HAS_CBOR = True
+except ImportError:
+    HAS_CBOR = False
+
+
+# Database key prefixes for Glyph data
+class GlyphDBKeys:
+    """Database key prefixes for Glyph index."""
+    TOKEN = b'GT'          # GT + ref -> token info
+    METADATA = b'GM'       # GM + metadata_hash -> CBOR metadata
+    BALANCE = b'GB'        # GB + scripthash + ref -> amount
+    HISTORY = b'GH'        # GH + ref + height + tx_idx -> event
+    BY_TYPE = b'GY'        # GY + type + ref -> (for type queries)
+    BY_NAME = b'GN'        # GN + name_hash -> ref (for search)
+    BY_TICKER = b'GK'      # GK + ticker -> ref (for FT lookup)
+    SUPPLY = b'GS'         # GS + ref -> current supply (FT only)
+
+
+# History event types
+class GlyphEventType:
+    DEPLOY = 0
+    MINT = 1
+    TRANSFER = 2
+    BURN = 3
+    UPDATE = 4  # Mutable metadata update
+
+
+def pack_ref(txid_bytes: bytes, vout: int) -> bytes:
+    """Pack a ref into bytes (32 bytes txid + 4 bytes vout)."""
+    return txid_bytes + struct.pack('<I', vout)
+
+
+def unpack_ref(data: bytes) -> Tuple[bytes, int]:
+    """Unpack a ref from bytes."""
+    txid = data[:32]
+    vout = struct.unpack('<I', data[32:36])[0]
+    return txid, vout
+
+
+def pack_balance_key(scripthash: bytes, ref: bytes) -> bytes:
+    """Pack a balance key."""
+    return GlyphDBKeys.BALANCE + scripthash + ref
+
+
+def pack_token_key(ref: bytes) -> bytes:
+    """Pack a token key."""
+    return GlyphDBKeys.TOKEN + ref
+
+
+def pack_history_key(ref: bytes, height: int, tx_idx: int) -> bytes:
+    """Pack a history key."""
+    return (GlyphDBKeys.HISTORY + ref + 
+            struct.pack('>I', height) + struct.pack('>H', tx_idx))
+
+
+class GlyphTokenInfo:
+    """
+    Represents indexed token information.
+    
+    Stores all fields needed by explorers, wallets, and exchanges.
+    """
+    __slots__ = (
+        # Core identity
+        'ref', 'protocols', 'token_type', 'glyph_version', 'name', 'ticker', 'decimals',
+        'description', 'author', 'license',
+        # Deployment info
+        'deploy_height', 'deploy_txid', 'metadata_hash', 'is_spent',
+        # Supply tracking
+        'total_supply', 'current_supply', 'premine', 'mined_supply',
+        # Image/content
+        'icon_ref', 'icon_type', 'icon_size', 'embedded_data_hash',
+        # dMint specific
+        'contract_ref', 'algorithm', 'start_difficulty', 'current_difficulty',
+        'reward', 'halving_interval', 'daa_mode', 'mint_count',
+        # Relationships
+        'container_ref', 'authority_ref', 'parent_ref',
+        # NFT specific
+        'attrs',
+    )
+    
+    def __init__(self):
+        # Core identity
+        self.ref = b''
+        self.protocols = []
+        self.token_type = GlyphTokenType.UNKNOWN
+        self.glyph_version = 1  # 1 for v1, 2 for v2
+        self.name = None
+        self.ticker = None
+        self.decimals = 0
+        self.description = None
+        self.author = None
+        self.license = None
+        # Deployment info
+        self.deploy_height = 0
+        self.deploy_txid = b''
+        self.metadata_hash = b''
+        self.is_spent = False
+        # Supply tracking
+        self.total_supply = 0
+        self.current_supply = 0
+        self.premine = 0
+        self.mined_supply = 0
+        # Image/content
+        self.icon_ref = None  # Reference to icon (txid_vout or embedded)
+        self.icon_type = None  # MIME type (image/png, image/svg+xml, etc.)
+        self.icon_size = 0
+        self.embedded_data_hash = None  # Hash of embedded data (for DAT tokens)
+        # dMint specific
+        self.contract_ref = None  # Mining contract reference
+        self.algorithm = 0  # Mining algorithm ID (0x01=SHA256D, etc.)
+        self.start_difficulty = 0
+        self.current_difficulty = 0
+        self.reward = 0  # Current block reward
+        self.halving_interval = 0  # Blocks between halvings
+        self.daa_mode = 0  # Difficulty adjustment algorithm
+        self.mint_count = 0  # Number of mint transactions
+        # Relationships
+        self.container_ref = None  # Parent container (if contained)
+        self.authority_ref = None  # Authority token reference
+        self.parent_ref = None  # Parent token for child tokens
+        # NFT specific
+        self.attrs = None  # Serialized attributes JSON
+    
+    def to_bytes(self) -> bytes:
+        """Serialize token info to CBOR bytes for flexible storage."""
+        if not HAS_CBOR:
+            raise RuntimeError('cbor2 required for Glyph indexing')
+        
+        data = {
+            # Core identity
+            'ref': self.ref,
+            'p': self.protocols,
+            'tt': self.token_type,
+            'gv': self.glyph_version,
+            'n': self.name,
+            'tk': self.ticker,
+            'dc': self.decimals,
+            'ds': self.description,
+            'au': self.author,
+            'li': self.license,
+            # Deployment
+            'dh': self.deploy_height,
+            'dt': self.deploy_txid,
+            'mh': self.metadata_hash,
+            'sp': self.is_spent,
+            # Supply
+            'ts': self.total_supply,
+            'cs': self.current_supply,
+            'pm': self.premine,
+            'ms': self.mined_supply,
+            # Image/content
+            'ir': self.icon_ref,
+            'it': self.icon_type,
+            'is': self.icon_size,
+            'ed': self.embedded_data_hash,
+            # dMint
+            'cr': self.contract_ref,
+            'al': self.algorithm,
+            'sd': self.start_difficulty,
+            'cd': self.current_difficulty,
+            'rw': self.reward,
+            'hi': self.halving_interval,
+            'da': self.daa_mode,
+            'mc': self.mint_count,
+            # Relationships
+            'co': self.container_ref,
+            'ar': self.authority_ref,
+            'pr': self.parent_ref,
+            # NFT
+            'at': self.attrs,
+        }
+        # Remove None values to save space
+        data = {k: v for k, v in data.items() if v is not None and v != 0 and v != b''}
+        return cbor2.dumps(data)
+    
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'GlyphTokenInfo':
+        """Deserialize token info from CBOR bytes."""
+        if not HAS_CBOR:
+            raise RuntimeError('cbor2 required for Glyph indexing')
+        
+        info = cls()
+        d = cbor2.loads(data)
+        
+        # Core identity
+        info.ref = d.get('ref', b'')
+        info.protocols = d.get('p', [])
+        info.token_type = d.get('tt', GlyphTokenType.UNKNOWN)
+        info.glyph_version = d.get('gv', 1)
+        info.name = d.get('n')
+        info.ticker = d.get('tk')
+        info.decimals = d.get('dc', 0)
+        info.description = d.get('ds')
+        info.author = d.get('au')
+        info.license = d.get('li')
+        # Deployment
+        info.deploy_height = d.get('dh', 0)
+        info.deploy_txid = d.get('dt', b'')
+        info.metadata_hash = d.get('mh', b'')
+        info.is_spent = d.get('sp', False)
+        # Supply
+        info.total_supply = d.get('ts', 0)
+        info.current_supply = d.get('cs', 0)
+        info.premine = d.get('pm', 0)
+        info.mined_supply = d.get('ms', 0)
+        # Image/content
+        info.icon_ref = d.get('ir')
+        info.icon_type = d.get('it')
+        info.icon_size = d.get('is', 0)
+        info.embedded_data_hash = d.get('ed')
+        # dMint
+        info.contract_ref = d.get('cr')
+        info.algorithm = d.get('al', 0)
+        info.start_difficulty = d.get('sd', 0)
+        info.current_difficulty = d.get('cd', 0)
+        info.reward = d.get('rw', 0)
+        info.halving_interval = d.get('hi', 0)
+        info.daa_mode = d.get('da', 0)
+        info.mint_count = d.get('mc', 0)
+        # Relationships
+        info.container_ref = d.get('co')
+        info.authority_ref = d.get('ar')
+        info.parent_ref = d.get('pr')
+        # NFT
+        info.attrs = d.get('at')
+        
+        return info
+    
+    def percent_mined(self) -> float:
+        """Calculate percentage of total supply that has been mined."""
+        if self.total_supply == 0:
+            return 0.0
+        return (self.mined_supply / self.total_supply) * 100.0
+
+
+class GlyphIndex:
+    """
+    Glyph token index manager.
+    
+    Handles indexing of Glyph tokens during block processing and
+    provides query methods for the API.
+    """
+    
+    def __init__(self, db, env):
+        self.logger = util.class_logger(__name__, self.__class__.__name__)
+        self.db = db
+        self.env = env
+        self.enabled = getattr(env, 'glyph_index', True)
+        
+        # In-memory caches for unflushed data
+        self.token_cache: Dict[bytes, GlyphTokenInfo] = {}
+        self.balance_cache: Dict[bytes, int] = {}  # key -> amount
+        self.history_cache: List[Tuple[bytes, bytes]] = []  # (key, value)
+        self.metadata_cache: Dict[bytes, bytes] = {}  # hash -> cbor
+        
+        if self.enabled:
+            self.logger.info('Glyph token indexing enabled')
+    
+    def process_tx(self, tx_hash: bytes, tx: 'Tx', height: int, tx_idx: int):
+        """
+        Process a transaction for Glyph tokens.
+        
+        Called by BlockProcessor for each transaction.
+        
+        Glyph tokens are found by checking INPUT scriptSigs for the 'gly' magic
+        bytes followed by a CBOR payload. This is how reveal transactions work:
+        - Commit tx creates UTXO with script that validates payload hash + 'gly'
+        - Reveal tx spends commit UTXO with scriptSig containing 'gly' + CBOR
+        
+        Returns:
+            dict or None: The parsed Glyph envelope if found, for chaining to
+                         WAVE/Swap indexers. Returns None if not a Glyph tx.
+        """
+        if not self.enabled:
+            return None
+        
+        result_envelope = None
+        
+        # Check INPUTS for Glyph reveal data (scriptSigs)
+        # This is where Glyph payloads actually live - in the input that spends a commit
+        for vin_idx, txin in enumerate(tx.inputs):
+            script = txin.script
+            
+            # Skip coinbase inputs (no script)
+            if not script:
+                continue
+            
+            # Check for Glyph magic in input scriptSig
+            if not contains_glyph_magic(script):
+                continue
+            
+            # DEBUG: Log when we find glyph magic in an input
+            self.logger.info(f'Found Glyph magic in tx {hash_to_hex_str(tx_hash)} input {vin_idx}, script len={len(script)}')
+            
+            # Try to parse as Glyph envelope
+            envelope = parse_glyph_envelope(script)
+            if not envelope:
+                continue
+            
+            if not envelope.get('is_reveal'):
+                continue
+            
+            # Parse the CBOR metadata
+            metadata = parse_glyph_metadata(envelope)
+            if not metadata:
+                continue
+            
+            # Store first envelope found for return (for WAVE/Swap chaining)
+            if result_envelope is None:
+                result_envelope = envelope.copy()
+                result_envelope['metadata'] = metadata
+                result_envelope['protocols'] = metadata.get('p', [])
+                result_envelope['tx_hash'] = tx_hash
+                result_envelope['vin_idx'] = vin_idx
+            
+            # The ref is derived from the input being spent (prev_hash:prev_idx)
+            # This is the commit UTXO that created this token
+            prev_hash = txin.prev_hash
+            prev_idx = txin.prev_idx
+            ref = pack_ref(prev_hash, prev_idx)
+            
+            # For NFTs, we also need to find the singleton ref in the outputs
+            # The reveal tx creates a singleton ref in one of its outputs
+            output_ref = self._find_output_ref(tx_hash, tx, metadata)
+            
+            # Index the token reveal
+            self._index_token_reveal(
+                output_ref if output_ref else ref,
+                tx_hash, 
+                vin_idx if not output_ref else output_ref[32:36],
+                height, 
+                tx_idx, 
+                envelope, 
+                metadata,
+                tx
+            )
+        
+        # Also check outputs for commit scripts (optional - for tracking)
+        for vout, output in enumerate(tx.outputs):
+            script = output.pk_script
+            if contains_glyph_magic(script):
+                commit_info = parse_glyph_from_output(script)
+                if commit_info and commit_info.get('is_commit'):
+                    self._track_commit(pack_ref(tx_hash, vout), commit_info)
+        
+        return result_envelope
+    
+    def _find_output_ref(self, tx_hash: bytes, tx, metadata: Dict) -> Optional[bytes]:
+        """
+        Find the output ref for a token in the reveal transaction.
+        
+        For NFTs, the reveal tx creates a singleton ref in one of its outputs
+        using OP_PUSHINPUTREFSINGLETON.
+        
+        Returns the ref bytes or None if not found.
+        """
+        protocols = metadata.get('p', [])
+        
+        # For NFTs, look for singleton pattern (d8 prefix = OP_PUSHINPUTREFSINGLETON)
+        if GlyphProtocol.GLYPH_NFT in protocols:
+            for vout, output in enumerate(tx.outputs):
+                script = output.pk_script
+                # NFT script starts with d8 (OP_PUSHINPUTREFSINGLETON) + 36 byte ref
+                if len(script) >= 38 and script[0] == 0xd8:
+                    # Extract the ref from the script (36 bytes after d8)
+                    ref_bytes = script[1:37]
+                    return pack_ref(tx_hash, vout)
+        
+        # For FTs, look for normal ref pattern (d0 prefix = OP_PUSHINPUTREF)
+        if GlyphProtocol.GLYPH_FT in protocols:
+            for vout, output in enumerate(tx.outputs):
+                script = output.pk_script
+                # FT script contains d0 (OP_PUSHINPUTREF) somewhere
+                if b'\xd0' in script:
+                    return pack_ref(tx_hash, vout)
+        
+        return None
+    
+    def _index_token_reveal(self, ref: bytes, tx_hash: bytes, vout_or_vin,
+                            height: int, tx_idx: int, envelope: Dict,
+                            metadata: Dict, tx: 'Tx'):
+        """
+        Index a token reveal transaction.
+        
+        Args:
+            ref: The token reference (txid + vout)
+            tx_hash: Transaction hash
+            vout_or_vin: Output or input index
+            height: Block height
+            tx_idx: Transaction index in block
+            envelope: Parsed Glyph envelope
+            metadata: Parsed CBOR metadata (already decoded)
+            tx: The full transaction object
+        """
+        if not metadata:
+            return
+        
+        # Extract token info
+        token_info = extract_token_info(metadata)
+        
+        # Create token record
+        token = GlyphTokenInfo()
+        token.ref = ref
+        token.protocols = token_info['protocols']
+        token.token_type = get_token_type_id(token_info['protocols'])
+        token.glyph_version = token_info.get('version', 1)
+        token.name = token_info.get('name')
+        token.ticker = token_info.get('ticker')
+        token.decimals = token_info.get('decimals', 0)
+        token.deploy_height = height
+        token.deploy_txid = tx_hash
+        token.is_spent = False
+        
+        # Store metadata
+        metadata_bytes = envelope.get('metadata_bytes', b'')
+        if metadata_bytes:
+            token.metadata_hash = sha256(metadata_bytes)
+            self.metadata_cache[token.metadata_hash] = metadata_bytes
+        
+        # For FT, track supply
+        if GlyphProtocol.GLYPH_FT in token.protocols:
+            # Initial supply from metadata or 0 for dMint
+            if GlyphProtocol.GLYPH_DMINT in token.protocols:
+                token.total_supply = token_info.get('dmint', {}).get('max_supply', 0)
+                token.current_supply = 0
+            else:
+                # For non-dMint FTs, get initial supply from output value
+                # Find the FT output to get its value
+                initial_supply = 0
+                for out in tx.outputs:
+                    if b'\xd0' in out.pk_script:  # OP_PUSHINPUTREF
+                        initial_supply = out.value
+                        break
+                token.total_supply = initial_supply
+                token.current_supply = initial_supply
+        
+        # Extract additional metadata fields
+        token.description = token_info.get('description')
+        if 'attrs' in token_info and token_info['attrs']:
+            token.attrs = token_info['attrs']
+        
+        # Store in cache
+        self.token_cache[ref] = token
+        
+        # Add deploy event to history
+        history_key = pack_history_key(ref, height, tx_idx)
+        history_value = struct.pack('<B', GlyphEventType.DEPLOY) + tx_hash
+        self.history_cache.append((history_key, history_value))
+        
+        # Log the indexed token
+        ref_txid, ref_vout = unpack_ref(ref)
+        self.logger.info(f'Indexed Glyph token: {hash_to_hex_str(ref_txid)}:{ref_vout} '
+                         f'type={token.token_type} name={token.name} protocols={token.protocols}')
+    
+    def _track_commit(self, ref: bytes, envelope: Dict):
+        """Track a commit transaction for later reveal matching."""
+        # For now, we don't need to store commits separately
+        # The reveal will be self-contained
+        pass
+    
+    def update_balance(self, scripthash: bytes, ref: bytes, delta: int):
+        """Update a token balance."""
+        if not self.enabled:
+            return
+        
+        key = pack_balance_key(scripthash, ref)
+        current = self.balance_cache.get(key, 0)
+        new_balance = max(0, current + delta)
+        
+        if new_balance > 0:
+            self.balance_cache[key] = new_balance
+        elif key in self.balance_cache:
+            del self.balance_cache[key]
+    
+    def flush(self, batch):
+        """Flush cached Glyph data to the database."""
+        if not self.enabled:
+            return
+        
+        # Flush tokens
+        for ref, token in self.token_cache.items():
+            key = pack_token_key(ref)
+            batch.put(key, token.to_bytes())
+            
+            # Also index by type
+            type_key = GlyphDBKeys.BY_TYPE + struct.pack('<B', token.token_type) + ref
+            batch.put(type_key, b'')
+            
+            # Index by name (if present)
+            if token.name:
+                name_hash = sha256(token.name.lower().encode('utf-8'))[:16]
+                name_key = GlyphDBKeys.BY_NAME + name_hash + ref
+                batch.put(name_key, b'')
+            
+            # Index by ticker (if FT)
+            if token.ticker and GlyphProtocol.GLYPH_FT in token.protocols:
+                ticker_key = GlyphDBKeys.BY_TICKER + token.ticker.upper().encode('utf-8')[:8]
+                batch.put(ticker_key, ref)
+        
+        # Flush balances
+        for key, amount in self.balance_cache.items():
+            batch.put(key, struct.pack('<Q', amount))
+        
+        # Flush history
+        for key, value in self.history_cache:
+            batch.put(key, value)
+        
+        # Flush metadata
+        for hash_bytes, cbor_data in self.metadata_cache.items():
+            key = GlyphDBKeys.METADATA + hash_bytes
+            batch.put(key, cbor_data)
+        
+        # Clear caches
+        self.token_cache.clear()
+        self.balance_cache.clear()
+        self.history_cache.clear()
+        self.metadata_cache.clear()
+    
+    # ========================================================================
+    # Query Methods (used by API)
+    # ========================================================================
+    
+    def get_token(self, ref: bytes) -> Optional[GlyphTokenInfo]:
+        """Get token info by ref."""
+        # Check cache first
+        if ref in self.token_cache:
+            return self.token_cache[ref]
+        
+        # Query database
+        key = pack_token_key(ref)
+        data = self.db.utxo_db.get(key)
+        if data:
+            return GlyphTokenInfo.from_bytes(data)
+        return None
+    
+    def get_token_by_ref_str(self, ref_str: str) -> Optional[Dict[str, Any]]:
+        """Get token info by ref string (txid_vout)."""
+        try:
+            txid, vout = parse_ref(ref_str)
+            ref = pack_ref(hex_str_to_hash(txid), vout)
+            token = self.get_token(ref)
+            if token:
+                return self._token_to_dict(token)
+        except Exception:
+            pass
+        return None
+    
+    def get_balance(self, scripthash: bytes, ref: bytes) -> int:
+        """Get token balance for a scripthash."""
+        key = pack_balance_key(scripthash, ref)
+        
+        # Check cache
+        if key in self.balance_cache:
+            return self.balance_cache[key]
+        
+        # Query database
+        data = self.db.utxo_db.get(key)
+        if data:
+            return struct.unpack('<Q', data)[0]
+        return 0
+    
+    def get_balances_for_scripthash(self, scripthash: bytes, 
+                                     limit: int = 100) -> List[Dict]:
+        """Get all token balances for a scripthash."""
+        results = []
+        prefix = GlyphDBKeys.BALANCE + scripthash
+        
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
+            if len(results) >= limit:
+                break
+            
+            ref = key[len(prefix):]
+            amount = struct.unpack('<Q', value)[0]
+            
+            # Get token info
+            token = self.get_token(ref)
+            if token:
+                results.append({
+                    'ref': hash_to_hex_str(ref[:32]) + '_' + str(struct.unpack('<I', ref[32:36])[0]),
+                    'amount': amount,
+                    'name': token.name,
+                    'ticker': token.ticker,
+                    'decimals': token.decimals,
+                    'type': token.token_type,
+                })
+        
+        return results
+    
+    def get_token_history(self, ref: bytes, limit: int = 100, 
+                          offset: int = 0) -> List[Dict]:
+        """Get transaction history for a token."""
+        results = []
+        prefix = GlyphDBKeys.HISTORY + ref
+        count = 0
+        
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
+            if count < offset:
+                count += 1
+                continue
+            if len(results) >= limit:
+                break
+            
+            # Unpack height and tx_idx from key
+            height = struct.unpack('>I', key[len(prefix):len(prefix)+4])[0]
+            tx_idx = struct.unpack('>H', key[len(prefix)+4:len(prefix)+6])[0]
+            
+            # Unpack event type and txid from value
+            event_type = value[0]
+            txid = value[1:33]
+            
+            results.append({
+                'height': height,
+                'tx_idx': tx_idx,
+                'txid': hash_to_hex_str(txid),
+                'event': self._event_type_name(event_type),
+            })
+            count += 1
+        
+        return results
+    
+    def search_tokens(self, query: str, protocols: List[int] = None,
+                      limit: int = 50) -> List[Dict]:
+        """Search tokens by name or ticker."""
+        results = []
+        query_lower = query.lower()
+        
+        # Search by name hash
+        name_hash = sha256(query_lower.encode('utf-8'))[:16]
+        prefix = GlyphDBKeys.BY_NAME + name_hash
+        
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix):
+            if len(results) >= limit:
+                break
+            
+            ref = key[len(prefix):]
+            token = self.get_token(ref)
+            
+            if token:
+                # Filter by protocols if specified
+                if protocols and not any(p in token.protocols for p in protocols):
+                    continue
+                results.append(self._token_to_dict(token))
+        
+        return results
+    
+    def get_tokens_by_type(self, token_type: int, limit: int = 100,
+                           offset: int = 0) -> List[Dict]:
+        """Get tokens by type."""
+        results = []
+        prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', token_type)
+        count = 0
+        
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix):
+            if count < offset:
+                count += 1
+                continue
+            if len(results) >= limit:
+                break
+            
+            ref = key[len(prefix):]
+            token = self.get_token(ref)
+            if token:
+                results.append(self._token_to_dict(token))
+            count += 1
+        
+        return results
+    
+    def get_metadata(self, metadata_hash: bytes) -> Optional[Dict]:
+        """Get parsed metadata by hash."""
+        # Check cache
+        if metadata_hash in self.metadata_cache:
+            cbor_data = self.metadata_cache[metadata_hash]
+        else:
+            key = GlyphDBKeys.METADATA + metadata_hash
+            cbor_data = self.db.utxo_db.get(key)
+        
+        if cbor_data and HAS_CBOR:
+            try:
+                return cbor2.loads(cbor_data)
+            except Exception:
+                pass
+        return None
+    
+    def _token_to_dict(self, token: GlyphTokenInfo, include_dmint: bool = True,
+                        include_content: bool = True) -> Dict[str, Any]:
+        """
+        Convert token info to API dict.
+        
+        Returns all fields needed by explorers, wallets, and exchanges.
+        """
+        txid, vout = unpack_ref(token.ref)
+        
+        result = {
+            # Core identity
+            'ref': hash_to_hex_str(txid) + '_' + str(vout),
+            'protocols': token.protocols,
+            'type': token.token_type,
+            'type_name': self._type_name(token.token_type),
+            'name': token.name,
+            'ticker': token.ticker,
+            'decimals': token.decimals,
+            'description': token.description,
+            'author': token.author,
+            'license': token.license,
+            # Deployment
+            'deploy_height': token.deploy_height,
+            'deploy_txid': hash_to_hex_str(token.deploy_txid) if token.deploy_txid else None,
+            'metadata_hash': hash_to_hex_str(token.metadata_hash) if token.metadata_hash else None,
+            'is_spent': token.is_spent,
+            # Supply tracking
+            'total_supply': token.total_supply,
+            'current_supply': token.current_supply,
+            'premine': token.premine,
+            'mined_supply': token.mined_supply,
+            'percent_mined': token.percent_mined() if token.total_supply > 0 else None,
+            # Relationships
+            'container_ref': token.container_ref,
+            'authority_ref': token.authority_ref,
+            'parent_ref': token.parent_ref,
+        }
+        
+        # Include image/content info
+        if include_content:
+            result.update({
+                'icon_ref': token.icon_ref,
+                'icon_type': token.icon_type,
+                'icon_size': token.icon_size,
+                'embedded_data_hash': hash_to_hex_str(token.embedded_data_hash) if token.embedded_data_hash else None,
+            })
+        
+        # Include dMint-specific fields for minable tokens
+        if include_dmint and GlyphProtocol.GLYPH_DMINT in token.protocols:
+            result['dmint'] = {
+                'contract_ref': token.contract_ref,
+                'algorithm': token.algorithm,
+                'algorithm_name': self._algorithm_name(token.algorithm),
+                'start_difficulty': token.start_difficulty,
+                'current_difficulty': token.current_difficulty,
+                'reward': token.reward,
+                'halving_interval': token.halving_interval,
+                'daa_mode': token.daa_mode,
+                'daa_mode_name': self._daa_mode_name(token.daa_mode),
+                'mint_count': token.mint_count,
+            }
+        
+        # Include NFT attributes
+        if token.attrs:
+            result['attrs'] = token.attrs
+        
+        return result
+    
+    @staticmethod
+    def _algorithm_name(algo_id: int) -> str:
+        """Get mining algorithm name from ID (per Glyph v2 spec Section 11.2)."""
+        algos = {
+            0x00: 'SHA256D',
+            0x01: 'Blake3',
+            0x02: 'KangarooTwelve',
+            0x03: 'Argon2id-Light',
+            0x04: 'RandomX-Light',
+        }
+        return algos.get(algo_id, f'Unknown ({algo_id})')
+    
+    @staticmethod
+    def _daa_mode_name(daa_mode: int) -> str:
+        """Get DAA mode name from ID."""
+        modes = {
+            0x00: 'Fixed',
+            0x01: 'Epoch',
+            0x02: 'ASERT',
+            0x03: 'LWMA',
+            0x04: 'Schedule',
+        }
+        return modes.get(daa_mode, f'Unknown ({daa_mode})')
+    
+    @staticmethod
+    def _type_name(token_type: int) -> str:
+        """Get type name from type ID."""
+        names = {
+            GlyphTokenType.UNKNOWN: 'Unknown',
+            GlyphTokenType.FT: 'Fungible Token',
+            GlyphTokenType.NFT: 'NFT',
+            GlyphTokenType.DAT: 'Data',
+            GlyphTokenType.DMINT: 'dMint Token',
+            GlyphTokenType.WAVE: 'WAVE Name',
+            GlyphTokenType.CONTAINER: 'Container',
+            GlyphTokenType.AUTHORITY: 'Authority',
+        }
+        return names.get(token_type, 'Unknown')
+    
+    @staticmethod
+    def _event_type_name(event_type: int) -> str:
+        """Get event type name."""
+        names = {
+            GlyphEventType.DEPLOY: 'deploy',
+            GlyphEventType.MINT: 'mint',
+            GlyphEventType.TRANSFER: 'transfer',
+            GlyphEventType.BURN: 'burn',
+            GlyphEventType.UPDATE: 'update',
+        }
+        return names.get(event_type, 'unknown')
+    
+    # =========================================================================
+    # TOKEN ANALYTICS API
+    # =========================================================================
+    
+    async def get_token_holders(self, ref: bytes, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+        """
+        Get token holders for a specific token.
+        
+        Returns list of addresses holding the token with their balances.
+        """
+        holders = []
+        total_holders = 0
+        
+        # Scan balance keys for this token ref
+        prefix = GlyphDBKeys.BALANCE
+        
+        async for key, value in self.db.iterator(prefix=prefix):
+            # Key format: GB + scripthash (32 bytes) + ref (36 bytes)
+            if len(key) < 2 + 32 + 36:
+                continue
+            
+            key_ref = key[2+32:2+32+36]
+            if key_ref != ref:
+                continue
+            
+            scripthash = key[2:2+32]
+            balance = struct.unpack('<Q', value)[0] if len(value) == 8 else 0
+            
+            if balance > 0:
+                total_holders += 1
+                if total_holders > offset and len(holders) < limit:
+                    holders.append({
+                        'scripthash': scripthash.hex(),
+                        'balance': balance,
+                    })
+        
+        return {
+            'ref': ref.hex(),
+            'total_holders': total_holders,
+            'holders': holders,
+            'limit': limit,
+            'offset': offset,
+        }
+    
+    async def get_token_supply(self, ref: bytes) -> Dict[str, Any]:
+        """
+        Get detailed supply information for a token.
+        
+        Returns total supply, circulating supply, burned amount, etc.
+        """
+        token = await self.get_token(ref)
+        if not token:
+            return None
+        
+        # Calculate holder-derived circulating supply
+        circulating = 0
+        holder_count = 0
+        
+        prefix = GlyphDBKeys.BALANCE
+        async for key, value in self.db.iterator(prefix=prefix):
+            if len(key) < 2 + 32 + 36:
+                continue
+            key_ref = key[2+32:2+32+36]
+            if key_ref != ref:
+                continue
+            balance = struct.unpack('<Q', value)[0] if len(value) == 8 else 0
+            if balance > 0:
+                circulating += balance
+                holder_count += 1
+        
+        # Get burn history count
+        burn_count = 0
+        burned_amount = 0
+        history_prefix = GlyphDBKeys.HISTORY + ref
+        async for key, value in self.db.iterator(prefix=history_prefix):
+            if len(value) >= 1 and value[0] == GlyphEventType.BURN:
+                burn_count += 1
+                # Amount would need to be stored in burn event
+        
+        return {
+            'ref': ref.hex(),
+            'name': token.name,
+            'ticker': token.ticker,
+            'decimals': token.decimals,
+            'total_supply': token.total_supply,
+            'circulating_supply': circulating,
+            'current_supply': token.current_supply,
+            'premine': token.premine,
+            'mined_supply': token.mined_supply,
+            'burned_count': burn_count,
+            'holder_count': holder_count,
+            'is_dmint': GlyphProtocol.GLYPH_DMINT in token.protocols,
+        }
+    
+    async def get_token_burns(self, ref: bytes, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+        """
+        Get burn history for a token.
+        
+        Returns list of burn events with transaction details.
+        """
+        burns = []
+        total_burns = 0
+        
+        history_prefix = GlyphDBKeys.HISTORY + ref
+        async for key, value in self.db.iterator(prefix=history_prefix):
+            if len(value) < 1:
+                continue
+            event_type = value[0]
+            if event_type != GlyphEventType.BURN:
+                continue
+            
+            total_burns += 1
+            if total_burns > offset and len(burns) < limit:
+                # Extract height and tx_idx from key
+                height = struct.unpack('>I', key[-6:-2])[0]
+                tx_idx = struct.unpack('>H', key[-2:])[0]
+                tx_hash = value[1:33] if len(value) >= 33 else b''
+                
+                burns.append({
+                    'height': height,
+                    'tx_idx': tx_idx,
+                    'txid': hash_to_hex_str(tx_hash) if tx_hash else None,
+                })
+        
+        return {
+            'ref': ref.hex(),
+            'total_burns': total_burns,
+            'burns': burns,
+            'limit': limit,
+            'offset': offset,
+        }
+    
+    async def get_token_trades(self, ref: bytes, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+        """
+        Get trade/transfer history for a token.
+        
+        Returns list of transfer events.
+        """
+        trades = []
+        total_trades = 0
+        
+        history_prefix = GlyphDBKeys.HISTORY + ref
+        async for key, value in self.db.iterator(prefix=history_prefix):
+            if len(value) < 1:
+                continue
+            event_type = value[0]
+            if event_type != GlyphEventType.TRANSFER:
+                continue
+            
+            total_trades += 1
+            if total_trades > offset and len(trades) < limit:
+                height = struct.unpack('>I', key[-6:-2])[0]
+                tx_idx = struct.unpack('>H', key[-2:])[0]
+                tx_hash = value[1:33] if len(value) >= 33 else b''
+                
+                trades.append({
+                    'height': height,
+                    'tx_idx': tx_idx,
+                    'txid': hash_to_hex_str(tx_hash) if tx_hash else None,
+                    'event': 'transfer',
+                })
+        
+        return {
+            'ref': ref.hex(),
+            'total_trades': total_trades,
+            'trades': trades,
+            'limit': limit,
+            'offset': offset,
+        }
+    
+    # =========================================================================
+    # RICH LIST / TOP WALLETS
+    # =========================================================================
+    
+    async def get_top_holders(self, ref: bytes, limit: int = 100) -> Dict[str, Any]:
+        """
+        Get top token holders sorted by balance (descending).
+        """
+        all_holders = []
+        
+        prefix = GlyphDBKeys.BALANCE
+        async for key, value in self.db.iterator(prefix=prefix):
+            if len(key) < 2 + 32 + 36:
+                continue
+            key_ref = key[2+32:2+32+36]
+            if key_ref != ref:
+                continue
+            
+            scripthash = key[2:2+32]
+            balance = struct.unpack('<Q', value)[0] if len(value) == 8 else 0
+            
+            if balance > 0:
+                all_holders.append({
+                    'scripthash': scripthash.hex(),
+                    'balance': balance,
+                })
+        
+        # Sort by balance descending
+        all_holders.sort(key=lambda x: x['balance'], reverse=True)
+        
+        # Get token info for context
+        token = await self.get_token(ref)
+        total_supply = token.total_supply if token else 0
+        
+        # Add percentage for each holder
+        top_holders = all_holders[:limit]
+        for holder in top_holders:
+            if total_supply > 0:
+                holder['percentage'] = round(holder['balance'] / total_supply * 100, 4)
+            else:
+                holder['percentage'] = 0
+        
+        return {
+            'ref': ref.hex(),
+            'name': token.name if token else None,
+            'ticker': token.ticker if token else None,
+            'total_supply': total_supply,
+            'holder_count': len(all_holders),
+            'top_holders': top_holders,
+        }
+    
+    async def get_all_tokens_summary(self, limit: int = 100, offset: int = 0, 
+                                      token_type: int = None) -> Dict[str, Any]:
+        """
+        Get summary of all indexed tokens with pagination.
+        
+        Optionally filter by token type.
+        """
+        tokens = []
+        total = 0
+        
+        prefix = GlyphDBKeys.TOKEN
+        async for key, value in self.db.iterator(prefix=prefix):
+            try:
+                token = GlyphTokenInfo.from_bytes(value)
+                
+                # Filter by type if specified
+                if token_type is not None and token.token_type != token_type:
+                    continue
+                
+                total += 1
+                if total > offset and len(tokens) < limit:
+                    tokens.append({
+                        'ref': token.ref.hex(),
+                        'name': token.name,
+                        'ticker': token.ticker,
+                        'type': self._type_name(token.token_type),
+                        'type_id': token.token_type,
+                        'glyph_version': token.glyph_version,
+                        'total_supply': token.total_supply,
+                        'current_supply': token.current_supply,
+                        'deploy_height': token.deploy_height,
+                        'is_spent': token.is_spent,
+                    })
+            except Exception:
+                continue
+        
+        return {
+            'total': total,
+            'tokens': tokens,
+            'limit': limit,
+            'offset': offset,
+            'filter_type': self._type_name(token_type) if token_type else None,
+        }

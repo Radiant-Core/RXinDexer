@@ -1,0 +1,2 @@
+6d994ff3d1256c3e47688deda86f09c9b608e04916c60c075c24bedd5564bc0b  electrumx-fullstack-deploy.zip
+91bcafc53735a1359bfc965518cab45c2bcc5d79db597f95864bc4cd53e4e99c  electrumx-standalone-deploy.zip

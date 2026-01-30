@@ -1,0 +1,28 @@
+# Database directories (large, mounted as volumes)
+electrumx-db/
+electrumx-db-*/
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Git
+.git/
+
+# Test artifacts
+.pytest_cache/
+*.log
+*.pid
+
+# IDE
+.vscode/
+.idea/
+
+# Benchmarks
+benchmarks/
+
+# Docker (avoid recursion)
+docker/full-stack/*.tar.gz
+*.zip

@@ -1,0 +1,125 @@
+# RXinDexer Full Stack Deployment
+# Radiant Node + RXinDexer (ElectrumX with Glyph/WAVE/Swap indexing)
+# 
+# Usage: docker-compose up -d
+# See README.md for full documentation
+
+services:
+  # Radiant Node (radiantd) - Built from Radiant-Core/Radiant-Core
+  radiantd:
+    build:
+      context: .
+      dockerfile: Dockerfile.radiantd
+    container_name: radiantd
+    restart: unless-stopped
+    volumes:
+      - radiant-data:/root/.radiant
+    ports:
+      - "7332:7332"   # RPC port
+      - "7333:7333"   # P2P port
+    command: >
+      -server=1
+      -printtoconsole
+      -rpcuser=${RPC_USER:-radiant}
+      -rpcpassword=${RPC_PASS:-radiant}
+      -rpcallowip=0.0.0.0/0
+      -rpcbind=0.0.0.0
+      -txindex=1
+      -zmqpubhashblock=tcp://0.0.0.0:28332
+    healthcheck:
+      test: ["CMD", "radiant-cli", "-rpcuser=${RPC_USER:-radiant}", "-rpcpassword=${RPC_PASS:-radiant}", "getblockchaininfo"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    deploy:
+      resources:
+        reservations:
+          memory: 2G
+
+  # RXinDexer Server (ElectrumX with Glyph/WAVE/Swap indexing)
+  rxindexer:
+    build:
+      context: /Users/main/Documents/Radiant/RXinDexer
+      dockerfile: docker/full-stack/Dockerfile
+    container_name: rxindexer
+    restart: unless-stopped
+    depends_on:
+      radiantd:
+        condition: service_healthy
+    volumes:
+      - rxindexer-data:/root/electrumdb
+      - rxindexer-contracts:/root/electrumx/data
+    ports:
+      - "50010:50010"   # TCP (Electrum protocol)
+      - "50011:50011"   # WSS (Photonic wallet, WebSocket subscriptions)
+      - "50012:50012"   # SSL (Electrum protocol)
+      - "8000:8000"     # RPC interface
+    environment:
+      # Core configuration
+      - DAEMON_URL=http://${RPC_USER:-radiant}:${RPC_PASS:-radiant}@radiantd:7332/
+      - COIN=Radiant
+      - NET=mainnet
+      - DB_ENGINE=rocksdb
+      - DB_DIRECTORY=/root/electrumdb
+      - SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,rpc://0.0.0.0:8000
+      - SSL_CERTFILE=/root/electrumdb/server.crt
+      - SSL_KEYFILE=/root/electrumdb/server.key
+      - ALLOW_ROOT=true
+      # Performance tuning
+      - CACHE_MB=${CACHE_MB:-2000}
+      - MAX_SESSIONS=${MAX_SESSIONS:-10000}
+      - MAX_SEND=10000000
+      - MAX_RECV=10000000
+      - REQUEST_TIMEOUT=60
+      # Rate limiting (relaxed for local RPC to prevent throttling disconnects)
+      - COST_SOFT_LIMIT=10000
+      - COST_HARD_LIMIT=100000
+      - INITIAL_CONCURRENT=50
+      - REQUEST_SLEEP=500
+      # RXinDexer: Glyph token indexing (FT, NFT, dMint, Mutable, Containers)
+      - GLYPH_INDEX=${GLYPH_INDEX:-1}
+      # RXinDexer: WAVE naming system indexing
+      - WAVE_INDEX=${WAVE_INDEX:-1}
+      - WAVE_HOT_NAMES=${WAVE_HOT_NAMES:-10000}
+      # RXinDexer: Swap DEX order indexing
+      - SWAP_INDEX=${SWAP_INDEX:-1}
+      # RXinDexer: Real-time WebSocket subscriptions
+      - GLYPH_SUBSCRIPTIONS=${GLYPH_SUBSCRIPTIONS:-1}
+      # RXinDexer: Mempool indexing for unconfirmed transactions
+      - MEMPOOL_GLYPH_INDEX=${MEMPOOL_GLYPH_INDEX:-1}
+      - MEMPOOL_SWAP_INDEX=${MEMPOOL_SWAP_INDEX:-1}
+      # RXinDexer: dMint contracts file
+      - DMINT_CONTRACTS_FILE=/root/electrumx/data/contracts.json
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50010 || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    stop_signal: SIGTERM
+    stop_grace_period: 180s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    deploy:
+      resources:
+        reservations:
+          memory: 4G
+
+volumes:
+  radiant-data:
+    name: radiant-node-data
+  rxindexer-data:
+    name: rxindexer-db-data
+  rxindexer-contracts:
+    name: rxindexer-contracts-data

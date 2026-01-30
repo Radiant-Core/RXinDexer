@@ -1,0 +1,70 @@
+# RXinDexer Integration Test Docker Compose
+# Usage: docker-compose -f docker-compose.test.yaml up --build
+
+services:
+  # RXinDexer server for testing
+  rxindexer:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: rxindexer_test
+    ports:
+      - "50010:50010"   # TCP
+      - "8000:8000"     # RPC
+    environment:
+      - DAEMON_URL=${DAEMON_URL:-http://radiantrpc:testpass@host.docker.internal:7332/}
+      - COIN=Radiant
+      - NET=mainnet
+      - DB_ENGINE=leveldb
+      - DB_DIRECTORY=/root/electrumdb
+      - SERVICES=tcp://0.0.0.0:50010,rpc://0.0.0.0:8000
+      - ALLOW_ROOT=true
+      - CACHE_MB=500
+      - MAX_SESSIONS=100
+      - LOG_LEVEL=DEBUG
+      # RXinDexer features
+      - GLYPH_INDEX=1
+      - WAVE_INDEX=1
+      - SWAP_INDEX=1
+      - GLYPH_SUBSCRIPTIONS=1
+      - MEMPOOL_GLYPH_INDEX=1
+      - MEMPOOL_SWAP_INDEX=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - test_db:/root/electrumdb
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50010 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    networks:
+      - test_network
+
+  # Integration test runner
+  test_runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test-runner
+    container_name: rxindexer_test_runner
+    depends_on:
+      rxindexer:
+        condition: service_healthy
+    environment:
+      - RXINDEXER_HOST=rxindexer
+      - RXINDEXER_TCP_PORT=50010
+      - RXINDEXER_RPC_PORT=8000
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./test_results:/app/test_results
+    networks:
+      - test_network
+    command: ["python3", "/app/tests/integration/run_tests.py"]
+
+volumes:
+  test_db:
+
+networks:
+  test_network:
+    driver: bridge
