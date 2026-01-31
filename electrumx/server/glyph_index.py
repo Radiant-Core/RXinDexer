@@ -331,6 +331,11 @@ class GlyphIndex:
             metadata = parse_glyph_metadata(envelope)
             if not metadata:
                 continue
+            if not isinstance(metadata, dict):
+                self.logger.warning(
+                    f'Invalid Glyph metadata type: tx={hash_to_hex_str(tx_hash)} input={vin_idx} type={type(metadata).__name__}'
+                )
+                continue
             
             # Log only after full validation confirms this is a real Glyph token
             protocols = metadata.get('p', [])
