@@ -310,6 +310,16 @@ class TestCBORMetadata:
         result = decode_cbor_metadata(b'\xff\xff\xff')
         assert result is None
 
+    def test_decode_cbor_non_dict(self):
+        """Test decoding CBOR that is not a map returns None."""
+        try:
+            import cbor2
+            cbor_data = cbor2.dumps(1)
+            result = decode_cbor_metadata(cbor_data)
+            assert result is None
+        except ImportError:
+            pytest.skip('cbor2 not available')
+
     def test_extract_token_info_v2_nft(self):
         """Test extracting token info from v2 NFT metadata."""
         metadata = {
