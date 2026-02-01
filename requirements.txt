@@ -1,4 +1,4 @@
-aiorpcX[ws]>=0.22,<0.23
+aiorpcx[ws]>=0.22,<0.23
 attrs
 plyvel
 pylru
