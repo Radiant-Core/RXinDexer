@@ -1,0 +1,18 @@
+aiorpcx[ws]>=0.22,<0.23
+attrs
+plyvel
+pylru
+aiohttp>=3.3,<4.0
+websockets>=10.0,<11.0
+psutil
+cbor2>=5.4.0
+
+# REST API dependencies
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+
+# python-rocksdb with GIL fix - install from source with patch
+# This works around the Cython GIL issue in python-rocksdb
+# Use older version that doesn't have GIL issues or install with CFLAGS
+# CFLAGS="-DCYTHON_WITHOUT_GIL=0" pip install python-rocksdb
