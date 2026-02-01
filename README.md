@@ -86,6 +86,8 @@ SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,rpc://0.0.0
 
 ### 3. Generate SSL Certificates
 
+**IMPORTANT**: See [SSL_CERTIFICATES.md](SSL_CERTIFICATES.md) for detailed security guidelines and certificate management.
+
 For production, use proper CA-signed certificates. For testing:
 
 ```bash
@@ -95,6 +97,8 @@ openssl req -x509 -nodes -days 365 -newkey rsa:4096 \
     -out electrumdb/server.crt \
     -subj "/CN=your.domain.com"
 ```
+
+⚠️ **Security Note**: The `.gitignore` file prevents accidental commits of certificate files. Never commit private keys to version control!
 
 ### 4. Build and Run
 

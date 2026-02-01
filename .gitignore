@@ -53,6 +53,14 @@ benchmarks/*.pid
 electrumx-fullstack-deploy.zip
 electrumx-standalone-deploy.zip
 
+# SSL/TLS certificates and private keys (NEVER commit these)
+*.crt
+*.key
+*.pem
+electrumdb/server.crt
+electrumdb/server.key
+electrumdb/server.csr
+
 # Environment files with secrets
 .env
 *.env.local
