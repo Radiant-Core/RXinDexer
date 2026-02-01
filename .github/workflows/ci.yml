@@ -24,7 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install flake8 pylint
           # Install python-rocksdb with GIL workaround for lint job
-          CFLAGS="-DCYTHON_WITHOUT_GIL=0" pip install python-rocksdb || pip install "python-rocksdb<=0.7.0"
+          CFLAGS="-DCYTHON_WITHOUT_GIL=0" pip install "python-rocksdb<=0.7.0"
           pip install -r requirements.txt
 
       - name: Run flake8
@@ -61,7 +61,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pytest-asyncio
           # Install python-rocksdb with GIL workaround
-          CFLAGS="-DCYTHON_WITHOUT_GIL=0" pip install python-rocksdb || pip install "python-rocksdb<=0.7.0"
+          CFLAGS="-DCYTHON_WITHOUT_GIL=0" pip install "python-rocksdb<=0.7.0"
           pip install -r requirements.txt
 
       - name: Verify critical dependencies
