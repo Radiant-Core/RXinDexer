@@ -59,15 +59,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest pytest-asyncio
           pip install -r requirements-ci.txt
+          # Install package in development mode to ensure imports work
+          pip install -e .
 
       - name: Verify critical dependencies
         run: |
           python -c "import aiorpcx; print('✅ aiorpcx installed successfully')"
           python -c "import aiohttp; print('✅ aiohttp installed successfully')"
+          python -c "import electrumx.lib; print('✅ electrumx.lib available')"
+          python -c "import electrumx.server.glyph_api; print('✅ glyph_api available')"
+
+      - name: Verify test environment
+        run: |
+          if [ -d "tests" ]; then
+            cd tests && python -c "import sys; print('Python path:'); [print(f'  {p}') for p in sys.path[:5]]"
+            cd tests && python -c "import electrumx.lib; print('✅ Test environment can import electrumx.lib')"
+          fi
 
       - name: Run tests
         run: |
           if [ -d "tests" ]; then
+            export PYTHONPATH=$PYTHONPATH:$(pwd)
             pytest tests/ -v
           else
             echo "No tests directory found"

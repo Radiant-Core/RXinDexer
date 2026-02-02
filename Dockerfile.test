@@ -23,13 +23,32 @@ RUN apt update && apt install --no-install-recommends -y $PACKAGES && \
     rm -rf /var/lib/apt/lists/* && \
     apt clean
 
-# Create directory for DB
-RUN mkdir -p /root/electrumdb
+RUN groupadd -r electrumx && useradd -r -g electrumx -u 1000 electrumx
 
-WORKDIR /root/electrumx
+# Create directory for DB
+RUN mkdir -p /data/electrumdb && chown -R electrumx:electrumx /data
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/Dockerfile.test
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/Dockerfile.test
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/Dockerfile.test
+=======
+
+RUN mkdir -p /home/electrumx/electrumx && chown -R electrumx:electrumx /home/electrumx
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/Dockerfile.test
+=======
+
+RUN mkdir -p /home/electrumx/electrumx && chown -R electrumx:electrumx /home/electrumx
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/Dockerfile.test
+=======
+
+RUN mkdir -p /home/electrumx/electrumx && chown -R electrumx:electrumx /home/electrumx
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/Dockerfile.test
+
+WORKDIR /home/electrumx/electrumx
 
 # Copy local source
 COPY . .
+
+RUN chown -R electrumx:electrumx /home/electrumx/electrumx
 
 # Install Python dependencies
 RUN python3 -m pip install --upgrade pip
@@ -40,14 +59,14 @@ RUN python3 -m pip install \
     aiohttp \
     cbor2 \
     websockets \
-    pylru
+    pylru \
+    pytest
 
 # Default environment
 ENV COIN=Radiant
 ENV NET=mainnet
 ENV DB_ENGINE=leveldb
-ENV DB_DIRECTORY=/root/electrumdb
-ENV ALLOW_ROOT=true
+ENV DB_DIRECTORY=/data/electrumdb
 ENV LOG_LEVEL=INFO
 
 # RXinDexer features enabled by default
@@ -58,6 +77,8 @@ ENV GLYPH_SUBSCRIPTIONS=1
 ENV MEMPOOL_GLYPH_INDEX=1
 ENV MEMPOOL_SWAP_INDEX=1
 
-EXPOSE 50010 8000
+EXPOSE 50010 8001
+
+USER electrumx
 
 ENTRYPOINT ["python3", "electrumx_server"]

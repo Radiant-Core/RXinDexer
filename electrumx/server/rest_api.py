@@ -8,10 +8,13 @@ Based on the RXinDexer PostgreSQL implementation API design.
 """
 
 from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, HTTPException, Query, Path
+import os
+import time
+from dataclasses import dataclass
+
+from fastapi import FastAPI, HTTPException, Query, Path, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import time
 
 # App instance
 app = FastAPI(
@@ -22,14 +25,77 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+_env_name = os.getenv('ELECTRUMX_ENV', os.getenv('ENV', 'dev')).strip().lower()
+_is_prod = _env_name == 'prod'
+
+_allowed_origins_raw = os.getenv('ALLOWED_ORIGINS', '').strip()
+_allowed_origins = [o.strip() for o in _allowed_origins_raw.split(',') if o.strip()]
+if _is_prod and not _allowed_origins:
+    raise RuntimeError('ALLOWED_ORIGINS must be set in production (ELECTRUMX_ENV=prod)')
+
+_require_rest_api_key_prod = os.getenv('REST_REQUIRE_API_KEY_IN_PROD', '1').strip() not in ('0', 'false', 'no')
+if _is_prod and _require_rest_api_key_prod and not os.getenv('REST_API_KEY', '').strip():
+    raise RuntimeError('REST_API_KEY must be set in production (or set REST_REQUIRE_API_KEY_IN_PROD=0)')
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=_allowed_origins if _allowed_origins else [],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+def _require_api_key(x_api_key: Optional[str] = Header(default=None, alias='X-API-Key')):
+    required_key = os.getenv('REST_API_KEY', '').strip()
+    if not required_key:
+        return
+    if not x_api_key or x_api_key != required_key:
+        raise HTTPException(status_code=401, detail='Unauthorized')
+
+
+@dataclass
+class _TokenBucket:
+    tokens: float
+    last_ts: float
+
+
+_rate_buckets: Dict[str, _TokenBucket] = {}
+
+
+def _rate_limit(request: Request):
+    limit_per_minute = int(os.getenv('REST_RATE_LIMIT_PER_MIN', '600'))
+    burst = int(os.getenv('REST_RATE_LIMIT_BURST', str(limit_per_minute)))
+    if limit_per_minute <= 0:
+        return
+
+    client_host = request.client.host if request.client else 'unknown'
+    now = time.time()
+    bucket = _rate_buckets.get(client_host)
+    if bucket is None:
+        bucket = _TokenBucket(tokens=float(burst), last_ts=now)
+        _rate_buckets[client_host] = bucket
+
+    elapsed = max(0.0, now - bucket.last_ts)
+    refill_per_sec = float(limit_per_minute) / 60.0
+    bucket.tokens = min(float(burst), bucket.tokens + elapsed * refill_per_sec)
+    bucket.last_ts = now
+
+    if bucket.tokens < 1.0:
+        raise HTTPException(status_code=429, detail='Rate limit exceeded')
+    bucket.tokens -= 1.0
+
+
+@app.middleware("http")
+async def _security_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith('/health'):
+        return await call_next(request)
+
+    _require_api_key(request.headers.get('x-api-key'))
+    _rate_limit(request)
+    return await call_next(request)
 
 # Global reference to the indexer (set by the server on startup)
 _glyph_index = None
@@ -97,6 +163,24 @@ async def health_check():
         database=db_status,
         sync_height=sync_height,
     )
+
+
+@app.get("/health/live", tags=["Health"])
+async def health_live():
+    return {"status": "alive"}
+
+
+@app.get("/health/ready", tags=["Health"])
+async def health_ready():
+    if not _db:
+        raise HTTPException(status_code=503, detail="Database not available")
+    try:
+        height = _db.db_height
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
+    if height is None or height < 1:
+        raise HTTPException(status_code=503, detail="Not ready")
+    return {"status": "ready", "height": height}
 
 
 @app.get("/health/db", tags=["Health"])

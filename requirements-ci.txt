@@ -5,6 +5,7 @@ pylru
 aiohttp>=3.3,<4.0
 websockets>=10.0,<11.0
 psutil
+python-rocksdb<=0.7.0
 cbor2>=5.4.0
 
 # REST API dependencies

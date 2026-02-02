@@ -63,6 +63,7 @@ electrumdb/server.csr
 
 # Environment files with secrets
 .env
+test.env
 *.env.local
 
 # Test databases

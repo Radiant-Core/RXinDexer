@@ -56,6 +56,14 @@ except ImportError:
     HAS_SUBSCRIPTIONS = False
     GlyphSubscriptionManager = None
 
+# Import dMint contracts manager
+try:
+    from electrumx.server.dmint_contracts import DMintContractsManager
+    HAS_DMINT_CONTRACTS = True
+except ImportError:
+    HAS_DMINT_CONTRACTS = False
+    DMintContractsManager = None
+
 
 class Prefetcher:
     '''Prefetches blocks (in the forward direction only).'''
@@ -255,6 +263,13 @@ class BlockProcessor:
             self.subscriptions = GlyphSubscriptionManager(env)
             self.logger.info('Glyph/Swap subscriptions initialized')
 
+        # dMint contracts manager for miners
+        self.dmint_contracts = None
+        if HAS_DMINT_CONTRACTS and self.glyph_index:
+            data_dir = getattr(env, 'db_dir', 'data')
+            self.dmint_contracts = DMintContractsManager(data_dir, self.glyph_index)
+            self.logger.info('dMint contracts manager initialized')
+
     async def run_with_lock(self, coro):
         # Shielded so that cancellations from shutdown don't lose work.  Cancellation will
         # cause fetch_and_process_blocks to block on the lock in flush(), the task completes,
@@ -297,7 +312,13 @@ class BlockProcessor:
             await self._backup_block(raw_block)
             # self.touched can include other addresses which is harmless, but remove None.
             self.touched.discard(None)
-            self.db.flush_backup(self.flush_data(), self.touched)
+            self.db.flush_backup(
+                self.flush_data(),
+                self.touched,
+                glyph_index=self.glyph_index,
+                wave_index=self.wave_index,
+                swap_index=self.swap_index,
+            )
             height -= 1
 
         self.logger.info('backed up to height {:,d}'.format(self.height))

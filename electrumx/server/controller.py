@@ -6,6 +6,7 @@
 # and warranty status of this software.
 
 from asyncio import Event
+import os
 
 from aiorpcx import _version as aiorpcx_version, TaskGroup
 
@@ -105,6 +106,39 @@ class Controller(ServerBase):
             db = DB(env)
             bp = BlockProcessor(env, db, daemon, notifications)
 
+            rest_enabled = os.getenv('REST_API_ENABLED', '0').strip().lower() in ('1', 'true', 'yes')
+            rest_host = os.getenv('REST_API_HOST', '0.0.0.0').strip()
+            rest_port = int(os.getenv('REST_API_PORT', '8000'))
+
+            async def run_rest_api():
+                if not rest_enabled:
+                    return
+                try:
+                    import uvicorn
+                    from electrumx.server.rest_api import app as rest_app, set_indexer
+                except Exception as e:
+                    self.logger.error(f'REST API disabled: failed to import dependencies: {e}')
+                    return
+
+                set_indexer(getattr(bp, 'glyph_index', None), db, daemon)
+
+                config = uvicorn.Config(
+                    rest_app,
+                    host=rest_host,
+                    port=rest_port,
+                    log_level=os.getenv('REST_LOG_LEVEL', 'info').strip().lower(),
+                    access_log=False,
+                )
+                server = uvicorn.Server(config)
+
+                async def stop_when_shutdown():
+                    await shutdown_event.wait()
+                    server.should_exit = True
+
+                async with TaskGroup() as rest_group:
+                    await rest_group.spawn(stop_when_shutdown())
+                    await rest_group.spawn(server.serve())
+
             # Set notifications up to implement the MemPoolAPI
             def get_db_height():
                 return db.db_height
@@ -115,7 +149,8 @@ class Controller(ServerBase):
             notifications.raw_transactions = daemon.getrawtransactions
             notifications.lookup_utxos = db.lookup_utxos
             MemPoolAPI.register(Notifications)
-            mempool = MemPool(env.coin, notifications)
+            mempool = MemPool(env.coin, notifications, env=env,
+                              glyph_index=bp.glyph_index, swap_index=bp.swap_index)
 
             session_mgr = SessionManager(env, db, bp, daemon, mempool,
                                          shutdown_event)
@@ -133,6 +168,7 @@ class Controller(ServerBase):
                 await group.spawn(mempool.keep_synchronized(mempool_event))
 
             async with TaskGroup() as group:
+                await group.spawn(run_rest_api())
                 await group.spawn(session_mgr.serve(notifications, mempool_event))
                 await group.spawn(bp.fetch_and_process_blocks(caught_up_event))
                 await group.spawn(wait_for_catchup())

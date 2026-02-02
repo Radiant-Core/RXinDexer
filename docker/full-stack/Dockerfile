@@ -41,13 +41,17 @@ RUN apt update && apt install --no-install-recommends -y $PACKAGES && \
     rm -rf /var/lib/apt/lists/* && \
     apt clean
 
+RUN groupadd -r electrumx && useradd -r -g electrumx -u 1000 electrumx
+
 # Create directories
-RUN mkdir -p /root/electrumdb /root/electrumx/data
+RUN mkdir -p /data/electrumdb /data/contracts && chown -R electrumx:electrumx /data
 
 WORKDIR /root
 
-# Copy local RXinDexer source
-COPY . electrumx
+# Clone RXinDexer from GitHub
+ARG RXINDEXER_BRANCH=main
+RUN git clone --depth 1 --branch ${RXINDEXER_BRANCH} \
+    https://github.com/Radiant-Core/RXinDexer.git electrumx
 
 WORKDIR /root/electrumx
 
@@ -69,16 +73,20 @@ ENV DAEMON_URL=http://user:pass@localhost:7332/
 ENV COIN=Radiant
 ENV NET=mainnet
 ENV REQUEST_TIMEOUT=60
-ENV DB_DIRECTORY=/root/electrumdb
+ENV DB_DIRECTORY=/data/electrumdb
 ENV ELECTRUMX_ENV=prod
 
 # SSL configuration
-ENV SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,rpc://0.0.0.0:8000
-ENV SSL_CERTFILE=/root/electrumdb/server.crt
-ENV SSL_KEYFILE=/root/electrumdb/server.key
+ENV SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,rpc://127.0.0.1:8001
+ENV SSL_CERTFILE=/data/electrumdb/server.crt
+ENV SSL_KEYFILE=/data/electrumdb/server.key
+
+# REST API (HTTP)
+ENV REST_API_ENABLED=1
+ENV REST_API_HOST=0.0.0.0
+ENV REST_API_PORT=8000
 
 # Production defaults
-ENV ALLOW_ROOT=true
 ENV CACHE_MB=10000
 ENV MAX_SESSIONS=10000
 ENV MAX_SEND=10000000
@@ -111,13 +119,15 @@ ENV MEMPOOL_GLYPH_INDEX=1
 ENV MEMPOOL_SWAP_INDEX=1
 
 # RXinDexer: dMint contracts configuration
-ENV DMINT_CONTRACTS_FILE=/root/electrumx/data/contracts.json
+ENV DMINT_CONTRACTS_FILE=/data/contracts/contracts.json
 
 # Logging
 ENV LOG_LEVEL=INFO
 
+USER electrumx
+
 # Create SSL certificates
-WORKDIR /root/electrumdb
+WORKDIR /data/electrumdb
 RUN openssl genrsa -out server.key 2048
 RUN openssl req -new -key server.key -out server.csr -subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=radiantblockchain.org"
 RUN openssl x509 -req -days 1825 -in server.csr -signkey server.key -out server.crt

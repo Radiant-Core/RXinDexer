@@ -108,7 +108,7 @@ def main():
     args = vars(args)
     port = args.pop('port')
     if port is None:
-        port = int(environ.get('RPC_PORT', 8000))
+        port = int(environ.get('RPC_PORT', 8001))
     method = args.pop('command')
 
     # aiorpcX makes this so easy...
