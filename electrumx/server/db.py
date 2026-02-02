@@ -365,7 +365,7 @@ class DB(object):
         self.last_flush_tx_count = self.fs_tx_count
         self.write_utxo_state(batch)
 
-    def flush_backup(self, flush_data, touched):
+    def flush_backup(self, flush_data, touched, *, glyph_index=None, wave_index=None, swap_index=None):
         '''Like flush_dbs() but when backing up.  All UTXOs are flushed.'''
         assert not flush_data.headers
         assert not flush_data.block_tx_hashes
@@ -378,6 +378,16 @@ class DB(object):
         self.backup_fs(flush_data.height, flush_data.tx_count)
         self.history.backup(touched, flush_data.tx_count)
         with self.utxo_db.write_batch() as batch:
+            # Reorg-safe secondary index unwind: the removed block height is
+            # (flush_data.height + 1) because BlockProcessor decrements height
+            # before calling flush_backup().
+            reorg_height = flush_data.height + 1
+            if glyph_index is not None:
+                glyph_index.backup(batch, reorg_height)
+            if wave_index is not None:
+                wave_index.backup(batch, reorg_height)
+            if swap_index is not None:
+                swap_index.backup(batch, reorg_height)
             self.flush_utxo_db(batch, flush_data)
             # Flush state last as it reads the wall time.
             self.flush_state(batch)

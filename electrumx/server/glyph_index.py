@@ -5,12 +5,14 @@ This module provides database storage and indexing for Glyph v1/v2 tokens.
 Handles token registration, balance tracking, and history.
 """
 
+import ast
 import struct
 from typing import Optional, Dict, Any, List, Tuple, Set
 from collections import defaultdict
 
 from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256, HASHX_LEN
+from electrumx.lib.util import pack_be_uint32
 from electrumx.lib.glyph import (
     GLYPH_MAGIC,
     GlyphProtocol,
@@ -44,6 +46,7 @@ class GlyphDBKeys:
     BY_NAME = b'GN'        # GN + name_hash -> ref (for search)
     BY_TICKER = b'GK'      # GK + ticker -> ref (for FT lookup)
     SUPPLY = b'GS'         # GS + ref -> current supply (FT only)
+    UNDO = b'GXU'          # GXU + height(be) -> repr([(key, prev_value_or_None), ...])
 
 
 # History event types
@@ -280,8 +283,34 @@ class GlyphIndex:
         # In-memory caches for unflushed data
         self.token_cache: Dict[bytes, GlyphTokenInfo] = {}
         self.balance_cache: Dict[bytes, int] = {}  # key -> amount
-        self.history_cache: List[Tuple[bytes, bytes]] = []  # (key, value)
+        self.balance_height: Dict[bytes, int] = {}
+        self.history_cache: List[Tuple[int, bytes, bytes]] = []  # (height, key, value)
         self.metadata_cache: Dict[bytes, bytes] = {}  # hash -> cbor
+        self.metadata_height: Dict[bytes, int] = {}
+        self.token_height: Dict[bytes, int] = {}
+
+        # Per-height undo information for reorg safety.
+        # We store the previous value of each key (or None if absent) the first time
+        # it is touched within a given height.
+        self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
+        self._undo_seen: Dict[int, Set[bytes]] = defaultdict(set)
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/glyph_index.py
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/glyph_index.py
+=======
+=======
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/glyph_index.py
+
+        # Undo retention: keep at most env.reorg_limit heights of undo data.
+        # We do not try to retroactively delete historical keys on startup; we
+        # only enforce the bound moving forward.
+        current_height = getattr(db, 'db_height', -1)
+        reorg_limit = getattr(env, 'reorg_limit', 0)
+        min_keep = max(0, current_height - reorg_limit + 1) if reorg_limit else 0
+        self._last_undo_pruned = min_keep - 1
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/glyph_index.py
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/glyph_index.py
+=======
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/glyph_index.py
         
         if self.enabled:
             self.logger.info('Glyph token indexing enabled')
@@ -453,6 +482,7 @@ class GlyphIndex:
         if metadata_bytes:
             token.metadata_hash = sha256(metadata_bytes)
             self.metadata_cache[token.metadata_hash] = metadata_bytes
+            self.metadata_height[token.metadata_hash] = height
         
         # For FT, track supply
         if GlyphProtocol.GLYPH_FT in token.protocols:
@@ -478,11 +508,12 @@ class GlyphIndex:
         
         # Store in cache
         self.token_cache[ref] = token
+        self.token_height[ref] = height
         
         # Add deploy event to history
         history_key = pack_history_key(ref, height, tx_idx)
         history_value = struct.pack('<B', GlyphEventType.DEPLOY) + tx_hash
-        self.history_cache.append((history_key, history_value))
+        self.history_cache.append((height, history_key, history_value))
         
         # Log the indexed token
         ref_txid, ref_vout = unpack_ref(ref)
@@ -495,63 +526,155 @@ class GlyphIndex:
         # The reveal will be self-contained
         pass
     
-    def update_balance(self, scripthash: bytes, ref: bytes, delta: int):
+    def update_balance(self, height: int, scripthash: bytes, ref: bytes, delta: int):
         """Update a token balance."""
         if not self.enabled:
             return
-        
+
         key = pack_balance_key(scripthash, ref)
+        self._record_undo(height, key)
         current = self.balance_cache.get(key, 0)
         new_balance = max(0, current + delta)
-        
+
         if new_balance > 0:
             self.balance_cache[key] = new_balance
+            self.balance_height[key] = height
         elif key in self.balance_cache:
             del self.balance_cache[key]
+            self.balance_height.pop(key, None)
+    
+    def _undo_key(self, height: int) -> bytes:
+        return GlyphDBKeys.UNDO + pack_be_uint32(height)
+    
+    def _record_undo(self, height: int, key: bytes):
+        """Record undo information for a key."""
+        if not self.enabled:
+            return
+        if key in self._undo_seen[height]:
+            return
+        self._undo_seen[height].add(key)
+        prev_value = self.db.utxo_db.get(key)
+        self._undo_cache[height].append((key, prev_value))
+    
+    def backup(self, batch, height: int):
+        """Revert DB keys written at the given height (reorg unwind)."""
+        if not self.enabled:
+            return
+        raw = self.db.utxo_db.get(self._undo_key(height))
+        if not raw:
+            return
+        entries = ast.literal_eval(raw.decode())
+
+        for key, prev in entries:
+            if prev is None:
+                batch.delete(key)
+            else:
+                batch.put(key, prev)
+        batch.delete(self._undo_key(height))
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/glyph_index.py
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/glyph_index.py
+=======
+=======
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/glyph_index.py
+
+    def _prune_old_undo_keys(self, batch):
+        """Delete undo keys that are older than the reorg window."""
+        reorg_limit = getattr(self.env, 'reorg_limit', 0)
+        if not reorg_limit:
+            return
+
+        # Keep undo info for heights in [db_height - reorg_limit + 1, db_height].
+        min_keep = max(0, self.db.db_height - reorg_limit + 1)
+        prune_to = min_keep - 1
+        if prune_to <= self._last_undo_pruned:
+            return
+
+        for height in range(self._last_undo_pruned + 1, prune_to + 1):
+            batch.delete(self._undo_key(height))
+        self._last_undo_pruned = prune_to
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/glyph_index.py
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/glyph_index.py
+=======
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/glyph_index.py
     
     def flush(self, batch):
         """Flush cached Glyph data to the database."""
         if not self.enabled:
             return
+        # Important: record undo entries for keys touched during this flush
+        # first, then persist undo records at the end.
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/glyph_index.py
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/glyph_index.py
+=======
+
+        self._prune_old_undo_keys(batch)
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/glyph_index.py
+=======
+
+        self._prune_old_undo_keys(batch)
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/glyph_index.py
         
         # Flush tokens
         for ref, token in self.token_cache.items():
+            height = self.token_height.get(ref)
+            if height is None:
+                continue
             key = pack_token_key(ref)
+            self._record_undo(height, key)
             batch.put(key, token.to_bytes())
             
             # Also index by type
             type_key = GlyphDBKeys.BY_TYPE + struct.pack('<B', token.token_type) + ref
+            self._record_undo(height, type_key)
             batch.put(type_key, b'')
             
             # Index by name (if present)
             if token.name:
                 name_hash = sha256(token.name.lower().encode('utf-8'))[:16]
                 name_key = GlyphDBKeys.BY_NAME + name_hash + ref
+                self._record_undo(height, name_key)
                 batch.put(name_key, b'')
             
             # Index by ticker (if FT)
             if token.ticker and GlyphProtocol.GLYPH_FT in token.protocols:
                 ticker_key = GlyphDBKeys.BY_TICKER + token.ticker.upper().encode('utf-8')[:8]
+                self._record_undo(height, ticker_key)
                 batch.put(ticker_key, ref)
         
         # Flush balances
         for key, amount in self.balance_cache.items():
+            height = self.balance_height.get(key)
+            if height is None:
+                continue
             batch.put(key, struct.pack('<Q', amount))
         
         # Flush history
-        for key, value in self.history_cache:
+        for height, key, value in self.history_cache:
+            self._record_undo(height, key)
             batch.put(key, value)
         
         # Flush metadata
         for hash_bytes, cbor_data in self.metadata_cache.items():
             key = GlyphDBKeys.METADATA + hash_bytes
+            height = self.metadata_height.get(hash_bytes)
+            if height is not None:
+                self._record_undo(height, key)
             batch.put(key, cbor_data)
+
+        # Persist undo information last so it includes keys written above.
+        for height, entries in sorted(self._undo_cache.items()):
+            batch.put(self._undo_key(height), repr(entries).encode())
+        self._undo_cache.clear()
+        self._undo_seen.clear()
         
         # Clear caches
         self.token_cache.clear()
         self.balance_cache.clear()
+        self.balance_height.clear()
         self.history_cache.clear()
         self.metadata_cache.clear()
+        self.metadata_height.clear()
+        self.token_height.clear()
     
     # ========================================================================
     # Query Methods (used by API)
@@ -569,6 +692,64 @@ class GlyphIndex:
         if data:
             return GlyphTokenInfo.from_bytes(data)
         return None
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about indexed Glyph tokens.
+        
+        Returns:
+            Dict with token counts by type and other stats
+        """
+        stats = {
+            'enabled': self.enabled,
+            'total_tokens': 0,
+            'by_type': {
+                'FT': 0,       # Fungible tokens
+                'NFT': 0,      # Non-fungible tokens
+                'DAT': 0,      # Data tokens
+                'dMint': 0,    # Distributed mint tokens
+                'unknown': 0,
+            },
+            'by_version': {
+                'v1': 0,
+                'v2': 0,
+            },
+            'cache_size': len(self.token_cache),
+        }
+        
+        if not self.enabled:
+            return stats
+        
+        # Iterate over all tokens in database
+        prefix = GlyphDBKeys.TOKEN
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
+            stats['total_tokens'] += 1
+            
+            try:
+                token = GlyphTokenInfo.from_bytes(value)
+                
+                # Count by version
+                if token.glyph_version == 2:
+                    stats['by_version']['v2'] += 1
+                else:
+                    stats['by_version']['v1'] += 1
+                
+                # Count by type
+                token_type = token.token_type
+                if token_type == GlyphTokenType.FT:
+                    stats['by_type']['FT'] += 1
+                elif token_type == GlyphTokenType.NFT:
+                    stats['by_type']['NFT'] += 1
+                elif token_type == GlyphTokenType.DAT:
+                    stats['by_type']['DAT'] += 1
+                elif token_type == GlyphTokenType.DMINT:
+                    stats['by_type']['dMint'] += 1
+                else:
+                    stats['by_type']['unknown'] += 1
+            except Exception:
+                stats['by_type']['unknown'] += 1
+        
+        return stats
     
     def get_token_by_ref_str(self, ref_str: str) -> Optional[Dict[str, Any]]:
         """Get token info by ref string (txid_vout)."""

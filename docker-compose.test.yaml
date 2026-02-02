@@ -10,15 +10,14 @@ services:
     container_name: rxindexer_test
     ports:
       - "50010:50010"   # TCP
-      - "8000:8000"     # RPC
+      - "127.0.0.1:8001:8001"     # Admin RPC (localhost)
     environment:
       - DAEMON_URL=${DAEMON_URL:-http://radiantrpc:testpass@host.docker.internal:7332/}
       - COIN=Radiant
       - NET=mainnet
       - DB_ENGINE=leveldb
-      - DB_DIRECTORY=/root/electrumdb
-      - SERVICES=tcp://0.0.0.0:50010,rpc://0.0.0.0:8000
-      - ALLOW_ROOT=true
+      - DB_DIRECTORY=/data/electrumdb
+      - SERVICES=tcp://0.0.0.0:50010,rpc://127.0.0.1:8001
       - CACHE_MB=500
       - MAX_SESSIONS=100
       - LOG_LEVEL=DEBUG
@@ -32,7 +31,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - test_db:/root/electrumdb
+      - test_db:/data/electrumdb
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 50010 || exit 1"]
       interval: 10s
@@ -54,7 +53,7 @@ services:
     environment:
       - RXINDEXER_HOST=rxindexer
       - RXINDEXER_TCP_PORT=50010
-      - RXINDEXER_RPC_PORT=8000
+      - RXINDEXER_RPC_PORT=8001
     volumes:
       - ./tests:/app/tests:ro
       - ./test_results:/app/test_results

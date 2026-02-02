@@ -8,6 +8,7 @@ and swap history.
 Designed to serve explorers, wallets, DEX interfaces, and market data APIs.
 """
 
+import ast
 import struct
 import time
 from typing import Optional, Dict, Any, List, Tuple
@@ -15,6 +16,7 @@ from collections import defaultdict
 
 from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256
+from electrumx.lib.util import pack_be_uint32
 from electrumx.lib.script import OpCodes
 
 try:
@@ -33,6 +35,7 @@ class SwapDBKeys:
     HISTORY = b'SH'         # SH + base_ref + height + tx_idx -> event
     STATS = b'SS'           # SS + base_ref + quote_ref -> pair stats
     FILL = b'SF'            # SF + order_id + height + tx_idx -> fill info
+    UNDO = b'SWU'           # SWU + height(be) -> repr([(key, prev_value_or_None), ...])
 
 
 # Order status
@@ -233,8 +236,27 @@ class SwapIndex:
         
         # In-memory caches
         self.order_cache: Dict[bytes, SwapOrderInfo] = {}
+        self.order_height: Dict[bytes, int] = {}
         self.stats_cache: Dict[bytes, PairStats] = {}
-        self.history_cache: List[Tuple[bytes, bytes]] = []
+        self.history_cache: List[Tuple[int, bytes, bytes]] = []
+
+        self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
+        self._undo_seen: Dict[int, set] = defaultdict(set)
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
+=======
+=======
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
+
+        # Undo retention: keep at most env.reorg_limit heights of undo data.
+        current_height = getattr(db, 'db_height', -1)
+        reorg_limit = getattr(env, 'reorg_limit', 0)
+        min_keep = max(0, current_height - reorg_limit + 1) if reorg_limit else 0
+        self._last_undo_pruned = min_keep - 1
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
+=======
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
         
         if self.enabled:
             self.logger.info('Swap order indexing enabled')
@@ -263,7 +285,59 @@ class SwapIndex:
             order = self._parse_rswp_advertisement(script, tx_hash, vout_idx, height, timestamp)
             if order:
                 self.order_cache[order.order_id] = order
+                self.order_height[order.order_id] = height
                 self.logger.debug(f'Indexed swap order: {hash_to_hex_str(order.order_id)}')
+
+    def _undo_key(self, height: int) -> bytes:
+        return SwapDBKeys.UNDO + pack_be_uint32(height)
+
+    def _record_undo(self, height: int, key: bytes):
+        if not self.enabled:
+            return
+        if key in self._undo_seen[height]:
+            return
+        self._undo_seen[height].add(key)
+        prev_value = self.db.utxo_db.get(key)
+        self._undo_cache[height].append((key, prev_value))
+
+    def backup(self, batch, height: int):
+        """Revert Swap keys written at the given height (reorg unwind)."""
+        if not self.enabled:
+            return
+        raw = self.db.utxo_db.get(self._undo_key(height))
+        if not raw:
+            return
+        entries = ast.literal_eval(raw.decode())
+        for key, prev in entries:
+            if prev is None:
+                batch.delete(key)
+            else:
+                batch.put(key, prev)
+        batch.delete(self._undo_key(height))
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
+=======
+=======
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
+
+    def _prune_old_undo_keys(self, batch):
+        """Delete undo keys that are older than the reorg window."""
+        reorg_limit = getattr(self.env, 'reorg_limit', 0)
+        if not reorg_limit:
+            return
+
+        min_keep = max(0, self.db.db_height - reorg_limit + 1)
+        prune_to = min_keep - 1
+        if prune_to <= self._last_undo_pruned:
+            return
+
+        for height in range(self._last_undo_pruned + 1, prune_to + 1):
+            batch.delete(self._undo_key(height))
+        self._last_undo_pruned = prune_to
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
+=======
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
     
     def _parse_rswp_advertisement(self, script: bytes, tx_hash: bytes, 
                                    vout: int, height: int, timestamp: int) -> Optional[SwapOrderInfo]:
@@ -540,39 +614,72 @@ class SwapIndex:
             padded = data + b'\x00' * (4 - len(data))
             return struct.unpack('<I', padded)[0]
         return None
-    
+
     def flush(self, batch):
         """Flush cached swap data to the database."""
         if not self.enabled:
             return
-        
-        # Flush orders
+        # Important: record undo entries for keys touched during this flush
+        # first, then persist undo records at the end.
+
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
+=======
+        self._prune_old_undo_keys(batch)
+
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
+=======
+        self._prune_old_undo_keys(batch)
+
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
+        # Flush orders and associated indexes
         for order_id, order in self.order_cache.items():
-            key = SwapDBKeys.ORDER + order_id
-            batch.put(key, order.to_bytes())
-            
-            # Index open orders by pair (for orderbook queries)
-            if order.status == OrderStatus.OPEN or order.status == OrderStatus.PARTIAL:
-                # Price key for sorting: invert for buys so highest first
+            height = self.order_height.get(order_id)
+            if height is None:
+                continue
+
+            order_key = SwapDBKeys.ORDER + order_id
+            self._record_undo(height, order_key)
+            batch.put(order_key, order.to_bytes())
+
+            # OPEN_BY_PAIR orderbook index
+            if order.base_ref and order.quote_ref and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
                 if order.side == OrderSide.BUY:
                     price_key = struct.pack('>Q', 0xFFFFFFFFFFFFFFFF - order.price)
                 else:
                     price_key = struct.pack('>Q', order.price)
-                
-                pair_key = (SwapDBKeys.OPEN_BY_PAIR + order.base_ref + 
-                           order.quote_ref + bytes([order.side]) + price_key + order_id)
+
+                pair_key = (
+                    SwapDBKeys.OPEN_BY_PAIR
+                    + order.base_ref
+                    + order.quote_ref
+                    + bytes([order.side])
+                    + price_key
+                    + order_id
+                )
+                self._record_undo(height, pair_key)
                 batch.put(pair_key, b'')
-            
-            # Index by maker
-            maker_key = SwapDBKeys.OPEN_BY_MAKER + order.maker_scripthash + order_id
-            batch.put(maker_key, b'')
-        
+
+            # OPEN_BY_MAKER user orders index
+            if order.maker_scripthash:
+                maker_key = SwapDBKeys.OPEN_BY_MAKER + order.maker_scripthash + order_id
+                self._record_undo(height, maker_key)
+                batch.put(maker_key, b'')
+
         # Flush history
-        for key, value in self.history_cache:
+        for height, key, value in self.history_cache:
+            self._record_undo(height, key)
             batch.put(key, value)
-        
+
+        # Persist undo information last so it includes keys written above.
+        for height, entries in sorted(self._undo_cache.items()):
+            batch.put(self._undo_key(height), repr(entries).encode())
+        self._undo_cache.clear()
+        self._undo_seen.clear()
+
         # Clear caches
         self.order_cache.clear()
+        self.order_height.clear()
         self.history_cache.clear()
     
     # ========================================================================

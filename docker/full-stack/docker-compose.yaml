@@ -15,7 +15,7 @@ services:
     volumes:
       - radiant-data:/root/.radiant
     ports:
-      - "7332:7332"   # RPC port
+      - "127.0.0.1:7332:7332"   # RPC port (localhost only)
       - "7333:7333"   # P2P port
     command: >
       -server=1
@@ -45,7 +45,7 @@ services:
   # RXinDexer Server (ElectrumX with Glyph/WAVE/Swap indexing)
   rxindexer:
     build:
-      context: /Users/main/Documents/Radiant/RXinDexer
+      context: ../..
       dockerfile: docker/full-stack/Dockerfile
     container_name: rxindexer
     restart: unless-stopped
@@ -53,24 +53,29 @@ services:
       radiantd:
         condition: service_healthy
     volumes:
-      - rxindexer-data:/root/electrumdb
-      - rxindexer-contracts:/root/electrumx/data
+      - rxindexer-data:/data/electrumdb
+      - rxindexer-contracts:/data/contracts
     ports:
       - "50010:50010"   # TCP (Electrum protocol)
       - "50011:50011"   # WSS (Photonic wallet, WebSocket subscriptions)
       - "50012:50012"   # SSL (Electrum protocol)
-      - "8000:8000"     # RPC interface
+      - "8000:8000"     # REST API (HTTP)
+      - "127.0.0.1:8001:8001"  # Admin RPC (localhost only)
     environment:
       # Core configuration
       - DAEMON_URL=http://${RPC_USER:-radiant}:${RPC_PASS:-radiant}@radiantd:7332/
       - COIN=Radiant
       - NET=mainnet
       - DB_ENGINE=rocksdb
-      - DB_DIRECTORY=/root/electrumdb
-      - SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,rpc://0.0.0.0:8000
-      - SSL_CERTFILE=/root/electrumdb/server.crt
-      - SSL_KEYFILE=/root/electrumdb/server.key
-      - ALLOW_ROOT=true
+      - DB_DIRECTORY=/data/electrumdb
+      - SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,rpc://127.0.0.1:8001
+      - SSL_CERTFILE=/data/electrumdb/server.crt
+      - SSL_KEYFILE=/data/electrumdb/server.key
+      - REST_API_ENABLED=1
+      - REST_API_HOST=0.0.0.0
+      - REST_API_PORT=8000
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      - REST_API_KEY=${REST_API_KEY}
       # Performance tuning
       - CACHE_MB=${CACHE_MB:-2000}
       - MAX_SESSIONS=${MAX_SESSIONS:-10000}
@@ -95,7 +100,7 @@ services:
       - MEMPOOL_GLYPH_INDEX=${MEMPOOL_GLYPH_INDEX:-1}
       - MEMPOOL_SWAP_INDEX=${MEMPOOL_SWAP_INDEX:-1}
       # RXinDexer: dMint contracts file
-      - DMINT_CONTRACTS_FILE=/root/electrumx/data/contracts.json
+      - DMINT_CONTRACTS_FILE=/data/contracts/contracts.json
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     healthcheck:
@@ -115,6 +120,11 @@ services:
       resources:
         reservations:
           memory: 4G
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   radiant-data:

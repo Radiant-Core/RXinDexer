@@ -280,6 +280,24 @@ class GlyphAPIMixin:
         
         return self.glyph_index.get_token_by_ref_str(ref)
 
+    async def glyph_stats(self):
+        """
+        Get Glyph token indexing statistics.
+        
+        Returns:
+            Dict with token counts by type and version:
+            - total_tokens: Total number of indexed tokens
+            - by_type: {FT, NFT, DAT, dMint, unknown}
+            - by_version: {v1, v2}
+            - enabled: Whether indexing is enabled
+        """
+        self.bump_cost(2.0)  # Slightly higher cost as it scans DB
+        
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'enabled': False, 'error': 'Glyph indexing not enabled'}
+        
+        return self.glyph_index.get_stats()
+
     async def glyph_get_balance(self, scripthash: str, ref: str):
         """
         Get token balance for a scripthash.
@@ -930,6 +948,7 @@ GLYPH_METHODS = {
     'glyph.get_protocol_info': 'glyph_get_protocol_info',
     'glyph.parse_envelope': 'glyph_parse_envelope',
     # New RXinDexer methods
+    'glyph.stats': 'glyph_stats',
     'glyph.get_token_info': 'glyph_get_token_info',
     'glyph.get_balance': 'glyph_get_balance',
     'glyph.list_tokens': 'glyph_list_tokens',

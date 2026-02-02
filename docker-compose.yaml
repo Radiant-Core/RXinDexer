@@ -9,7 +9,8 @@ services:
       - "50010:50010"   # Port for TCP connections
       - "50011:50011"   # Port for WSS connections (Photonic wallet)
       - "50012:50012"   # Port for SSL connections
-      - "8000:8000"     # Port for RPC
+      - "8000:8000"     # Port for REST API
+      - "127.0.0.1:8001:8001"  # Admin RPC (localhost only)
     # NOTE: SYS_PTRACE removed for production security
     # For debugging, uncomment the following:
     # cap_add:
@@ -24,12 +25,20 @@ services:
       - SERVICES=${SERVICES}
       - SSL_CERTFILE=${SSL_CERTFILE}
       - SSL_KEYFILE=${SSL_KEYFILE}
-      - ALLOW_ROOT=${ALLOW_ROOT}
+      - REST_API_ENABLED=${REST_API_ENABLED:-1}
+      - REST_API_HOST=${REST_API_HOST:-0.0.0.0}
+      - REST_API_PORT=${REST_API_PORT:-8000}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      - REST_API_KEY=${REST_API_KEY}
       - CACHE_MB=${CACHE_MB}
       - MAX_SESSIONS=${MAX_SESSIONS}
       - MAX_SEND=${MAX_SEND}
       - MAX_RECV=${MAX_RECV}
-    network_mode: "host"
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 50010 || exit 1"]
       interval: 60s
@@ -48,5 +57,5 @@ services:
         reservations:
           memory: 4G
     volumes:
-      - ./electrumdb:/root/electrumdb   # Mount local directory for database and SSL keys
+      - ./electrumdb:/data/electrumdb   # Mount local directory for database and SSL keys
     entrypoint: ["python3", "electrumx_server"]
