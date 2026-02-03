@@ -30,6 +30,7 @@ RUN mkdir -p /data/electrumdb && chown -R electrumx:electrumx /data
 <<<<<<< /Users/main/Documents/Radiant/RXinDexer/Dockerfile.test
 <<<<<<< /Users/main/Documents/Radiant/RXinDexer/Dockerfile.test
 <<<<<<< /Users/main/Documents/Radiant/RXinDexer/Dockerfile.test
+<<<<<<< /Users/main/Documents/Radiant/RXinDexer/Dockerfile.test
 =======
 
 RUN mkdir -p /home/electrumx/electrumx && chown -R electrumx:electrumx /home/electrumx
@@ -43,6 +44,11 @@ RUN mkdir -p /home/electrumx/electrumx && chown -R electrumx:electrumx /home/ele
 RUN mkdir -p /home/electrumx/electrumx && chown -R electrumx:electrumx /home/electrumx
 >>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/Dockerfile.test
 
+=======
+
+RUN mkdir -p /home/electrumx/electrumx && chown -R electrumx:electrumx /home/electrumx
+
+>>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/Dockerfile.test
 WORKDIR /home/electrumx/electrumx
 
 # Copy local source
