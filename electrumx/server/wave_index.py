@@ -271,33 +271,21 @@ class WaveIndex:
         self.zone_cache: Dict[bytes, bytes] = {}  # ref -> zone cbor
         self.owner_cache: Dict[bytes, bytes] = {}  # ref -> scripthash
 
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-=======
         self.tree_height: Dict[bytes, int] = {}
         self.name_height: Dict[bytes, int] = {}
         self.zone_height: Dict[bytes, int] = {}
         self.owner_height: Dict[bytes, int] = {}
 
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
         # Per-height undo info for reorg safety
         self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
         self._undo_seen: Dict[int, Set[bytes]] = defaultdict(set)
         self._pending_heights: Dict[str, int] = {}
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-=======
-=======
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
 
         # Undo retention: keep at most env.reorg_limit heights of undo data.
         current_height = getattr(db, 'db_height', -1)
         reorg_limit = getattr(env, 'reorg_limit', 0)
         min_keep = max(0, current_height - reorg_limit + 1) if reorg_limit else 0
         self._last_undo_pruned = min_keep - 1
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
-=======
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
         
         # Hot name cache (frequently accessed names in memory)
         self.hot_names: Dict[str, WaveNameInfo] = {}
@@ -389,10 +377,7 @@ class WaveIndex:
         claim_script = tx.outputs[0].pk_script
         owner_scripthash = Script.hashX_from_script(Script.zero_refs(claim_script))
         self.owner_cache[claim_ref] = owner_scripthash
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-=======
         self.owner_height[claim_ref] = height
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
 
         # Track height for flush/undo
         self._pending_heights[claim_ref.hex()] = height
@@ -465,11 +450,6 @@ class WaveIndex:
             else:
                 batch.put(key, prev)
         batch.delete(self._undo_key(height))
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-=======
-=======
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
 
     def _prune_old_undo_keys(self, batch):
         """Delete undo keys that are older than the reorg window."""
@@ -485,10 +465,6 @@ class WaveIndex:
         for height in range(self._last_undo_pruned + 1, prune_to + 1):
             batch.delete(self._undo_key(height))
         self._last_undo_pruned = prune_to
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
-=======
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
     
     def flush(self, batch):
         """Flush cached WAVE data to the database."""
@@ -496,29 +472,12 @@ class WaveIndex:
             return
         # Important: record undo entries for keys touched during this flush
         # first, then persist undo records at the end.
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-=======
-
-        self._prune_old_undo_keys(batch)
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
-        
-        # Flush tree entries
-        for tree_key, child_ref in self.tree_cache.items():
-            # Best-effort height attribution: use claim_ref if present in path.
-            height = None
-            try:
-                height = self._pending_heights.get(child_ref.hex())
-            except Exception:
-                height = None
-=======
 
         self._prune_old_undo_keys(batch)
         
         # Flush tree entries
         for tree_key, child_ref in self.tree_cache.items():
             height = self.tree_height.get(tree_key)
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
             key = WaveDBKeys.TREE + tree_key
             if height is not None:
                 self._record_undo(height, key)
@@ -526,15 +485,7 @@ class WaveIndex:
         
         # Flush name -> ref mappings
         for name_hash, ref in self.name_cache.items():
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-            height = None
-            try:
-                height = self._pending_heights.get(ref.hex())
-            except Exception:
-                height = None
-=======
             height = self.name_height.get(name_hash)
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
             key = WaveDBKeys.NAME + name_hash
             if height is not None:
                 self._record_undo(height, key)
@@ -542,15 +493,7 @@ class WaveIndex:
         
         # Flush zone records
         for ref, zone_cbor in self.zone_cache.items():
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-            height = None
-            try:
-                height = self._pending_heights.get(ref.hex())
-            except Exception:
-                height = None
-=======
             height = self.zone_height.get(ref)
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
             key = WaveDBKeys.ZONE + ref
             if height is not None:
                 self._record_undo(height, key)
@@ -558,15 +501,7 @@ class WaveIndex:
         
         # Flush owner mappings
         for ref, scripthash in self.owner_cache.items():
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-            height = None
-            try:
-                height = self._pending_heights.get(ref.hex())
-            except Exception:
-                height = None
-=======
             height = self.owner_height.get(ref)
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
             key = WaveDBKeys.OWNER + ref
             if height is not None:
                 self._record_undo(height, key)
@@ -584,13 +519,10 @@ class WaveIndex:
         self.name_cache.clear()
         self.zone_cache.clear()
         self.owner_cache.clear()
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/wave_index.py
-=======
         self.tree_height.clear()
         self.name_height.clear()
         self.zone_height.clear()
         self.owner_height.clear()
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/wave_index.py
         self._pending_heights.clear()
         
         if count > 0:

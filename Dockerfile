@@ -57,7 +57,14 @@ WORKDIR /root/electrumx
 # Pin Cython<3 BEFORE installing python-rocksdb to avoid Cython 3 incompatibility
 RUN python3 -m pip install --upgrade pip setuptools wheel
 RUN python3 -m pip install 'Cython<3'
-RUN python3 -m pip install -r requirements.txt
+
+# Install core dependencies first (except python-rocksdb)
+RUN python3 -m pip install plyvel 'aiorpcX[ws]>=0.22,<0.23' attrs pylru 'aiohttp>=3.3,<4.0' \
+    'websockets>=10.0,<11.0' psutil 'cbor2>=5.4.0' 'fastapi>=0.109.0' \
+    'uvicorn[standard]>=0.27.0' 'pydantic>=2.5.0'
+
+# Install python-rocksdb with build isolation disabled to use Cython<3
+RUN python3 -m pip install --no-build-isolation 'python-rocksdb<=0.7.0'
 
 # Core configuration
 ENV DAEMON_URL=http://user:pass@localhost:7332/

@@ -242,21 +242,12 @@ class SwapIndex:
 
         self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
         self._undo_seen: Dict[int, set] = defaultdict(set)
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
-=======
-=======
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
 
         # Undo retention: keep at most env.reorg_limit heights of undo data.
         current_height = getattr(db, 'db_height', -1)
         reorg_limit = getattr(env, 'reorg_limit', 0)
         min_keep = max(0, current_height - reorg_limit + 1) if reorg_limit else 0
         self._last_undo_pruned = min_keep - 1
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
-=======
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
         
         if self.enabled:
             self.logger.info('Swap order indexing enabled')
@@ -314,11 +305,6 @@ class SwapIndex:
             else:
                 batch.put(key, prev)
         batch.delete(self._undo_key(height))
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
-=======
-=======
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
 
     def _prune_old_undo_keys(self, batch):
         """Delete undo keys that are older than the reorg window."""
@@ -334,10 +320,6 @@ class SwapIndex:
         for height in range(self._last_undo_pruned + 1, prune_to + 1):
             batch.delete(self._undo_key(height))
         self._last_undo_pruned = prune_to
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
-=======
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
     
     def _parse_rswp_advertisement(self, script: bytes, tx_hash: bytes, 
                                    vout: int, height: int, timestamp: int) -> Optional[SwapOrderInfo]:
@@ -622,16 +604,8 @@ class SwapIndex:
         # Important: record undo entries for keys touched during this flush
         # first, then persist undo records at the end.
 
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
-<<<<<<< /Users/main/Documents/Radiant/RXinDexer/electrumx/server/swap_index.py
-=======
         self._prune_old_undo_keys(batch)
 
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
-=======
-        self._prune_old_undo_keys(batch)
-
->>>>>>> /Users/main/.windsurf/worktrees/RXinDexer/RXinDexer-c38ad641/electrumx/server/swap_index.py
         # Flush orders and associated indexes
         for order_id, order in self.order_cache.items():
             height = self.order_height.get(order_id)
