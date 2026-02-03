@@ -3,6 +3,7 @@
 # https://github.com/Radiant-Core/RXinDexer
 #
 # Build with: docker build -t rxindexer .
+# Build timestamp: 2026-02-02
 
 FROM ubuntu:22.04
 
