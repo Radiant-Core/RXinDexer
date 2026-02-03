@@ -25,7 +25,8 @@ RXinDexer is an enhanced ElectrumX server that indexes Radiant's advanced token 
 cp .env.example .env
 nano .env  # Set RPC_PASS
 
-# 2. Start
+# 2. Start (use --no-cache to avoid build context issues)
+docker-compose build --no-cache
 docker-compose up -d
 
 # 3. Monitor
@@ -41,7 +42,8 @@ docker-compose logs -f
 | rxindexer | 50010 | TCP (Electrum protocol) |
 | rxindexer | 50011 | WSS (WebSocket subscriptions) |
 | rxindexer | 50012 | SSL (Electrum protocol) |
-| rxindexer | 8000 | RPC interface |
+| rxindexer | 8000 | REST API (HTTP) |
+| rxindexer | 8001 | Admin RPC (localhost only) |
 
 ## API Methods (38 total)
 
