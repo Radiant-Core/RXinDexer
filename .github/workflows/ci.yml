@@ -28,8 +28,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install flake8 pylint
-          # Pin Cython<3.0 to avoid python-rocksdb build issues
-          pip install 'Cython<3.0'
+          # Install Cython<3.0 and python-rocksdb with --no-build-isolation
+          # to avoid GIL-related Cython 3.x compilation errors
+          pip install 'Cython<3.0' setuptools wheel
+          pip install python-rocksdb --no-build-isolation
           pip install -r requirements-ci.txt
 
       - name: Run flake8
@@ -65,8 +67,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest pytest-asyncio
-          # Pin Cython<3.0 to avoid python-rocksdb build issues
-          pip install 'Cython<3.0'
+          # Install Cython<3.0 and python-rocksdb with --no-build-isolation
+          # to avoid GIL-related Cython 3.x compilation errors
+          pip install 'Cython<3.0' setuptools wheel
+          pip install python-rocksdb --no-build-isolation
           pip install -r requirements-ci.txt
           # Install package in development mode to ensure imports work
           pip install -e .
