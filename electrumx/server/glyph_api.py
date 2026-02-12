@@ -494,7 +494,7 @@ class GlyphAPIMixin:
         Get contracts filtered by mining algorithm.
         
         Args:
-            algorithm: Algorithm ID (1=SHA256D, 2=RadiantHash)
+            algorithm: Algorithm ID (0=SHA256D, 1=Blake3, 2=K12)
             
         Returns:
             List of contracts using that algorithm

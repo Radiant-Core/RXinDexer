@@ -30,10 +30,12 @@ class DMintContractsManager:
     - Provides API methods for miners
     """
     
-    # Algorithm IDs
-    ALGO_NONE = 0x00
-    ALGO_SHA256D = 0x01
-    ALGO_RADIANTHASH = 0x02
+    # Algorithm IDs (per Glyph v2 spec Section 11.2)
+    ALGO_SHA256D = 0x00
+    ALGO_BLAKE3 = 0x01
+    ALGO_K12 = 0x02
+    ALGO_ARGON2ID_LIGHT = 0x03
+    ALGO_RANDOMX_LIGHT = 0x04
     
     def __init__(self, data_dir: str, glyph_index=None):
         self.logger = util.class_logger(__name__, self.__class__.__name__)
@@ -133,7 +135,8 @@ class DMintContractsManager:
             'reward': reward,
             'percent_mined': 0,
             'active': True,
-            'deploy_height': deploy_height
+            'deploy_height': deploy_height,
+            'version': 2  # v2 contract version
         }
         
         # Insert in order by deploy_height
