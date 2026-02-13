@@ -714,9 +714,12 @@ async def get_swap_orders(
     try:
         base_bytes = bytes.fromhex(base_ref) if base_ref else None
         quote_bytes = bytes.fromhex(quote_ref) if quote_ref else None
+        if base_bytes and quote_bytes:
+            return _swap_index.get_orderbook(
+                base_bytes, quote_bytes, limit=limit,
+            )
         return _swap_index.get_open_orders(
-            base_ref=base_bytes, quote_ref=quote_bytes,
-            limit=limit, offset=offset,
+            base_ref=base_bytes, limit=limit, offset=offset,
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -754,8 +757,10 @@ async def get_swap_history(
 
     try:
         base_bytes = bytes.fromhex(base_ref) if base_ref else None
-        return _swap_index.get_trade_history(
-            base_ref=base_bytes, limit=limit, offset=offset,
+        if not base_bytes:
+            return {'trades': [], 'error': 'base_ref is required'}
+        return _swap_index.get_swap_history(
+            base_bytes, limit=limit, offset=offset,
         )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -769,7 +774,10 @@ async def get_swap_stats():
     _ensure_swap()
 
     try:
-        return _swap_index.stats()
+        return {
+            'enabled': getattr(_swap_index, 'enabled', False),
+            'order_cache_size': len(getattr(_swap_index, 'order_cache', {})),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

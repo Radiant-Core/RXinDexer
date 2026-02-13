@@ -36,6 +36,7 @@ class FakeUtxoDB:
 class FakeDB:
     def __init__(self):
         self.utxo_db = FakeUtxoDB()
+        self.db_height = 100
 
 
 class FakeEnv:
@@ -44,6 +45,7 @@ class FakeEnv:
     swap_index = True
     wave_hot_names = 100
     wave_genesis_ref = None
+    reorg_limit = 10
 
 
 def test_glyph_undo_backup_roundtrip():

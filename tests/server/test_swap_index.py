@@ -133,6 +133,7 @@ class TestSwapIndexParsing:
         db.utxo_db = MagicMock()
         db.utxo_db.get = Mock(return_value=None)
         db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
         return db
 
     @pytest.fixture
@@ -140,6 +141,7 @@ class TestSwapIndexParsing:
         """Create a mock environment."""
         env = Mock()
         env.swap_index = True
+        env.reorg_limit = 10
         return env
 
     @pytest.fixture
@@ -305,12 +307,14 @@ class TestSwapIndexOrdering:
         db.utxo_db = MagicMock()
         db.utxo_db.get = Mock(return_value=None)
         db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
         return db
 
     @pytest.fixture
     def mock_env(self):
         env = Mock()
         env.swap_index = True
+        env.reorg_limit = 10
         return env
 
     @pytest.fixture
