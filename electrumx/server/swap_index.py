@@ -442,8 +442,8 @@ class SwapIndex:
         # Signature is last push
         signature = remaining[-1]
         
-        # Price terms are all pushes before signature
-        price_terms = b''.join(remaining[:-1])
+        # Price term pushes are all pushes before the signature
+        price_term_chunks = remaining[:-1]
         
         # Build order
         order.order_id = utxo_hash + struct.pack('<I', utxo_index)
@@ -453,11 +453,67 @@ class SwapIndex:
         order.side = OrderSide.SELL if offered_type == 1 else OrderSide.BUY
         order.status = OrderStatus.OPEN
         
-        # Store raw data for potential verification
-        # price_terms contains the pricing data
-        # signature contains the maker's signature
+        # Parse price/amount from price_term_chunks based on termsType
+        self._parse_price_terms(terms_type, price_term_chunks, order)
         
         return order
+    
+    def _parse_price_terms(self, terms_type: int, term_chunks: List[bytes],
+                           order: SwapOrderInfo):
+        """
+        Parse price terms from RSWP advertisement.
+        
+        termsType 0 — Fixed price:
+          term_chunks = [<price>, <amount>]
+          price and amount are script-encoded integers.
+          
+        termsType 1 — Rate (ratio):
+          term_chunks = [<numerator>, <denominator>, <amount>]
+          Effective price = numerator / denominator (scaled to 10^8).
+          
+        termsType 2 — Fixed price + min fill:
+          term_chunks = [<price>, <amount>, <min_fill>]
+        """
+        try:
+            if terms_type == 0:
+                # Fixed price: [price, amount]
+                if len(term_chunks) >= 1:
+                    order.price = self._parse_script_int(term_chunks[0]) or 0
+                if len(term_chunks) >= 2:
+                    order.amount = self._parse_script_int(term_chunks[1]) or 0
+                    order.remaining_amount = order.amount
+            elif terms_type == 1:
+                # Rate: [numerator, denominator, amount]
+                numerator = 0
+                denominator = 1
+                if len(term_chunks) >= 1:
+                    numerator = self._parse_script_int(term_chunks[0]) or 0
+                if len(term_chunks) >= 2:
+                    denominator = self._parse_script_int(term_chunks[1]) or 1
+                    if denominator == 0:
+                        denominator = 1
+                if len(term_chunks) >= 3:
+                    order.amount = self._parse_script_int(term_chunks[2]) or 0
+                    order.remaining_amount = order.amount
+                # Convert rate to scaled price (10^8 precision)
+                order.price = int((numerator * 10**8) / denominator)
+            elif terms_type == 2:
+                # Fixed price + min fill: [price, amount, min_fill]
+                if len(term_chunks) >= 1:
+                    order.price = self._parse_script_int(term_chunks[0]) or 0
+                if len(term_chunks) >= 2:
+                    order.amount = self._parse_script_int(term_chunks[1]) or 0
+                    order.remaining_amount = order.amount
+                if len(term_chunks) >= 3:
+                    order.min_fill = self._parse_script_int(term_chunks[2]) or 0
+            else:
+                # Unknown terms type — store raw concatenated bytes as price
+                # for forward compatibility
+                raw = b''.join(term_chunks)
+                if raw:
+                    order.price = self._parse_script_int(raw) or 0
+        except Exception:
+            pass
     
     def _parse_rswp_v1(self, chunks: List[bytes], order: SwapOrderInfo) -> Optional[SwapOrderInfo]:
         """

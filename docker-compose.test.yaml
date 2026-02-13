@@ -10,6 +10,7 @@ services:
     container_name: rxindexer_test
     ports:
       - "50010:50010"   # TCP
+      - "8000:8000"     # REST API
       - "127.0.0.1:8001:8001"     # Admin RPC (localhost)
     environment:
       - DAEMON_URL=${DAEMON_URL:-http://radiantrpc:testpass@host.docker.internal:7332/}
@@ -18,6 +19,9 @@ services:
       - DB_ENGINE=leveldb
       - DB_DIRECTORY=/data/electrumdb
       - SERVICES=tcp://0.0.0.0:50010,rpc://127.0.0.1:8001
+      - REST_API_ENABLED=1
+      - REST_API_HOST=0.0.0.0
+      - REST_API_PORT=8000
       - CACHE_MB=500
       - MAX_SESSIONS=100
       - LOG_LEVEL=DEBUG
@@ -54,6 +58,7 @@ services:
       - RXINDEXER_HOST=rxindexer
       - RXINDEXER_TCP_PORT=50010
       - RXINDEXER_RPC_PORT=8001
+      - RXINDEXER_REST_URL=http://rxindexer:8000
     volumes:
       - ./tests:/app/tests:ro
       - ./test_results:/app/test_results

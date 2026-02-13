@@ -322,6 +322,60 @@ async def test_subscription_methods(client: ElectrumXClient) -> bool:
     return all_pass
 
 
+async def run_rest_api_tests(base_url: str):
+    """Run REST API integration tests using urllib."""
+    import urllib.request
+    import urllib.error
+
+    endpoints = [
+        ("GET", "/health", 200),
+        ("GET", "/glyphs/stats", 200),
+        ("GET", "/glyphs/tokens?limit=5&offset=0", 200),
+        ("GET", "/glyphs/search?query=test&limit=5", 200),
+        ("GET", f"/glyphs/holders/{'0'*72}?limit=5", 200),
+        ("GET", f"/glyphs/history/{'0'*72}", 200),
+        ("GET", f"/glyphs/balances/{'0'*64}", 200),
+        ("GET", "/dmint/contracts", 200),
+        ("GET", "/dmint/by-algorithm/sha256d", 200),
+        ("GET", "/dmint/profitable?limit=5", 200),
+        ("GET", "/wave/available/testname", 200),
+        ("GET", f"/wave/reverse/{'0'*64}", 200),
+        ("GET", "/wave/stats", 200),
+        ("GET", "/swaps/orders", 200),
+        ("GET", "/swaps/history", 200),
+        ("GET", "/swaps/stats", 200),
+        ("GET", "/mempool/stats", 200),
+    ]
+
+    for method, path, expected_status in endpoints:
+        start = time.time()
+        test_name = f"REST {method} {path.split('?')[0]}"
+        try:
+            url = base_url.rstrip('/') + path
+            req = urllib.request.Request(url, method=method)
+            req.add_header('Accept', 'application/json')
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status = resp.status
+                body = resp.read().decode()
+                # Try to parse JSON
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = body
+                if status == expected_status:
+                    log_result(test_name, True, f"HTTP {status}", time.time() - start)
+                else:
+                    log_result(test_name, False, f"Expected {expected_status}, got {status}", time.time() - start)
+        except urllib.error.HTTPError as e:
+            # 404 and 503 are acceptable for some endpoints (no data yet)
+            if e.code in (404, 503):
+                log_result(test_name, True, f"HTTP {e.code} (acceptable)", time.time() - start)
+            else:
+                log_result(test_name, False, f"HTTP {e.code}: {e.reason}", time.time() - start)
+        except Exception as e:
+            log_result(test_name, False, str(e), time.time() - start)
+
+
 def wait_for_server(host: str, port: int, timeout: int = 120) -> bool:
     """Wait for server to be available."""
     print(f"Waiting for RXinDexer at {host}:{port}...")
@@ -405,6 +459,14 @@ async def run_all_tests():
     
     # Close connection
     await client.close()
+    
+    # ---- REST API Tests ----
+    rest_url = os.environ.get('RXINDEXER_REST_URL', '')
+    if rest_url:
+        print("\n--- REST API Tests ---\n")
+        await run_rest_api_tests(rest_url)
+    else:
+        print("\nSkipping REST API tests (RXINDEXER_REST_URL not set)")
     
     # Summary
     print("\n" + "=" * 60)

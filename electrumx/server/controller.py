@@ -110,6 +110,19 @@ class Controller(ServerBase):
             rest_host = os.getenv('REST_API_HOST', '0.0.0.0').strip()
             rest_port = int(os.getenv('REST_API_PORT', '8000'))
 
+            # Set notifications up to implement the MemPoolAPI
+            def get_db_height():
+                return db.db_height
+            notifications.height = daemon.height
+            notifications.db_height = get_db_height
+            notifications.cached_height = daemon.cached_height
+            notifications.mempool_hashes = daemon.mempool_hashes
+            notifications.raw_transactions = daemon.getrawtransactions
+            notifications.lookup_utxos = db.lookup_utxos
+            MemPoolAPI.register(Notifications)
+            mempool = MemPool(env.coin, notifications, env=env,
+                              glyph_index=bp.glyph_index, swap_index=bp.swap_index)
+
             async def run_rest_api():
                 if not rest_enabled:
                     return
@@ -125,6 +138,7 @@ class Controller(ServerBase):
                     wave_index=getattr(bp, 'wave_index', None),
                     swap_index=getattr(bp, 'swap_index', None),
                     dmint_contracts=getattr(bp, 'dmint_contracts', None),
+                    mempool=mempool,
                 )
 
                 config = uvicorn.Config(
@@ -143,19 +157,6 @@ class Controller(ServerBase):
                 async with TaskGroup() as rest_group:
                     await rest_group.spawn(stop_when_shutdown())
                     await rest_group.spawn(server.serve())
-
-            # Set notifications up to implement the MemPoolAPI
-            def get_db_height():
-                return db.db_height
-            notifications.height = daemon.height
-            notifications.db_height = get_db_height
-            notifications.cached_height = daemon.cached_height
-            notifications.mempool_hashes = daemon.mempool_hashes
-            notifications.raw_transactions = daemon.getrawtransactions
-            notifications.lookup_utxos = db.lookup_utxos
-            MemPoolAPI.register(Notifications)
-            mempool = MemPool(env.coin, notifications, env=env,
-                              glyph_index=bp.glyph_index, swap_index=bp.swap_index)
 
             session_mgr = SessionManager(env, db, bp, daemon, mempool,
                                          shutdown_event)
