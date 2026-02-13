@@ -27,12 +27,12 @@ env/
 .venv/
 .env/
 
-# Database files
+# Database files (runtime data — never commit)
+electrumdb/
 electrumx-db/
 electrumx-db-*/
 *.ldb
 *.sst
-*.log
 
 # IDE
 .idea/
@@ -58,9 +58,6 @@ electrumx-standalone-deploy.zip
 *.crt
 *.key
 *.pem
-electrumdb/server.crt
-electrumdb/server.key
-electrumdb/server.csr
 
 # Environment files with secrets
 .env
