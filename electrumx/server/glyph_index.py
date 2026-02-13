@@ -46,6 +46,7 @@ class GlyphDBKeys:
     BY_NAME = b'GN'        # GN + name_hash -> ref (for search)
     BY_TICKER = b'GK'      # GK + ticker -> ref (for FT lookup)
     SUPPLY = b'GS'         # GS + ref -> current supply (FT only)
+    HOLDER_BY_REF = b'GR'  # GR + ref + scripthash -> amount (reverse of BALANCE)
     UNDO = b'GXU'          # GXU + height(be) -> repr([(key, prev_value_or_None), ...])
 
 
@@ -73,6 +74,11 @@ def unpack_ref(data: bytes) -> Tuple[bytes, int]:
 def pack_balance_key(scripthash: bytes, ref: bytes) -> bytes:
     """Pack a balance key."""
     return GlyphDBKeys.BALANCE + scripthash + ref
+
+
+def pack_holder_key(ref: bytes, scripthash: bytes) -> bytes:
+    """Pack a holder-by-ref key (secondary index for token holder lookups)."""
+    return GlyphDBKeys.HOLDER_BY_REF + ref + scripthash
 
 
 def pack_token_key(ref: bytes) -> bytes:
@@ -523,7 +529,9 @@ class GlyphIndex:
             return
 
         key = pack_balance_key(scripthash, ref)
+        holder_key = pack_holder_key(ref, scripthash)
         self._record_undo(height, key)
+        self._record_undo(height, holder_key)
         current = self.balance_cache.get(key, 0)
         new_balance = max(0, current + delta)
 
@@ -615,12 +623,19 @@ class GlyphIndex:
                 self._record_undo(height, ticker_key)
                 batch.put(ticker_key, ref)
         
-        # Flush balances
+        # Flush balances (primary + secondary index)
         for key, amount in self.balance_cache.items():
             height = self.balance_height.get(key)
             if height is None:
                 continue
-            batch.put(key, struct.pack('<Q', amount))
+            packed = struct.pack('<Q', amount)
+            batch.put(key, packed)
+            # Write secondary holder-by-ref index:
+            # key = GB + scripthash(32) + ref(36) → extract parts
+            scripthash = key[2:2+32]
+            ref = key[2+32:2+32+36]
+            holder_key = pack_holder_key(ref, scripthash)
+            batch.put(holder_key, packed)
         
         # Flush history
         for height, key, value in self.history_cache:
@@ -1000,33 +1015,28 @@ class GlyphIndex:
         """
         Get token holders for a specific token.
         
-        Returns list of addresses holding the token with their balances.
+        Uses the HOLDER_BY_REF secondary index for efficient lookup:
+        GR + ref + scripthash -> amount
         """
         holders = []
         total_holders = 0
-        
-        # Scan balance keys for this token ref
-        prefix = GlyphDBKeys.BALANCE
+        prefix = GlyphDBKeys.HOLDER_BY_REF + ref
         
         for key, value in self.db.utxo_db.iterator(prefix=prefix):
-            # Key format: GB + scripthash (32 bytes) + ref (36 bytes)
-            if len(key) < 2 + 32 + 36:
-                continue
-            
-            key_ref = key[2+32:2+32+36]
-            if key_ref != ref:
-                continue
-            
-            scripthash = key[2:2+32]
             balance = struct.unpack('<Q', value)[0] if len(value) == 8 else 0
+            if balance <= 0:
+                continue
             
-            if balance > 0:
-                total_holders += 1
-                if total_holders > offset and len(holders) < limit:
-                    holders.append({
-                        'scripthash': scripthash.hex(),
-                        'balance': balance,
-                    })
+            total_holders += 1
+            if total_holders > offset and len(holders) < limit:
+                scripthash = key[len(prefix):len(prefix)+32]
+                holders.append({
+                    'scripthash': scripthash.hex(),
+                    'balance': balance,
+                })
+            elif len(holders) >= limit and total_holders > offset + limit:
+                # We have enough results; keep counting total but stop collecting
+                pass
         
         return {
             'ref': ref.hex(),
@@ -1040,23 +1050,18 @@ class GlyphIndex:
         """
         Get detailed supply information for a token.
         
-        Returns total supply, circulating supply, burned amount, etc.
+        Uses HOLDER_BY_REF index for efficient supply calculation.
         """
         token = self.get_token(ref)
         if not token:
             return None
         
-        # Calculate holder-derived circulating supply
+        # Calculate holder-derived circulating supply via secondary index
         circulating = 0
         holder_count = 0
         
-        prefix = GlyphDBKeys.BALANCE
+        prefix = GlyphDBKeys.HOLDER_BY_REF + ref
         for key, value in self.db.utxo_db.iterator(prefix=prefix):
-            if len(key) < 2 + 32 + 36:
-                continue
-            key_ref = key[2+32:2+32+36]
-            if key_ref != ref:
-                continue
             balance = struct.unpack('<Q', value)[0] if len(value) == 8 else 0
             if balance > 0:
                 circulating += balance
@@ -1167,21 +1172,15 @@ class GlyphIndex:
     def get_top_holders(self, ref: bytes, limit: int = 100) -> Dict[str, Any]:
         """
         Get top token holders sorted by balance (descending).
+        Uses HOLDER_BY_REF secondary index.
         """
         all_holders = []
         
-        prefix = GlyphDBKeys.BALANCE
+        prefix = GlyphDBKeys.HOLDER_BY_REF + ref
         for key, value in self.db.utxo_db.iterator(prefix=prefix):
-            if len(key) < 2 + 32 + 36:
-                continue
-            key_ref = key[2+32:2+32+36]
-            if key_ref != ref:
-                continue
-            
-            scripthash = key[2:2+32]
             balance = struct.unpack('<Q', value)[0] if len(value) == 8 else 0
-            
             if balance > 0:
+                scripthash = key[len(prefix):len(prefix)+32]
                 all_holders.append({
                     'scripthash': scripthash.hex(),
                     'balance': balance,

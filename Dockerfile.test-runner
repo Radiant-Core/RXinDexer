@@ -15,6 +15,7 @@ WORKDIR /app
 # Install test dependencies
 RUN pip install --no-cache-dir \
     aiohttp \
+    httpx \
     pytest \
     pytest-asyncio \
     websockets

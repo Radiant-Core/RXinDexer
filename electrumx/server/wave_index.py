@@ -48,6 +48,7 @@ class WaveDBKeys:
     NAME = b'WN'      # WN + name_hash -> ref
     ZONE = b'WZ'      # WZ + ref -> zone records (CBOR)
     OWNER = b'WO'     # WO + ref -> owner scripthash
+    REVERSE_OWNER = b'WR'  # WR + scripthash + ref -> '' (reverse index)
     HEIGHT = b'WH'    # WH + ref -> registration height
     UNDO = b'WVU'      # WVU + height(be) -> repr([(key, prev_value_or_None), ...])
 
@@ -359,7 +360,7 @@ class WaveIndex:
             return
         
         # Index the name in the prefix tree
-        self._index_name_in_tree(name, parent_ref, claim_ref, height)
+        self._index_name_in_tree(name, parent_ref, claim_ref, height, tx_hash=tx_hash)
         
         # Store name -> ref mapping
         name_hash = name_to_hash(name)
@@ -384,12 +385,21 @@ class WaveIndex:
         
         self.logger.debug(f'Indexed WAVE name "{name}" at height {height}')
     
-    def _index_name_in_tree(self, name: str, parent_ref: bytes, claim_ref: bytes, height: int):
+    def _index_name_in_tree(self, name: str, parent_ref: bytes, claim_ref: bytes,
+                             height: int, tx_hash: bytes = None):
         """
         Index a name in the prefix tree.
         
         For each character in the name, create a tree entry:
         parent_ref + output_index -> next_ref
+        
+        Branch outputs follow the WAVE convention:
+        - Output 0: Claim token
+        - Output 1-37: Branch outputs for child name characters
+        
+        Intermediate nodes point to the branch output ref (tx_hash + branch_vout)
+        so that child name registrations can chain from them.
+        The last character points to the claim ref (output 0).
         """
         current_ref = parent_ref
         normalized = normalize_name(name)
@@ -399,17 +409,22 @@ class WaveIndex:
             tree_key = current_ref + struct.pack('<B', output_idx)
             
             if i == len(normalized) - 1:
-                # Last character points to claim ref
+                # Last character points to claim ref (output 0)
                 self.tree_cache[tree_key] = claim_ref
             else:
-                # Intermediate: we need to track the path
-                # For now, store claim_ref for all steps (simplified)
-                self.tree_cache[tree_key] = claim_ref
+                # Intermediate node: points to the branch output for this character.
+                # The branch output index in the tx is the same as the character's
+                # output_idx. The ref is tx_hash + branch_vout.
+                if tx_hash:
+                    branch_ref = tx_hash + struct.pack('<I', output_idx)
+                else:
+                    branch_ref = claim_ref
+                self.tree_cache[tree_key] = branch_ref
+                # Next level starts from this branch output
+                current_ref = branch_ref
+                self.tree_height[tree_key] = height
+                continue
             
-            # Move to next level (would need child ref from tx outputs)
-            # This is simplified - full impl needs to track branch outputs
-            current_ref = claim_ref
-
             self.tree_height[tree_key] = height
     
     def _resolve_name_to_ref(self, name: str) -> Optional[bytes]:
@@ -499,13 +514,18 @@ class WaveIndex:
                 self._record_undo(height, key)
             batch.put(key, zone_cbor)
         
-        # Flush owner mappings
+        # Flush owner mappings + reverse owner index
         for ref, scripthash in self.owner_cache.items():
             height = self.owner_height.get(ref)
             key = WaveDBKeys.OWNER + ref
             if height is not None:
                 self._record_undo(height, key)
             batch.put(key, scripthash)
+            # Write reverse index: scripthash + ref -> ''
+            rev_key = WaveDBKeys.REVERSE_OWNER + scripthash + ref
+            if height is not None:
+                self._record_undo(height, rev_key)
+            batch.put(rev_key, b'')
 
         # Persist undo information last so it includes keys written above.
         for height, entries in sorted(self._undo_cache.items()):
@@ -617,24 +637,29 @@ class WaveIndex:
         return results
     
     def reverse_lookup(self, scripthash: bytes, limit: int = 100) -> List[Dict[str, Any]]:
-        """Find WAVE names owned by a scripthash."""
+        """Find WAVE names owned by a scripthash.
+        
+        Uses REVERSE_OWNER index: WR + scripthash + ref -> ''
+        """
         results = []
+        prefix = WaveDBKeys.REVERSE_OWNER + scripthash
         
-        # Iterate over owner entries (this is inefficient without a reverse index)
-        # A production implementation would maintain scripthash -> refs index
-        prefix = WaveDBKeys.OWNER
-        
-        for key, value in self.db.utxo_db.iterator(prefix=prefix):
+        for key, _value in self.db.utxo_db.iterator(prefix=prefix):
             if len(results) >= limit:
                 break
             
-            if value == scripthash:
-                ref = key[len(prefix):]
-                # Look up name for this ref (need reverse lookup)
-                # Simplified: just return the ref
-                results.append({
-                    'ref': self._format_ref(ref),
-                })
+            ref = key[len(prefix):]
+            entry = {'ref': self._format_ref(ref)}
+            
+            # Try to resolve the name for this ref
+            zone = self._get_zone_records(ref)
+            owner_sh = self._get_owner(ref)
+            if zone:
+                entry['zone'] = zone.to_dict()
+            if owner_sh:
+                entry['owner'] = owner_sh.hex()
+            
+            results.append(entry)
         
         return results
     

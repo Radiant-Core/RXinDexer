@@ -38,12 +38,14 @@ Swap Endpoints:
   /swaps/history               — Trade history
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
+import asyncio
+import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from fastapi import FastAPI, HTTPException, Query, Path, Header, Request
+from fastapi import FastAPI, HTTPException, Query, Path, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -93,9 +95,12 @@ class _TokenBucket:
 
 
 _rate_buckets: Dict[str, _TokenBucket] = {}
+_rate_request_count: int = 0
+_RATE_CLEANUP_INTERVAL: int = 1000
 
 
 def _rate_limit(request: Request):
+    global _rate_request_count
     limit_per_minute = int(os.getenv('REST_RATE_LIMIT_PER_MIN', '600'))
     burst = int(os.getenv('REST_RATE_LIMIT_BURST', str(limit_per_minute)))
     if limit_per_minute <= 0:
@@ -103,6 +108,16 @@ def _rate_limit(request: Request):
 
     client_host = request.client.host if request.client else 'unknown'
     now = time.time()
+
+    # Periodically purge stale buckets to prevent unbounded memory growth
+    _rate_request_count += 1
+    if _rate_request_count >= _RATE_CLEANUP_INTERVAL:
+        _rate_request_count = 0
+        stale_cutoff = now - 120.0  # 2 minutes
+        stale_keys = [k for k, b in _rate_buckets.items() if b.last_ts < stale_cutoff]
+        for k in stale_keys:
+            del _rate_buckets[k]
+
     bucket = _rate_buckets.get(client_host)
     if bucket is None:
         bucket = _TokenBucket(tokens=float(burst), last_ts=now)
@@ -133,21 +148,23 @@ _glyph_index = None
 _wave_index = None
 _swap_index = None
 _dmint_contracts = None
+_mempool = None
 _db = None
 _daemon = None
 _start_time = time.time()
 
 
 def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
-                dmint_contracts=None):
+                dmint_contracts=None, mempool=None):
     """Set the indexer references from the main server."""
-    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _dmint_contracts
+    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _dmint_contracts, _mempool
     _glyph_index = glyph_index
     _db = db
     _daemon = daemon
     _wave_index = wave_index
     _swap_index = swap_index
     _dmint_contracts = dmint_contracts
+    _mempool = mempool
 
 
 # =============================================================================
@@ -780,6 +797,259 @@ async def get_swap_stats():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# MEMPOOL (Unconfirmed Glyph/Swap Data)
+# =============================================================================
+
+def _get_mempool_glyph():
+    """Get the mempool glyph index if available."""
+    if not _mempool:
+        return None
+    return getattr(_mempool, 'glyph_mempool', None)
+
+
+@app.get("/mempool/glyphs/balance/{scripthash}/{ref}", tags=["Mempool"])
+async def mempool_glyph_balance(
+    scripthash: str = Path(..., min_length=64, max_length=64),
+    ref: str = Path(..., min_length=72, max_length=72),
+):
+    """Get unconfirmed balance delta for a token at an address."""
+    mp = _get_mempool_glyph()
+    if not mp:
+        raise HTTPException(status_code=503, detail="Mempool Glyph indexing not available")
+
+    try:
+        sh_bytes = bytes.fromhex(scripthash)
+        ref_bytes = bytes.fromhex(ref)
+        delta = mp.get_unconfirmed_glyph_balance(sh_bytes, ref_bytes)
+        return {"scripthash": scripthash, "ref": ref, "unconfirmed_delta": delta}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hex format")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mempool/glyphs/txs/{scripthash}", tags=["Mempool"])
+async def mempool_glyph_txs(
+    scripthash: str = Path(..., min_length=64, max_length=64),
+):
+    """Get unconfirmed Glyph transactions for an address."""
+    mp = _get_mempool_glyph()
+    if not mp:
+        raise HTTPException(status_code=503, detail="Mempool Glyph indexing not available")
+
+    try:
+        sh_bytes = bytes.fromhex(scripthash)
+        txs = mp.get_unconfirmed_glyph_txs(sh_bytes)
+        return {"scripthash": scripthash, "txs": txs, "count": len(txs)}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hex format")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mempool/glyphs/token/{ref}", tags=["Mempool"])
+async def mempool_token_txs(
+    ref: str = Path(..., min_length=72, max_length=72),
+):
+    """Get unconfirmed transactions for a specific token."""
+    mp = _get_mempool_glyph()
+    if not mp:
+        raise HTTPException(status_code=503, detail="Mempool Glyph indexing not available")
+
+    try:
+        ref_bytes = bytes.fromhex(ref)
+        txs = mp.get_unconfirmed_token_txs(ref_bytes)
+        return {"ref": ref, "txs": txs, "count": len(txs)}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hex format")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mempool/swaps/orders", tags=["Mempool"])
+async def mempool_swap_orders(
+    base_ref: Optional[str] = Query(default=None, description="Base token ref (72 hex)"),
+    quote_ref: Optional[str] = Query(default=None, description="Quote token ref (72 hex)"),
+):
+    """Get unconfirmed swap orders from mempool."""
+    mp = _get_mempool_glyph()
+    if not mp:
+        raise HTTPException(status_code=503, detail="Mempool Glyph indexing not available")
+
+    try:
+        base_bytes = bytes.fromhex(base_ref) if base_ref else None
+        quote_bytes = bytes.fromhex(quote_ref) if quote_ref else None
+        orders = mp.get_unconfirmed_swap_orders(base_bytes, quote_bytes)
+        return {"orders": orders, "count": len(orders)}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hex format")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mempool/swaps/user/{scripthash}", tags=["Mempool"])
+async def mempool_user_swap_orders(
+    scripthash: str = Path(..., min_length=64, max_length=64),
+):
+    """Get unconfirmed swap orders for a specific user."""
+    mp = _get_mempool_glyph()
+    if not mp:
+        raise HTTPException(status_code=503, detail="Mempool Glyph indexing not available")
+
+    try:
+        sh_bytes = bytes.fromhex(scripthash)
+        orders = mp.get_user_unconfirmed_orders(sh_bytes)
+        return {"scripthash": scripthash, "orders": orders, "count": len(orders)}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hex format")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mempool/stats", tags=["Mempool"])
+async def mempool_glyph_stats():
+    """Get mempool Glyph/Swap indexing statistics."""
+    mp = _get_mempool_glyph()
+    if not mp:
+        return {"enabled": False}
+
+    stats = mp.stats()
+    stats["enabled"] = True
+    return stats
+
+
+# =============================================================================
+# WEBSOCKET SUBSCRIPTIONS
+# =============================================================================
+
+@dataclass
+class _WsClient:
+    ws: Any
+    subscribed_refs: Set[str] = field(default_factory=set)
+    subscribed_scripthashes: Set[str] = field(default_factory=set)
+    subscribe_all_tokens: bool = False
+    subscribe_all_swaps: bool = False
+
+
+_ws_clients: Dict[int, _WsClient] = {}
+_ws_broadcast_task = None
+
+
+async def _ws_broadcast_loop():
+    """Poll mempool touched sets and broadcast to subscribed WebSocket clients."""
+    while True:
+        await asyncio.sleep(2.0)
+        mp = _get_mempool_glyph()
+        if not mp or not _ws_clients:
+            continue
+
+        try:
+            touched_refs, touched_shs = mp.get_touched_and_clear()
+        except Exception:
+            continue
+
+        if not touched_refs and not touched_shs:
+            continue
+
+        ref_hexes = {r.hex() for r in touched_refs}
+        sh_hexes = {s.hex() for s in touched_shs}
+
+        dead = []
+        for cid, client in _ws_clients.items():
+            matched_refs = ref_hexes & client.subscribed_refs if client.subscribed_refs else set()
+            matched_shs = sh_hexes & client.subscribed_scripthashes if client.subscribed_scripthashes else set()
+            send_token = client.subscribe_all_tokens and ref_hexes
+            send_swap = client.subscribe_all_swaps and ref_hexes
+
+            if matched_refs or matched_shs or send_token or send_swap:
+                msg = {
+                    'event': 'update',
+                    'touched_refs': list(matched_refs or (ref_hexes if send_token or send_swap else set())),
+                    'touched_scripthashes': list(matched_shs),
+                }
+                try:
+                    await client.ws.send_json(msg)
+                except Exception:
+                    dead.append(cid)
+
+        for cid in dead:
+            _ws_clients.pop(cid, None)
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    """WebSocket endpoint for real-time token/swap event subscriptions.
+
+    Clients send JSON messages to subscribe:
+      {"action": "subscribe", "refs": ["aabb...00"]}
+      {"action": "subscribe", "scripthashes": ["ccdd...00"]}
+      {"action": "subscribe", "all_tokens": true}
+      {"action": "subscribe", "all_swaps": true}
+      {"action": "unsubscribe", "refs": ["aabb...00"]}
+      {"action": "ping"}
+    """
+    global _ws_broadcast_task
+    await ws.accept()
+
+    cid = id(ws)
+    client = _WsClient(ws=ws)
+    _ws_clients[cid] = client
+
+    # Start broadcast loop if not running
+    if _ws_broadcast_task is None or _ws_broadcast_task.done():
+        _ws_broadcast_task = asyncio.get_event_loop().create_task(_ws_broadcast_loop())
+
+    try:
+        await ws.send_json({'event': 'connected', 'message': 'RXinDexer WebSocket ready'})
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                await ws.send_json({'event': 'error', 'message': 'Invalid JSON'})
+                continue
+
+            action = msg.get('action', '')
+
+            if action == 'ping':
+                await ws.send_json({'event': 'pong'})
+            elif action == 'subscribe':
+                for ref in msg.get('refs', []):
+                    client.subscribed_refs.add(ref)
+                for sh in msg.get('scripthashes', []):
+                    client.subscribed_scripthashes.add(sh)
+                if msg.get('all_tokens'):
+                    client.subscribe_all_tokens = True
+                if msg.get('all_swaps'):
+                    client.subscribe_all_swaps = True
+                await ws.send_json({
+                    'event': 'subscribed',
+                    'refs': len(client.subscribed_refs),
+                    'scripthashes': len(client.subscribed_scripthashes),
+                    'all_tokens': client.subscribe_all_tokens,
+                    'all_swaps': client.subscribe_all_swaps,
+                })
+            elif action == 'unsubscribe':
+                for ref in msg.get('refs', []):
+                    client.subscribed_refs.discard(ref)
+                for sh in msg.get('scripthashes', []):
+                    client.subscribed_scripthashes.discard(sh)
+                if msg.get('all_tokens') is False:
+                    client.subscribe_all_tokens = False
+                if msg.get('all_swaps') is False:
+                    client.subscribe_all_swaps = False
+                await ws.send_json({'event': 'unsubscribed'})
+            else:
+                await ws.send_json({'event': 'error', 'message': f'Unknown action: {action}'})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        _ws_clients.pop(cid, None)
 
 
 # =============================================================================
