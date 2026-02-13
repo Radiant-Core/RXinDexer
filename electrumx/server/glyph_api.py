@@ -523,6 +523,100 @@ class GlyphAPIMixin:
         
         return self.dmint_contracts.get_most_profitable(limit=min(limit, 100))
 
+    async def dmint_get_stats(self):
+        """
+        Get aggregate dMint statistics.
+        
+        Returns:
+            Dict with total/active/completed counts, breakdown by algorithm and DAA mode
+        """
+        self.bump_cost(2.0)
+        
+        if not hasattr(self, 'dmint_contracts') or not self.dmint_contracts:
+            return {'error': 'dMint contracts manager not initialized'}
+        
+        contracts = self.dmint_contracts.contracts
+        active = [c for c in contracts if c.get('active', True)]
+        inactive = [c for c in contracts if not c.get('active', True)]
+        
+        algo_names = {0: 'SHA256D', 1: 'BLAKE3', 2: 'K12', 3: 'Argon2id-Light', 4: 'RandomX-Light'}
+        by_algorithm = {}
+        for c in active:
+            algo_id = c.get('algorithm', 0)
+            name = algo_names.get(algo_id, f'unknown({algo_id})')
+            by_algorithm[name] = by_algorithm.get(name, 0) + 1
+        
+        daa_names = {0: 'fixed', 1: 'epoch', 2: 'asert', 3: 'lwma', 4: 'schedule'}
+        by_daa = {}
+        for c in active:
+            daa_id = c.get('daa_mode', 0)
+            name = daa_names.get(daa_id, f'unknown({daa_id})')
+            by_daa[name] = by_daa.get(name, 0) + 1
+        
+        return {
+            'total_contracts': len(contracts),
+            'active': len(active),
+            'completed': len(inactive),
+            'by_algorithm': by_algorithm,
+            'by_daa_mode': by_daa,
+            'total_active_reward': sum(c.get('reward', 0) for c in active),
+            'updated_height': self.dmint_contracts.last_updated_height,
+        }
+
+    async def dmint_get_contract_daa(self, ref: str):
+        """
+        Get DAA configuration for a specific dMint contract.
+        
+        Args:
+            ref: Contract reference (72 hex chars)
+            
+        Returns:
+            Dict with algorithm, DAA mode, current difficulty, and mode-specific params
+        """
+        self.bump_cost(1.0)
+        
+        if not hasattr(self, 'dmint_contracts') or not self.dmint_contracts:
+            return {'error': 'dMint contracts manager not initialized'}
+        
+        contract = self.dmint_contracts.get_contract(ref)
+        if not contract:
+            return {'error': 'Contract not found'}
+        
+        daa_names = {0: 'fixed', 1: 'epoch', 2: 'asert', 3: 'lwma', 4: 'schedule'}
+        algo_names = {0: 'SHA256D', 1: 'BLAKE3', 2: 'K12', 3: 'Argon2id-Light', 4: 'RandomX-Light'}
+        daa_id = contract.get('daa_mode', 0)
+        algo_id = contract.get('algorithm', 0)
+        
+        result = {
+            'ref': ref,
+            'algorithm': {'id': algo_id, 'name': algo_names.get(algo_id, 'unknown')},
+            'daa_mode': {'id': daa_id, 'name': daa_names.get(daa_id, 'unknown')},
+            'current_difficulty': contract.get('difficulty', 0),
+            'reward': contract.get('reward', 0),
+        }
+        
+        daa_params = contract.get('daa_params', {})
+        if daa_params:
+            result['daa_params'] = daa_params
+        elif daa_id == 2:
+            result['daa_params'] = {
+                'target_block_time': contract.get('target_block_time', 60),
+                'half_life': contract.get('half_life', 1000),
+            }
+        elif daa_id == 3:
+            result['daa_params'] = {
+                'target_block_time': contract.get('target_block_time', 60),
+                'window_size': contract.get('window_size', 144),
+            }
+        elif daa_id == 1:
+            result['daa_params'] = {
+                'target_block_time': contract.get('target_block_time', 60),
+                'epoch_length': contract.get('epoch_length', 2016),
+                'max_adjustment': contract.get('max_adjustment', 4),
+            }
+        
+        return result
+
     # ========================================================================
     # Mempool Glyph/Swap API
     # ========================================================================
