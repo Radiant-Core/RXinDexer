@@ -1,0 +1,75 @@
+# RXinDexer Local Development Docker Compose
+# Uses the production Dockerfile but mounts local code for live changes.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yaml up --build
+#   docker compose -f docker-compose.dev.yaml logs -f
+#   docker compose -f docker-compose.dev.yaml down
+
+services:
+  electrumx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rxindexer_dev
+    user: "root"
+    restart: unless-stopped
+    ports:
+      - "50010:50010"   # TCP (ElectrumX protocol)
+      - "50011:50011"   # WSS
+      - "50012:50012"   # SSL
+      - "8000:8000"     # REST API
+      - "127.0.0.1:8001:8001"  # Admin RPC (localhost only)
+    environment:
+      - DAEMON_URL=${DAEMON_URL}
+      - COIN=${COIN:-Radiant}
+      - NET=${NET:-mainnet}
+      - DB_ENGINE=${DB_ENGINE:-rocksdb}
+      - DB_DIRECTORY=${DB_DIRECTORY:-/data/electrumdb}
+      - SERVICES=${SERVICES:-tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,rpc://127.0.0.1:8001}
+      - SSL_CERTFILE=${SSL_CERTFILE:-/data/electrumdb/server.crt}
+      - SSL_KEYFILE=${SSL_KEYFILE:-/data/electrumdb/server.key}
+      - REST_API_ENABLED=${REST_API_ENABLED:-1}
+      - REST_API_HOST=${REST_API_HOST:-0.0.0.0}
+      - REST_API_PORT=${REST_API_PORT:-8000}
+      - CACHE_MB=${CACHE_MB:-2000}
+      - MAX_SESSIONS=${MAX_SESSIONS:-10000}
+      - MAX_SEND=${MAX_SEND:-10000000}
+      - MAX_RECV=${MAX_RECV:-10000000}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-60}
+      - COST_SOFT_LIMIT=${COST_SOFT_LIMIT:-1000}
+      - COST_HARD_LIMIT=${COST_HARD_LIMIT:-10000}
+      - ALLOW_ROOT=${ALLOW_ROOT:-true}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ELECTRUMX_ENV=dev
+      - ALLOWED_ORIGINS=*
+      # RXinDexer features
+      - GLYPH_INDEX=1
+      - WAVE_INDEX=1
+      - SWAP_INDEX=1
+      - GLYPH_SUBSCRIPTIONS=1
+      - MEMPOOL_GLYPH_INDEX=1
+      - MEMPOOL_SWAP_INDEX=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persist database across restarts
+      - ./electrumdb:/data/electrumdb
+      # Mount local code over cloned repo for live development
+      - ./electrumx:/root/electrumx/electrumx:ro
+      - ./electrumx_server:/root/electrumx/electrumx_server:ro
+      - ./electrumx_rpc:/root/electrumx/electrumx_rpc:ro
+      - ./electrumx_rest_api:/root/electrumx/electrumx_rest_api:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50010 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    stop_signal: SIGTERM
+    stop_grace_period: 180s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
