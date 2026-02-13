@@ -64,10 +64,12 @@ def mock_wave_index():
 @pytest.fixture
 def mock_swap_index():
     idx = Mock()
-    idx.get_open_orders = Mock(return_value={'orders': []})
+    idx.enabled = True
+    idx.order_cache = {}
+    idx.get_open_orders = Mock(return_value=[])
+    idx.get_orderbook = Mock(return_value={'bids': [], 'asks': []})
     idx.get_order = Mock(return_value=None)
-    idx.get_trade_history = Mock(return_value={'trades': []})
-    idx.stats = Mock(return_value={'total_orders': 0})
+    idx.get_swap_history = Mock(return_value=[])
     return idx
 
 
@@ -403,6 +405,7 @@ class TestSwapEndpoints:
         quote = _make_ref('bb' * 32)
         resp = client.get(f'/swaps/orders?base_ref={base}&quote_ref={quote}')
         assert resp.status_code == 200
+        mock_swap_index.get_orderbook.assert_called_once()
 
     def test_get_single_order(self, client, mock_swap_index):
         oid = _make_ref()
@@ -416,13 +419,21 @@ class TestSwapEndpoints:
         resp = client.get(f'/swaps/orders/{oid}')
         assert resp.status_code == 404
 
-    def test_swap_history(self, client, mock_swap_index):
+    def test_swap_history_requires_base_ref(self, client, mock_swap_index):
         resp = client.get('/swaps/history')
         assert resp.status_code == 200
+        assert resp.json().get('error')  # base_ref required
+
+    def test_swap_history_with_base_ref(self, client, mock_swap_index):
+        base = _make_ref()
+        resp = client.get(f'/swaps/history?base_ref={base}')
+        assert resp.status_code == 200
+        mock_swap_index.get_swap_history.assert_called_once()
 
     def test_swap_stats(self, client, mock_swap_index):
         resp = client.get('/swaps/stats')
         assert resp.status_code == 200
+        assert resp.json()['enabled'] is True
 
 
 # ===========================================================================

@@ -351,6 +351,7 @@ class TestWaveIndex:
         db.utxo_db = MagicMock()
         db.utxo_db.get = Mock(return_value=None)
         db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
         return db
 
     @pytest.fixture
@@ -360,6 +361,7 @@ class TestWaveIndex:
         env.wave_index = True
         env.wave_genesis_ref = 'a' * 64 + '_0'
         env.wave_hot_names = 1000
+        env.reorg_limit = 10
         return env
 
     @pytest.fixture

@@ -400,6 +400,7 @@ class TestGlyphIndexIntegration:
         db.utxo_db = MagicMock()
         db.utxo_db.get = Mock(return_value=None)
         db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
         return db
 
     @pytest.fixture
@@ -407,6 +408,7 @@ class TestGlyphIndexIntegration:
         """Create a mock environment."""
         env = Mock()
         env.glyph_index = True
+        env.reorg_limit = 10
         return env
 
     def test_glyph_index_init(self, mock_db, mock_env):

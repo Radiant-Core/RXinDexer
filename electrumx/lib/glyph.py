@@ -220,15 +220,47 @@ def parse_ref(ref_str: str) -> Tuple[str, int]:
 
 
 def extract_token_info(metadata: Dict[str, Any], envelope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Extract a normalized token-info dict from decoded metadata."""
+    """Extract a normalized token-info dict from decoded metadata.
+
+    Handles both v1 (``type`` field) and v2 (``p`` list) formats.
+    """
+    version = metadata.get('v', (envelope or {}).get('version', GlyphVersion.V2))
     protocols = metadata.get('p', []) or []
+
+    # v1 legacy: infer protocols from 'type' string
+    if not protocols and 'type' in metadata:
+        _type_map = {
+            'ft': [GlyphProtocol.GLYPH_FT],
+            'nft': [GlyphProtocol.GLYPH_NFT],
+            'dat': [GlyphProtocol.GLYPH_DAT],
+        }
+        protocols = _type_map.get(str(metadata['type']).lower(), [])
+
     token_info: Dict[str, Any] = {
         'protocols': protocols,
-        'version': (envelope or {}).get('version', GlyphVersion.V2),
+        'version': version,
         'name': metadata.get('name') or metadata.get('n'),
         'ticker': metadata.get('ticker') or metadata.get('tk'),
         'decimals': metadata.get('decimals') or metadata.get('dc', 0),
     }
+
+    # Pass through attrs if present
+    if 'attrs' in metadata:
+        token_info['attrs'] = metadata['attrs']
+
+    # dMint fields
+    if GlyphProtocol.GLYPH_DMINT in protocols:
+        token_info['dmint'] = {
+            'algorithm': metadata.get('algorithm'),
+            'start_difficulty': metadata.get('startDiff'),
+            'max_supply': metadata.get('maxSupply'),
+            'reward': metadata.get('reward'),
+        }
+        daa = metadata.get('daa')
+        if daa and isinstance(daa, dict):
+            token_info['dmint']['daa_mode'] = daa.get('mode')
+            token_info['dmint']['halflife'] = daa.get('halflife')
+
     return token_info
 
 
@@ -400,6 +432,37 @@ def validate_protocols(protocols: List[int]) -> Tuple[bool, Optional[str]]:
             return False, 'WAVE requires MUT'
     
     return True, None
+
+
+def decode_cbor_metadata(data: bytes) -> Optional[Dict[str, Any]]:
+    """Decode raw CBOR bytes into a metadata dict.
+
+    Returns None if data is invalid CBOR or not a dict.
+    """
+    if not HAS_CBOR:
+        return None
+    try:
+        result = cbor2.loads(data)
+        if not isinstance(result, dict):
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def is_glyph_op_return(script: bytes) -> bool:
+    """Check if an output script is an OP_RETURN containing Glyph magic.
+
+    Handles both OP_RETURN and OP_FALSE OP_RETURN patterns.
+    """
+    if not script:
+        return False
+    # Must start with OP_RETURN (0x6a) or OP_FALSE OP_RETURN (0x00 0x6a)
+    if script[0] == 0x6a:
+        return GLYPH_MAGIC in script
+    if len(script) >= 2 and script[0] == 0x00 and script[1] == 0x6a:
+        return GLYPH_MAGIC in script
+    return False
 
 
 def format_glyph_id(txid: str, vout: int) -> str:
