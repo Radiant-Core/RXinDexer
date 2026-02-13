@@ -120,7 +120,12 @@ class Controller(ServerBase):
                     self.logger.error(f'REST API disabled: failed to import dependencies: {e}')
                     return
 
-                set_indexer(getattr(bp, 'glyph_index', None), db, daemon)
+                set_indexer(
+                    getattr(bp, 'glyph_index', None), db, daemon,
+                    wave_index=getattr(bp, 'wave_index', None),
+                    swap_index=getattr(bp, 'swap_index', None),
+                    dmint_contracts=getattr(bp, 'dmint_contracts', None),
+                )
 
                 config = uvicorn.Config(
                     rest_app,

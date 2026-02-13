@@ -304,6 +304,51 @@ def is_container(protocols: List[int]) -> bool:
     return GlyphProtocol.GLYPH_CONTAINER in protocols
 
 
+def is_dmint_reveal(script_or_envelope) -> bool:
+    """Check if a script/envelope contains a dMint reveal (DMINT protocol).
+
+    Accepts either raw script bytes or a pre-parsed envelope dict.
+    """
+    if isinstance(script_or_envelope, dict):
+        env = script_or_envelope
+    else:
+        env = parse_glyph_envelope(script_or_envelope)
+    if not env:
+        return False
+    # Already-parsed metadata takes priority
+    metadata = env.get('metadata')
+    if metadata is None:
+        if not env.get('is_reveal'):
+            return False
+        metadata = parse_glyph_metadata(env)
+    if not metadata or not isinstance(metadata, dict):
+        return False
+    protocols = metadata.get('p', [])
+    return GlyphProtocol.GLYPH_DMINT in protocols
+
+
+def is_wave_claim(script_or_envelope) -> bool:
+    """Check if a script/envelope contains a WAVE name claim (WAVE protocol).
+
+    Accepts either raw script bytes or a pre-parsed envelope dict.
+    """
+    if isinstance(script_or_envelope, dict):
+        env = script_or_envelope
+    else:
+        env = parse_glyph_envelope(script_or_envelope)
+    if not env:
+        return False
+    metadata = env.get('metadata')
+    if metadata is None:
+        if not env.get('is_reveal'):
+            return False
+        metadata = parse_glyph_metadata(env)
+    if not metadata or not isinstance(metadata, dict):
+        return False
+    protocols = metadata.get('p', [])
+    return GlyphProtocol.GLYPH_WAVE in protocols
+
+
 def validate_protocols(protocols: List[int]) -> Tuple[bool, Optional[str]]:
     """
     Validate a protocol combination per Glyph v2 spec Section 3.5.

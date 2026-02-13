@@ -370,4 +370,99 @@ RXinDexer supports WebSocket subscriptions for real-time token updates:
 
 ---
 
+## REST API (HTTP)
+
+RXinDexer also provides a FastAPI-based REST API for HTTP access. Enable it with `REST_API_ENABLED=1`.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REST_API_ENABLED` | `0` | Enable REST API |
+| `REST_API_HOST` | `0.0.0.0` | Listen address |
+| `REST_API_PORT` | `8000` | Listen port |
+| `REST_API_KEY` | *(none)* | API key (required in prod) |
+| `REST_RATE_LIMIT_PER_MIN` | `600` | Rate limit per client |
+| `ALLOWED_ORIGINS` | *(none)* | CORS origins (required in prod) |
+
+### Health & Status
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check (status, uptime, sync height) |
+| GET | `/health/live` | Liveness probe |
+| GET | `/health/ready` | Readiness probe |
+| GET | `/health/db` | Database health |
+| GET | `/status` | Full indexer status (all subsystems) |
+
+### Glyph v2 Token Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/glyphs` | List all tokens (paginated, filterable by `token_type`) |
+| GET | `/glyphs/search?q=` | Search tokens by name/ticker |
+| GET | `/glyphs/stats` | Token counts by type and version |
+| GET | `/glyphs/by-type/{type_id}` | Filter tokens by type ID |
+| GET | `/glyphs/{ref}` | Get single token by 72-hex ref |
+
+### Token Analytics Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/tokens/{ref}/holders` | Token holder list |
+| GET | `/tokens/{ref}/supply` | Supply breakdown (total, circulating, burned) |
+| GET | `/tokens/{ref}/burns` | Burn event history |
+| GET | `/tokens/{ref}/trades` | Transfer event history |
+| GET | `/tokens/{ref}/top-holders` | Rich list (sorted by balance) |
+| GET | `/tokens/{ref}/history` | Full event history (deploy, mint, transfer, burn) |
+| GET | `/tokens/{ref}/metadata` | Parsed CBOR metadata |
+
+### dMint v2 Contract Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/dmint/contracts` | All active dMint contracts (`format=simple\|extended`) |
+| GET | `/dmint/contracts/{ref}` | Single contract detail |
+| GET | `/dmint/algorithms` | Supported algorithm and DAA mode definitions |
+| GET | `/dmint/by-algorithm/{id}` | Contracts filtered by algorithm (0=SHA256D, 1=BLAKE3, 2=K12) |
+| GET | `/dmint/profitable` | Contracts sorted by profitability |
+
+### WAVE Naming System Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/wave/resolve/{name}` | Resolve WAVE name to zone records |
+| GET | `/wave/available/{name}` | Check name availability |
+| GET | `/wave/{name}/subdomains` | List subdomains |
+| GET | `/wave/reverse/{scripthash}` | Reverse lookup by owner |
+| GET | `/wave/stats` | WAVE indexing statistics |
+
+### Swap / DEX Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/swaps/orders` | Active orders (filter by `base_ref`, `quote_ref`) |
+| GET | `/swaps/orders/{order_id}` | Single order detail |
+| GET | `/swaps/history` | Trade/fill history |
+| GET | `/swaps/stats` | Swap indexing statistics |
+
+### Blocks & Transactions
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/blocks/recent` | Recent blocks |
+| GET | `/block/{height}` | Block by height |
+| GET | `/transaction/{txid}` | Transaction by ID |
+
+### Authentication
+
+All endpoints (except `/health*`) require an `X-API-Key` header when `REST_API_KEY` is set.
+
+### Interactive Docs
+
+- Swagger UI: `http://host:port/docs`
+- ReDoc: `http://host:port/redoc`
+
+---
+
 *Reference: [Glyph v2 Token Standard](https://github.com/Radiant-Core/Glyph-Token-Standards)*

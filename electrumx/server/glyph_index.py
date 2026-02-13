@@ -996,7 +996,7 @@ class GlyphIndex:
     # TOKEN ANALYTICS API
     # =========================================================================
     
-    async def get_token_holders(self, ref: bytes, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    def get_token_holders(self, ref: bytes, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
         """
         Get token holders for a specific token.
         
@@ -1008,7 +1008,7 @@ class GlyphIndex:
         # Scan balance keys for this token ref
         prefix = GlyphDBKeys.BALANCE
         
-        async for key, value in self.db.iterator(prefix=prefix):
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
             # Key format: GB + scripthash (32 bytes) + ref (36 bytes)
             if len(key) < 2 + 32 + 36:
                 continue
@@ -1036,13 +1036,13 @@ class GlyphIndex:
             'offset': offset,
         }
     
-    async def get_token_supply(self, ref: bytes) -> Dict[str, Any]:
+    def get_token_supply(self, ref: bytes) -> Optional[Dict[str, Any]]:
         """
         Get detailed supply information for a token.
         
         Returns total supply, circulating supply, burned amount, etc.
         """
-        token = await self.get_token(ref)
+        token = self.get_token(ref)
         if not token:
             return None
         
@@ -1051,7 +1051,7 @@ class GlyphIndex:
         holder_count = 0
         
         prefix = GlyphDBKeys.BALANCE
-        async for key, value in self.db.iterator(prefix=prefix):
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
             if len(key) < 2 + 32 + 36:
                 continue
             key_ref = key[2+32:2+32+36]
@@ -1064,12 +1064,10 @@ class GlyphIndex:
         
         # Get burn history count
         burn_count = 0
-        burned_amount = 0
         history_prefix = GlyphDBKeys.HISTORY + ref
-        async for key, value in self.db.iterator(prefix=history_prefix):
+        for key, value in self.db.utxo_db.iterator(prefix=history_prefix):
             if len(value) >= 1 and value[0] == GlyphEventType.BURN:
                 burn_count += 1
-                # Amount would need to be stored in burn event
         
         return {
             'ref': ref.hex(),
@@ -1086,7 +1084,7 @@ class GlyphIndex:
             'is_dmint': GlyphProtocol.GLYPH_DMINT in token.protocols,
         }
     
-    async def get_token_burns(self, ref: bytes, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    def get_token_burns(self, ref: bytes, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
         """
         Get burn history for a token.
         
@@ -1096,7 +1094,7 @@ class GlyphIndex:
         total_burns = 0
         
         history_prefix = GlyphDBKeys.HISTORY + ref
-        async for key, value in self.db.iterator(prefix=history_prefix):
+        for key, value in self.db.utxo_db.iterator(prefix=history_prefix):
             if len(value) < 1:
                 continue
             event_type = value[0]
@@ -1124,7 +1122,7 @@ class GlyphIndex:
             'offset': offset,
         }
     
-    async def get_token_trades(self, ref: bytes, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    def get_token_trades(self, ref: bytes, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
         """
         Get trade/transfer history for a token.
         
@@ -1134,7 +1132,7 @@ class GlyphIndex:
         total_trades = 0
         
         history_prefix = GlyphDBKeys.HISTORY + ref
-        async for key, value in self.db.iterator(prefix=history_prefix):
+        for key, value in self.db.utxo_db.iterator(prefix=history_prefix):
             if len(value) < 1:
                 continue
             event_type = value[0]
@@ -1166,14 +1164,14 @@ class GlyphIndex:
     # RICH LIST / TOP WALLETS
     # =========================================================================
     
-    async def get_top_holders(self, ref: bytes, limit: int = 100) -> Dict[str, Any]:
+    def get_top_holders(self, ref: bytes, limit: int = 100) -> Dict[str, Any]:
         """
         Get top token holders sorted by balance (descending).
         """
         all_holders = []
         
         prefix = GlyphDBKeys.BALANCE
-        async for key, value in self.db.iterator(prefix=prefix):
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
             if len(key) < 2 + 32 + 36:
                 continue
             key_ref = key[2+32:2+32+36]
@@ -1193,7 +1191,7 @@ class GlyphIndex:
         all_holders.sort(key=lambda x: x['balance'], reverse=True)
         
         # Get token info for context
-        token = await self.get_token(ref)
+        token = self.get_token(ref)
         total_supply = token.total_supply if token else 0
         
         # Add percentage for each holder
@@ -1213,8 +1211,8 @@ class GlyphIndex:
             'top_holders': top_holders,
         }
     
-    async def get_all_tokens_summary(self, limit: int = 100, offset: int = 0, 
-                                      token_type: int = None) -> Dict[str, Any]:
+    def get_all_tokens_summary(self, limit: int = 100, offset: int = 0, 
+                               token_type: int = None) -> Dict[str, Any]:
         """
         Get summary of all indexed tokens with pagination.
         
@@ -1224,7 +1222,7 @@ class GlyphIndex:
         total = 0
         
         prefix = GlyphDBKeys.TOKEN
-        async for key, value in self.db.iterator(prefix=prefix):
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
             try:
                 token = GlyphTokenInfo.from_bytes(value)
                 
