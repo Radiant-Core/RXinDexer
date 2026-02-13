@@ -54,7 +54,9 @@ class Daemon(object):
         self.session = None
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession(connector=self.connector())
+        timeout = aiohttp.ClientTimeout(total=120, sock_read=90)
+        self.session = aiohttp.ClientSession(
+            connector=self.connector(), timeout=timeout)
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):

@@ -113,7 +113,9 @@ class Coin:
     def max_fetch_blocks(cls, height):
         if height < 130000:
             return 1000
-        return 100
+        if height < 230000:
+            return 100
+        return 25
 
     @classmethod
     def genesis_block(cls, block):
