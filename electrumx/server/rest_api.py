@@ -21,9 +21,14 @@ Glyph v2 Endpoints:
 dMint v2 Endpoints:
   /dmint/contracts             — All active dMint contracts
   /dmint/contracts/{ref}       — Single contract detail
+  /dmint/contracts/{ref}/daa   — DAA configuration for a contract
   /dmint/algorithms            — Supported mining algorithms
   /dmint/by-algorithm/{algo}   — Filter by algorithm
   /dmint/profitable            — Sorted by profitability
+  /dmint/stats                 — Aggregate dMint statistics
+
+V2 Hard Fork Endpoints:
+  /v2/activation-status        — Fork activation height and opcode status
 
 WAVE Endpoints:
   /wave/resolve/{name}         — Resolve WAVE name
@@ -630,6 +635,154 @@ async def get_dmint_profitable(limit: int = Query(default=10, le=100)):
         return _dmint_contracts.get_most_profitable(limit=limit)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dmint/stats", tags=["dMint"])
+async def get_dmint_stats():
+    """Get aggregate dMint statistics: total contracts, breakdown by algorithm and DAA mode."""
+    _ensure_dmint()
+
+    try:
+        contracts = _dmint_contracts.contracts
+        active = [c for c in contracts if c.get('active', True)]
+        inactive = [c for c in contracts if not c.get('active', True)]
+
+        algo_names = {0: 'SHA256D', 1: 'BLAKE3', 2: 'K12', 3: 'Argon2id-Light', 4: 'RandomX-Light'}
+        by_algorithm = {}
+        for c in active:
+            algo_id = c.get('algorithm', 0)
+            name = algo_names.get(algo_id, f'unknown({algo_id})')
+            by_algorithm[name] = by_algorithm.get(name, 0) + 1
+
+        daa_names = {0: 'fixed', 1: 'epoch', 2: 'asert', 3: 'lwma', 4: 'schedule'}
+        by_daa = {}
+        for c in active:
+            daa_id = c.get('daa_mode', 0)
+            name = daa_names.get(daa_id, f'unknown({daa_id})')
+            by_daa[name] = by_daa.get(name, 0) + 1
+
+        total_reward = sum(c.get('reward', 0) for c in active)
+
+        return {
+            'total_contracts': len(contracts),
+            'active': len(active),
+            'completed': len(inactive),
+            'by_algorithm': by_algorithm,
+            'by_daa_mode': by_daa,
+            'total_active_reward': total_reward,
+            'updated_height': _dmint_contracts.last_updated_height,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dmint/contracts/{ref}/daa", tags=["dMint"])
+async def get_dmint_contract_daa(
+    ref: str = Path(..., min_length=72, max_length=72)
+):
+    """Get DAA (Difficulty Adjustment Algorithm) configuration for a specific dMint contract."""
+    _ensure_dmint()
+
+    try:
+        contract = _dmint_contracts.get_contract(ref)
+        if not contract:
+            raise HTTPException(status_code=404, detail="Contract not found")
+
+        daa_names = {0: 'fixed', 1: 'epoch', 2: 'asert', 3: 'lwma', 4: 'schedule'}
+        algo_names = {0: 'SHA256D', 1: 'BLAKE3', 2: 'K12', 3: 'Argon2id-Light', 4: 'RandomX-Light'}
+        daa_id = contract.get('daa_mode', 0)
+        algo_id = contract.get('algorithm', 0)
+
+        result = {
+            'ref': ref,
+            'algorithm': {'id': algo_id, 'name': algo_names.get(algo_id, 'unknown')},
+            'daa_mode': {'id': daa_id, 'name': daa_names.get(daa_id, 'unknown')},
+            'current_difficulty': contract.get('difficulty', 0),
+            'reward': contract.get('reward', 0),
+        }
+
+        # Include mode-specific parameters if available
+        daa_params = contract.get('daa_params', {})
+        if daa_params:
+            result['daa_params'] = daa_params
+        elif daa_id == 2:  # ASERT defaults
+            result['daa_params'] = {
+                'target_block_time': contract.get('target_block_time', 60),
+                'half_life': contract.get('half_life', 1000),
+            }
+        elif daa_id == 3:  # LWMA defaults
+            result['daa_params'] = {
+                'target_block_time': contract.get('target_block_time', 60),
+                'window_size': contract.get('window_size', 144),
+            }
+        elif daa_id == 1:  # Epoch defaults
+            result['daa_params'] = {
+                'target_block_time': contract.get('target_block_time', 60),
+                'epoch_length': contract.get('epoch_length', 2016),
+                'max_adjustment': contract.get('max_adjustment', 4),
+            }
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# V2 HARD FORK STATUS
+# =============================================================================
+
+# Activation heights per network (from Radiant Core chainparams.cpp)
+_V2_ACTIVATION_HEIGHTS = {
+    'mainnet': 410_000,
+    'testnet3': 410_000,
+    'scalenet': 1_000,
+    'regtest': 200,
+}
+
+_V2_OPCODES = [
+    {'name': 'OP_BLAKE3', 'hex': '0xee', 'purpose': 'Blake3 hash for dMint PoW'},
+    {'name': 'OP_K12', 'hex': '0xef', 'purpose': 'KangarooTwelve hash for dMint PoW'},
+    {'name': 'OP_LSHIFT', 'hex': '0x98', 'purpose': 'Bitwise left shift (DAA arithmetic)'},
+    {'name': 'OP_RSHIFT', 'hex': '0x99', 'purpose': 'Bitwise right shift (DAA arithmetic)'},
+    {'name': 'OP_2MUL', 'hex': '0x8d', 'purpose': 'Multiply by 2 (DAA arithmetic)'},
+    {'name': 'OP_2DIV', 'hex': '0x8e', 'purpose': 'Divide by 2 (DAA arithmetic)'},
+]
+
+
+@app.get("/v2/activation-status", tags=["V2 Fork"])
+async def get_v2_activation_status():
+    """Get V2 hard fork activation status including current height vs activation height."""
+    current_height = None
+    if _db:
+        try:
+            current_height = _db.db_height
+        except Exception:
+            pass
+
+    network = os.getenv('NET', os.getenv('COIN', 'mainnet')).strip().lower()
+    if 'test' in network:
+        network_key = 'testnet3'
+    elif 'scale' in network:
+        network_key = 'scalenet'
+    elif 'reg' in network:
+        network_key = 'regtest'
+    else:
+        network_key = 'mainnet'
+
+    activation_height = _V2_ACTIVATION_HEIGHTS.get(network_key, 410_000)
+    activated = current_height is not None and current_height >= activation_height
+
+    return {
+        'network': network_key,
+        'activation_height': activation_height,
+        'current_height': current_height,
+        'activated': activated,
+        'blocks_remaining': max(0, activation_height - (current_height or 0)) if current_height is not None else None,
+        'opcodes': _V2_OPCODES,
+        'gating_flag': 'SCRIPT_ENHANCED_REFERENCES',
+    }
 
 
 # =============================================================================

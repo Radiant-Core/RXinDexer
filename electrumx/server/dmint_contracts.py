@@ -294,4 +294,6 @@ DMINT_CONTRACTS_METHODS = {
     'dmint.get_contract': 'dmint_get_contract',
     'dmint.get_by_algorithm': 'dmint_get_by_algorithm',
     'dmint.get_most_profitable': 'dmint_get_most_profitable',
+    'dmint.get_stats': 'dmint_get_stats',
+    'dmint.get_contract_daa': 'dmint_get_contract_daa',
 }
