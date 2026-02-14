@@ -282,11 +282,11 @@ async def get_recent_blocks(limit: int = Query(default=10, le=100)):
 
     for h in range(height, max(0, height - limit), -1):
         try:
-            header = await _db.read_headers(h, 1)
-            if header:
+            header_data, count = await _db.read_headers(h, 1)
+            if header_data and count > 0:
                 blocks.append({
                     "height": h,
-                    "header_hex": header.hex() if header else None,
+                    "header_hex": header_data.hex(),
                 })
         except Exception:
             continue
@@ -304,10 +304,10 @@ async def get_block(height: int = Path(..., ge=0)):
         raise HTTPException(status_code=404, detail="Block not found")
 
     try:
-        header = await _db.read_headers(height, 1)
+        header_data, count = await _db.read_headers(height, 1)
         return {
             "height": height,
-            "header_hex": header.hex() if header else None,
+            "header_hex": header_data.hex() if header_data and count > 0 else None,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
