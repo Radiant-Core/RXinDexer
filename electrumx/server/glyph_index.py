@@ -295,6 +295,10 @@ class GlyphIndex:
         self.metadata_height: Dict[bytes, int] = {}
         self.token_height: Dict[bytes, int] = {}
 
+        # Persistent set of refs known to exist as tokens (survives flush cycles).
+        # Prevents redundant DB lookups for refs already confirmed as known.
+        self._known_refs: Set[bytes] = set()
+
         # Per-height undo information for reorg safety.
         # We store the previous value of each key (or None if absent) the first time
         # it is touched within a given height.
@@ -312,16 +316,32 @@ class GlyphIndex:
         if self.enabled:
             self.logger.info('Glyph token indexing enabled')
     
-    def process_tx(self, tx_hash: bytes, tx: 'Tx', height: int, tx_idx: int):
+    def process_tx(self, tx_hash: bytes, tx: 'Tx', height: int, tx_idx: int,
+                    output_refs_by_vout: Dict[int, List[Tuple[bytes, int]]] = None):
         """
         Process a transaction for Glyph tokens.
         
         Called by BlockProcessor for each transaction.
         
-        Glyph tokens are found by checking INPUT scriptSigs for the 'gly' magic
-        bytes followed by a CBOR payload. This is how reveal transactions work:
-        - Commit tx creates UTXO with script that validates payload hash + 'gly'
-        - Reveal tx spends commit UTXO with scriptSig containing 'gly' + CBOR
+        Token detection uses TWO complementary approaches:
+        
+        1. OUTPUT SCRIPT PATTERNS (primary): Detect FT/NFT token UTXOs by
+           their ref opcodes (OP_PUSHINPUTREF 0xd0 for FT, 
+           OP_PUSHINPUTREFSINGLETON 0xd8 for NFT). This catches ALL token
+           activity including transfers (thousands per block).
+        
+        2. INPUT SCRIPTSIG 'gly' MAGIC (secondary): Detect rare reveal
+           transactions that contain CBOR metadata. Only ~5 total on the
+           entire mainnet chain, but needed for token metadata extraction.
+        
+        Args:
+            tx_hash: Transaction hash
+            tx: Transaction object
+            height: Block height
+            tx_idx: Transaction index in block
+            output_refs_by_vout: Pre-parsed ref data from block processor.
+                Dict mapping vout -> list of (ref_bytes, ref_type) where
+                ref_type is 0 for normal (FT) and 1 for singleton (NFT).
         
         Returns:
             dict or None: The parsed Glyph envelope if found, for chaining to
@@ -331,21 +351,84 @@ class GlyphIndex:
             return None
         
         result_envelope = None
+        is_token_tx = False
         
-        # Check INPUTS for Glyph reveal data (scriptSigs)
-        # This is where Glyph payloads actually live - in the input that spends a commit
+        # ===================================================================
+        # PHASE 1: Detect token UTXOs by OUTPUT SCRIPT PATTERNS
+        # This is the PRIMARY detection method — catches all token activity.
+        # ===================================================================
+        if output_refs_by_vout:
+            for vout, ref_list in output_refs_by_vout.items():
+                output = tx.outputs[vout]
+                script = output.pk_script
+                for ref_bytes, ref_type in ref_list:
+                    is_token_tx = True
+                    # Check if this token ref is already known
+                    known = self._is_known_token(ref_bytes)
+                    if not known:
+                        # New token ref discovered — register it
+                        token = GlyphTokenInfo()
+                        token.ref = ref_bytes
+                        if ref_type == 1:  # singleton = NFT
+                            token.token_type = GlyphTokenType.NFT
+                            token.protocols = [GlyphProtocol.GLYPH_NFT]
+                        else:  # normal = FT
+                            token.token_type = GlyphTokenType.FT
+                            token.protocols = [GlyphProtocol.GLYPH_FT]
+                        token.deploy_height = height
+                        token.deploy_txid = tx_hash
+                        self.token_cache[ref_bytes] = token
+                        self.token_height[ref_bytes] = height
+                        self._known_refs.add(ref_bytes)
+                        
+                        # Add deploy event
+                        history_key = pack_history_key(ref_bytes, height, tx_idx)
+                        history_value = struct.pack('<B', GlyphEventType.DEPLOY) + tx_hash
+                        self.history_cache.append((height, history_key, history_value))
+        else:
+            # Fallback: parse output scripts directly if block processor
+            # didn't provide pre-parsed ref data
+            for vout, output in enumerate(tx.outputs):
+                script = output.pk_script
+                if len(script) < 38:
+                    continue
+                refs_found = self._extract_refs_from_script(script)
+                for ref_bytes, ref_type in refs_found:
+                    is_token_tx = True
+                    known = self._is_known_token(ref_bytes)
+                    if not known:
+                        token = GlyphTokenInfo()
+                        token.ref = ref_bytes
+                        if ref_type == 1:
+                            token.token_type = GlyphTokenType.NFT
+                            token.protocols = [GlyphProtocol.GLYPH_NFT]
+                        else:
+                            token.token_type = GlyphTokenType.FT
+                            token.protocols = [GlyphProtocol.GLYPH_FT]
+                        token.deploy_height = height
+                        token.deploy_txid = tx_hash
+                        self.token_cache[ref_bytes] = token
+                        self.token_height[ref_bytes] = height
+                        self._known_refs.add(ref_bytes)
+                        
+                        history_key = pack_history_key(ref_bytes, height, tx_idx)
+                        history_value = struct.pack('<B', GlyphEventType.DEPLOY) + tx_hash
+                        self.history_cache.append((height, history_key, history_value))
+        
+        # ===================================================================
+        # PHASE 2: Check INPUTS for 'gly' magic (reveal tx metadata)
+        # This is RARE (~5 on entire mainnet) but provides CBOR metadata.
+        # When found, update the token record with full metadata.
+        # ===================================================================
         for vin_idx, txin in enumerate(tx.inputs):
             script = txin.script
             
-            # Skip coinbase inputs (no script)
             if not script:
                 continue
             
-            # Check for Glyph magic in input scriptSig
             if not contains_glyph_magic(script):
                 continue
             
-            # Try to parse as Glyph envelope
             envelope = parse_glyph_envelope(script)
             if not envelope:
                 continue
@@ -353,7 +436,6 @@ class GlyphIndex:
             if not envelope.get('is_reveal'):
                 continue
             
-            # Parse the CBOR metadata
             metadata = parse_glyph_metadata(envelope)
             if not metadata:
                 continue
@@ -363,12 +445,10 @@ class GlyphIndex:
                 )
                 continue
             
-            # Log only after full validation confirms this is a real Glyph token
             protocols = metadata.get('p', [])
             token_type = get_token_type(protocols)
-            self.logger.info(f'Glyph token found: tx={hash_to_hex_str(tx_hash)} input={vin_idx} type={token_type} protocols={protocols}')
+            self.logger.info(f'Glyph REVEAL: tx={hash_to_hex_str(tx_hash)} input={vin_idx} type={token_type} protocols={protocols}')
             
-            # Store first envelope found for return (for WAVE/Swap chaining)
             if result_envelope is None:
                 result_envelope = envelope.copy()
                 result_envelope['metadata'] = metadata
@@ -376,37 +456,75 @@ class GlyphIndex:
                 result_envelope['tx_hash'] = tx_hash
                 result_envelope['vin_idx'] = vin_idx
             
-            # The ref is derived from the input being spent (prev_hash:prev_idx)
-            # This is the commit UTXO that created this token
+            # Find the ref for this reveal
             prev_hash = txin.prev_hash
             prev_idx = txin.prev_idx
             ref = pack_ref(prev_hash, prev_idx)
             
-            # For NFTs, we also need to find the singleton ref in the outputs
-            # The reveal tx creates a singleton ref in one of its outputs
             output_ref = self._find_output_ref(tx_hash, tx, metadata)
+            final_ref = output_ref if output_ref else ref
             
-            # Index the token reveal
+            # Index the reveal with full metadata
             self._index_token_reveal(
-                output_ref if output_ref else ref,
-                tx_hash, 
+                final_ref, tx_hash,
                 vin_idx if not output_ref else output_ref[32:36],
-                height, 
-                tx_idx, 
-                envelope, 
-                metadata,
-                tx
+                height, tx_idx, envelope, metadata, tx
             )
         
-        # Also check outputs for commit scripts (optional - for tracking)
-        for vout, output in enumerate(tx.outputs):
-            script = output.pk_script
-            if contains_glyph_magic(script):
-                commit_info = parse_glyph_from_output(script)
-                if commit_info and commit_info.get('is_commit'):
-                    self._track_commit(pack_ref(tx_hash, vout), commit_info)
-        
         return result_envelope
+    
+    def _is_known_token(self, ref: bytes) -> bool:
+        """Check if a token ref is already known (in cache, known set, or DB)."""
+        if ref in self._known_refs:
+            return True
+        if ref in self.token_cache:
+            self._known_refs.add(ref)
+            return True
+        key = pack_token_key(ref)
+        if self.db.utxo_db.get(key) is not None:
+            self._known_refs.add(ref)
+            return True
+        return False
+    
+    @staticmethod
+    def _extract_refs_from_script(script: bytes) -> List[Tuple[bytes, int]]:
+        """
+        Extract token refs from an output script.
+        
+        Detects:
+        - OP_PUSHINPUTREFSINGLETON (0xd8) + 36 bytes = NFT (ref_type=1)
+        - OP_PUSHINPUTREF (0xd0) + 36 bytes = FT (ref_type=0)
+        
+        Returns list of (ref_bytes, ref_type) tuples.
+        """
+        results = []
+        n = 0
+        while n < len(script):
+            op = script[n]
+            n += 1
+            if op == 0xd8 and n + 36 <= len(script):  # OP_PUSHINPUTREFSINGLETON
+                results.append((script[n:n+36], 1))
+                n += 36
+            elif op == 0xd0 and n + 36 <= len(script):  # OP_PUSHINPUTREF
+                results.append((script[n:n+36], 0))
+                n += 36
+            elif op <= 0x4e:  # Data push opcodes — skip data
+                if op < 0x4c:  # OP_PUSHBYTES_N
+                    n += op
+                elif op == 0x4c:  # OP_PUSHDATA1
+                    if n < len(script):
+                        n += 1 + script[n]
+                elif op == 0x4d:  # OP_PUSHDATA2
+                    if n + 1 < len(script):
+                        dlen = script[n] | (script[n+1] << 8)
+                        n += 2 + dlen
+                elif op == 0x4e:  # OP_PUSHDATA4
+                    if n + 3 < len(script):
+                        dlen = script[n] | (script[n+1] << 8) | (script[n+2] << 16) | (script[n+3] << 24)
+                        n += 4 + dlen
+            elif op in (0xd1, 0xd2, 0xd3):  # Other ref ops with 36-byte data
+                n += 36
+        return results
     
     def _find_output_ref(self, tx_hash: bytes, tx, metadata: Dict) -> Optional[bytes]:
         """
@@ -559,6 +677,8 @@ class GlyphIndex:
         """Revert DB keys written at the given height (reorg unwind)."""
         if not self.enabled:
             return
+        # Clear known refs cache on reorg — it will repopulate from DB lookups
+        self._known_refs.clear()
         raw = self.db.utxo_db.get(self._undo_key(height))
         if not raw:
             return
