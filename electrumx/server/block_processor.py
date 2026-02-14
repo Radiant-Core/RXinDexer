@@ -515,6 +515,9 @@ class BlockProcessor:
             tx_numb = to_le_uint64(tx_num)[:5]
             refs = []
             append_ref = refs.append
+            # Collect per-output ref data for the glyph indexer
+            # Maps vout -> list of (ref_bytes, ref_type) where 0=normal/FT, 1=singleton/NFT
+            output_refs_by_vout = {}
 
             # Spend the inputs
             for txin in tx.inputs:
@@ -542,6 +545,14 @@ class BlockProcessor:
                 all_refs_dedup = Script.dedup_refs(all_refs)
                 normal_refs_dedup = Script.dedup_refs(normal_refs)
                 singleton_refs_dedup = Script.dedup_refs(singleton_refs)
+
+                # Collect ref data for glyph indexer
+                if all_refs_dedup:
+                    vout_refs = []
+                    for ref_id in all_refs_dedup.keys():
+                        ref_type = 1 if singleton_refs_dedup.get(ref_id) and not normal_refs_dedup.get(ref_id) else 0
+                        vout_refs.append((ref_id, ref_type))
+                    output_refs_by_vout[idx] = vout_refs
                 # Save all the refs if any for the utxo
                 refs_value = b''
                 for ref_id in all_refs_dedup.keys():
@@ -589,7 +600,7 @@ class BlockProcessor:
 
             # Process transaction for Glyph tokens
             if self.glyph_index:
-                glyph_envelope = self.glyph_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count)
+                glyph_envelope = self.glyph_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, output_refs_by_vout)
                 
                 # Process for WAVE naming if this is a Glyph tx
                 if self.wave_index and glyph_envelope:
