@@ -104,6 +104,17 @@ def parse_glyph_envelope(data: bytes) -> Optional[Dict[str, Any]]:
     """
     Parse a Glyph envelope from raw script data.
     
+    Handles two on-chain formats:
+    
+    1. SCRIPTPUSH FORMAT (v1 mainnet reality):
+       OP_PUSHBYTES_3 (0x03) + 'gly' + OP_PUSHDATA<N> + <CBOR payload>
+       The 'gly' magic is pushed as a 3-byte data push, followed by
+       a separate data push containing the raw CBOR metadata.
+    
+    2. STRUCTURED FORMAT (v2 spec):
+       'gly' + version_byte + flags_byte + <payload>
+       Version is 0x01 or 0x02, flags indicate reveal vs commit.
+    
     Returns a dict with envelope details or None if not a valid Glyph envelope.
     """
     magic_pos = find_glyph_magic(data)
@@ -111,7 +122,37 @@ def parse_glyph_envelope(data: bytes) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        # Position after magic bytes
+        # ---------------------------------------------------------------
+        # Try FORMAT 1: Script push format (OP_PUSHBYTES_3 + 'gly' + push)
+        # This is how v1 tokens actually appear on Radiant mainnet.
+        # The byte before 'gly' should be 0x03 (OP_PUSHBYTES_3).
+        # ---------------------------------------------------------------
+        if magic_pos >= 1 and data[magic_pos - 1] == 0x03:
+            pos = magic_pos + 3  # position after 'gly'
+            if pos >= len(data):
+                return None
+
+            # Read the next data push (contains the CBOR payload)
+            payload = _read_script_push(data, pos)
+            if payload is not None and len(payload) > 2:
+                # Try to decode as CBOR to verify it's valid
+                if HAS_CBOR:
+                    try:
+                        test = cbor2.loads(payload)
+                        if isinstance(test, dict):
+                            return {
+                                'version': GlyphVersion.V1,
+                                'flags': EnvelopeFlags.IS_REVEAL,
+                                'is_reveal': True,
+                                'metadata_bytes': payload,
+                            }
+                    except Exception:
+                        pass
+
+        # ---------------------------------------------------------------
+        # Try FORMAT 2: Structured format ('gly' + version + flags)
+        # This is the v2 spec format.
+        # ---------------------------------------------------------------
         pos = magic_pos + 3
 
         if pos >= len(data):
@@ -164,6 +205,44 @@ def parse_glyph_envelope(data: bytes) -> Optional[Dict[str, Any]]:
 
     except Exception:
         return None
+
+
+def _read_script_push(data: bytes, pos: int) -> Optional[bytes]:
+    """Read a single script data push starting at pos.
+    
+    Handles OP_PUSHBYTES_N (1-75), OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4.
+    Returns the pushed data bytes, or None if not a valid push.
+    """
+    if pos >= len(data):
+        return None
+    op = data[pos]
+    pos += 1
+    if 1 <= op <= 75:  # OP_PUSHBYTES_N
+        end = pos + op
+        if end <= len(data):
+            return data[pos:end]
+    elif op == 0x4c:  # OP_PUSHDATA1
+        if pos < len(data):
+            dlen = data[pos]
+            pos += 1
+            end = pos + dlen
+            if end <= len(data):
+                return data[pos:end]
+    elif op == 0x4d:  # OP_PUSHDATA2
+        if pos + 1 < len(data):
+            dlen = data[pos] | (data[pos+1] << 8)
+            pos += 2
+            end = pos + dlen
+            if end <= len(data):
+                return data[pos:end]
+    elif op == 0x4e:  # OP_PUSHDATA4
+        if pos + 3 < len(data):
+            dlen = data[pos] | (data[pos+1] << 8) | (data[pos+2] << 16) | (data[pos+3] << 24)
+            pos += 4
+            end = pos + dlen
+            if end <= len(data):
+                return data[pos:end]
+    return None
 
 
 def parse_glyph_metadata(envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:

@@ -528,32 +528,33 @@ class GlyphIndex:
     
     def _find_output_ref(self, tx_hash: bytes, tx, metadata: Dict) -> Optional[bytes]:
         """
-        Find the output ref for a token in the reveal transaction.
+        Find the token ref in the reveal transaction's outputs.
         
-        For NFTs, the reveal tx creates a singleton ref in one of its outputs
-        using OP_PUSHINPUTREFSINGLETON.
+        The token's identity is the 36-byte ref embedded after OP_PUSHINPUTREFSINGLETON
+        (0xd8) for NFTs or OP_PUSHINPUTREF (0xd0) for FTs in the output script.
         
-        Returns the ref bytes or None if not found.
+        Returns the 36-byte ref or None if not found.
         """
         protocols = metadata.get('p', [])
         
-        # For NFTs, look for singleton pattern (d8 prefix = OP_PUSHINPUTREFSINGLETON)
+        # For NFTs, look for singleton pattern (d8 + 36 byte ref)
         if GlyphProtocol.GLYPH_NFT in protocols:
             for vout, output in enumerate(tx.outputs):
                 script = output.pk_script
-                # NFT script starts with d8 (OP_PUSHINPUTREFSINGLETON) + 36 byte ref
-                if len(script) >= 38 and script[0] == 0xd8:
-                    # Extract the ref from the script (36 bytes after d8)
-                    ref_bytes = script[1:37]
-                    return pack_ref(tx_hash, vout)
+                if len(script) >= 37 and script[0] == 0xd8:
+                    return script[1:37]
+                # Also check if d8 appears further into the script
+                idx = script.find(b'\xd8')
+                while idx >= 0 and idx + 37 <= len(script):
+                    return script[idx+1:idx+37]
         
-        # For FTs, look for normal ref pattern (d0 prefix = OP_PUSHINPUTREF)
+        # For FTs, look for normal ref pattern (d0 + 36 byte ref)
         if GlyphProtocol.GLYPH_FT in protocols:
             for vout, output in enumerate(tx.outputs):
                 script = output.pk_script
-                # FT script contains d0 (OP_PUSHINPUTREF) somewhere
-                if b'\xd0' in script:
-                    return pack_ref(tx_hash, vout)
+                idx = script.find(b'\xd0')
+                while idx >= 0 and idx + 37 <= len(script):
+                    return script[idx+1:idx+37]
         
         return None
     
