@@ -405,7 +405,11 @@ class BlockProcessor:
         # requesting size from Python (see deep_getsizeof).
         one_MB = 1000*1000
         utxo_cache_size = len(self.utxo_cache) * 205
-        ref_cache_size = len(self.ref_cache) * 38 + (37 * 3) # Assume there are on average 3 refs per utxo when at least 1 ref found
+        # Python dict overhead per entry: ~72B hash slot + ~50B key obj + 36B key data
+        # + ~50B value obj + ~16B value data ≈ 190B actual vs old 38B estimate.
+        # The old 38B estimate caused ref_cache to silently consume 5x reported memory,
+        # leading to OOM kills when reported ref_MB was ~1000 but actual was ~5GB.
+        ref_cache_size = len(self.ref_cache) * 190
         db_deletes_size = len(self.db_deletes) * 57
         hist_cache_size = self.db.history.unflushed_memsize()
         # Roughly ntxs * 32 + nblocks * 42
@@ -421,10 +425,14 @@ class BlockProcessor:
                                  utxo_MB, hist_MB, ref_MB))
 
         # Flush history if it takes up over 20% of cache memory.
-        # Flush UTXOs once they take up 80% of cache memory.
+        # Always do a full flush (UTXOs + refs) to prevent ref_cache from
+        # growing unbounded and causing OOM kills.  The slight I/O cost of
+        # more frequent full flushes (~13s each) is negligible compared to
+        # hours of lost progress from OOM-induced restarts.
         cache_MB = self.env.cache_MB
-        if utxo_MB + hist_MB >= cache_MB or hist_MB >= cache_MB // 5:
-            return utxo_MB >= cache_MB * 4 // 5
+        total_MB = utxo_MB + hist_MB + ref_MB
+        if total_MB >= cache_MB or hist_MB >= cache_MB // 5:
+            return True
         return None
 
     async def _advance_blocks(self, raw_blocks):
