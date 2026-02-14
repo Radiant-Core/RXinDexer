@@ -102,46 +102,59 @@ def find_glyph_magic(data: bytes) -> int:
 
 def parse_glyph_envelope(data: bytes) -> Optional[Dict[str, Any]]:
     """
-    Parse a Glyph envelope from raw script data.
-    
-    Handles two on-chain formats:
-    
-    1. SCRIPTPUSH FORMAT (v1 mainnet reality):
-       OP_PUSHBYTES_3 (0x03) + 'gly' + OP_PUSHDATA<N> + <CBOR payload>
-       The 'gly' magic is pushed as a 3-byte data push, followed by
-       a separate data push containing the raw CBOR metadata.
-    
-    2. STRUCTURED FORMAT (v2 spec):
-       'gly' + version_byte + flags_byte + <payload>
-       Version is 0x01 or 0x02, flags indicate reveal vs commit.
-    
-    Returns a dict with envelope details or None if not a valid Glyph envelope.
+    Parse a Glyph envelope from raw script bytes.
+
+    Handles all known on-chain formats for both v1 and v2 tokens:
+
+    FORMAT 1 — v1 / v2 Style B  (scriptSig, 'gly' in its own push)
+    ---------------------------------------------------------------
+    v1:  ... OP_PUSHBYTES_3(03) 'gly'  <push>(CBOR_metadata) ...
+    v2B: ... OP_3(53) OP_PUSHBYTES_3(03) 'gly' <push>(data) ...
+
+    The 'gly' magic is a standalone 3-byte data push.
+    The NEXT push is either:
+      • Raw CBOR metadata dict  → reveal  (v1 or v2 Style B reveal)
+      • Version+flags+...       → v2 Style B commit
+
+    FORMAT 2 — v2 Style A  (OP_RETURN output, 'gly' concatenated)
+    ---------------------------------------------------------------
+    Commit:  OP_RETURN <push>('gly' || V2 || flags || commit_hash [...])
+    Reveal:  OP_RETURN <push>('gly' || V2 || flags) <push>(CBOR) [<push>(file)]...
+
+    The 'gly' magic is the first 3 bytes of a larger data push,
+    followed immediately by version (0x02) and flags bytes.
+    For reveals (flags bit 7 set), metadata is in the next push.
+    For commits (flags bit 7 clear), commit_hash follows inline.
+
+    Returns a dict with envelope details, or None if not a valid
+    Glyph envelope.
     """
-    magic_pos = find_glyph_magic(data)
-    if magic_pos == -1:
+    if GLYPH_MAGIC not in data:
         return None
 
     try:
-        # ---------------------------------------------------------------
-        # Try FORMAT 1: Script push format (OP_PUSHBYTES_3 + 'gly' + push)
-        # This is how v1 tokens actually appear on Radiant mainnet.
-        # The byte before 'gly' should be 0x03 (OP_PUSHBYTES_3).
-        # ---------------------------------------------------------------
-        if magic_pos >= 1 and data[magic_pos - 1] == 0x03:
-            pos = magic_pos + 3  # position after 'gly'
-            if pos >= len(data):
-                return None
+        pushes = _parse_script_pushes(data)
 
-            # Read the next data push (contains the CBOR payload)
-            payload = _read_script_push(data, pos)
-            if payload is not None and len(payload) > 2:
-                # Try to decode as CBOR to verify it's valid
+        for i, push in enumerate(pushes):
+            # -----------------------------------------------------------
+            # Case A: 'gly' is a standalone 3-byte push
+            # Matches v1 format and v2 Style B.
+            # -----------------------------------------------------------
+            if push == GLYPH_MAGIC:
+                if i + 1 >= len(pushes):
+                    continue
+                payload = pushes[i + 1]
+                if not payload or len(payload) < 2:
+                    continue
+
+                # Try decoding as CBOR reveal (most common case).
                 if HAS_CBOR:
                     try:
-                        test = cbor2.loads(payload)
-                        if isinstance(test, dict):
+                        decoded = cbor2.loads(payload)
+                        if isinstance(decoded, dict):
+                            v = decoded.get('v', GlyphVersion.V1)
                             return {
-                                'version': GlyphVersion.V1,
+                                'version': v,
                                 'flags': EnvelopeFlags.IS_REVEAL,
                                 'is_reveal': True,
                                 'metadata_bytes': payload,
@@ -149,95 +162,206 @@ def parse_glyph_envelope(data: bytes) -> Optional[Dict[str, Any]]:
                     except Exception:
                         pass
 
-        # ---------------------------------------------------------------
-        # Try FORMAT 2: Structured format ('gly' + version + flags)
-        # This is the v2 spec format.
-        # ---------------------------------------------------------------
-        pos = magic_pos + 3
+                # Try as v2 structured payload (commit: version+flags+data).
+                if payload[0] in (GlyphVersion.V1, GlyphVersion.V2):
+                    result = _parse_v2_structured(payload)
+                    if result is not None:
+                        return result
+                continue
 
-        if pos >= len(data):
-            return None
+            # -----------------------------------------------------------
+            # Case B: 'gly' is the prefix of a larger push
+            # Matches v2 Style A (OP_RETURN concatenated format).
+            # -----------------------------------------------------------
+            if len(push) > 3 and push[:3] == GLYPH_MAGIC:
+                inner = push[3:]  # bytes after 'gly'
+                if len(inner) < 2:
+                    continue
+                version = inner[0]
+                if version not in (GlyphVersion.V1, GlyphVersion.V2):
+                    continue
+                flags = inner[1]
+                is_reveal = (flags & EnvelopeFlags.IS_REVEAL) != 0
 
-        # Version byte
-        version = data[pos]
-        pos += 1
-
-        if version not in (GlyphVersion.V1, GlyphVersion.V2):
-            return None
-
-        if pos >= len(data):
-            return None
-
-        # Flags byte
-        flags = data[pos]
-        pos += 1
-
-        is_reveal = (flags & EnvelopeFlags.IS_REVEAL) != 0
-
-        result = {
-            'version': version,
-            'flags': flags,
-            'is_reveal': is_reveal,
-        }
-
-        if is_reveal:
-            # Reveal envelope - remaining data is metadata
-            if pos < len(data):
-                result['metadata_bytes'] = data[pos:]
-        else:
-            # Commit envelope - next 32 bytes are commit hash
-            if pos + 32 <= len(data):
-                result['commit_hash'] = data[pos:pos+32].hex()
-                pos += 32
-
-                # Optional content root
-                if flags & EnvelopeFlags.HAS_CONTENT_ROOT:
-                    if pos + 32 <= len(data):
-                        result['content_root'] = data[pos:pos+32].hex()
-                        pos += 32
-
-                # Optional controller
-                if flags & EnvelopeFlags.HAS_CONTROLLER:
-                    if pos + 36 <= len(data):
-                        result['controller'] = data[pos:pos+36].hex()
-
-        return result
+                if is_reveal:
+                    # Style A reveal — metadata is in the NEXT push
+                    result: Dict[str, Any] = {
+                        'version': version,
+                        'flags': flags,
+                        'is_reveal': True,
+                    }
+                    if i + 1 < len(pushes):
+                        result['metadata_bytes'] = pushes[i + 1]
+                        # Collect file-chunk pushes (if any)
+                        if i + 2 < len(pushes):
+                            result['file_chunks'] = pushes[i + 2:]
+                    return result
+                else:
+                    # Style A commit — commit data follows inline
+                    return _parse_v2_commit_inline(version, flags, inner[2:])
 
     except Exception:
         return None
 
+    return None
+
+
+# ------------------------------------------------------------------
+# Internal helpers
+# ------------------------------------------------------------------
+
+def _parse_script_pushes(data: bytes) -> list:
+    """Extract an ordered list of data-push payloads from raw script bytes.
+
+    Skips non-push opcodes (OP_RETURN, OP_3, OP_DROP, etc.).
+    Handles:
+      • OP_PUSHBYTES_N  (0x01-0x4b)
+      • OP_PUSHDATA1    (0x4c)
+      • OP_PUSHDATA2    (0x4d)
+      • OP_PUSHDATA4    (0x4e)
+      • Radiant ref opcodes 0xd0-0xd3, 0xd8  (skip 36-byte inline ref)
+    """
+    pushes: list = []
+    pos = 0
+    length = len(data)
+    while pos < length:
+        op = data[pos]
+        pos += 1
+
+        if 1 <= op <= 75:                            # OP_PUSHBYTES_N
+            end = pos + op
+            if end <= length:
+                pushes.append(data[pos:end])
+                pos = end
+            else:
+                break
+        elif op == 0x4c:                             # OP_PUSHDATA1
+            if pos < length:
+                dlen = data[pos]; pos += 1
+                end = pos + dlen
+                if end <= length:
+                    pushes.append(data[pos:end])
+                    pos = end
+                else:
+                    break
+            else:
+                break
+        elif op == 0x4d:                             # OP_PUSHDATA2
+            if pos + 2 <= length:
+                dlen = data[pos] | (data[pos + 1] << 8); pos += 2
+                end = pos + dlen
+                if end <= length:
+                    pushes.append(data[pos:end])
+                    pos = end
+                else:
+                    break
+            else:
+                break
+        elif op == 0x4e:                             # OP_PUSHDATA4
+            if pos + 4 <= length:
+                dlen = (data[pos] | (data[pos + 1] << 8)
+                        | (data[pos + 2] << 16) | (data[pos + 3] << 24))
+                pos += 4
+                end = pos + dlen
+                if end <= length:
+                    pushes.append(data[pos:end])
+                    pos = end
+                else:
+                    break
+            else:
+                break
+        elif op in (0xd0, 0xd1, 0xd2, 0xd3, 0xd8):  # Radiant ref ops
+            pos += 36
+        # else: non-push opcode — skip (OP_RETURN, OP_3, OP_DROP, …)
+
+    return pushes
+
+
+def _parse_v2_structured(payload: bytes) -> Optional[Dict[str, Any]]:
+    """Parse a v2 structured payload that starts with version + flags.
+
+    Used for v2 Style B commits where the push after 'gly' contains
+    ``version || flags || commit_hash [|| optional fields]``.
+
+    Also handles a v2 Style B reveal with the is_reveal flag set,
+    where the remaining bytes after flags are the CBOR metadata.
+    """
+    if len(payload) < 2:
+        return None
+    version = payload[0]
+    flags = payload[1]
+    if version not in (GlyphVersion.V1, GlyphVersion.V2):
+        return None
+    is_reveal = (flags & EnvelopeFlags.IS_REVEAL) != 0
+    result: Dict[str, Any] = {
+        'version': version,
+        'flags': flags,
+        'is_reveal': is_reveal,
+    }
+    pos = 2
+    if is_reveal:
+        if pos < len(payload):
+            result['metadata_bytes'] = payload[pos:]
+    else:
+        return _parse_v2_commit_inline(version, flags, payload[pos:])
+    return result
+
+
+def _parse_v2_commit_inline(version: int, flags: int,
+                            remainder: bytes) -> Dict[str, Any]:
+    """Build a commit envelope dict from the bytes after version+flags."""
+    result: Dict[str, Any] = {
+        'version': version,
+        'flags': flags,
+        'is_reveal': False,
+    }
+    pos = 0
+    if pos + 32 <= len(remainder):
+        result['commit_hash'] = remainder[pos:pos + 32].hex()
+        pos += 32
+        if flags & EnvelopeFlags.HAS_CONTENT_ROOT:
+            if pos + 32 <= len(remainder):
+                result['content_root'] = remainder[pos:pos + 32].hex()
+                pos += 32
+        if flags & EnvelopeFlags.HAS_CONTROLLER:
+            if pos + 36 <= len(remainder):
+                result['controller'] = remainder[pos:pos + 36].hex()
+    return result
+
 
 def _read_script_push(data: bytes, pos: int) -> Optional[bytes]:
-    """Read a single script data push starting at pos.
-    
+    """Read a single script data push starting at *pos*.
+
     Handles OP_PUSHBYTES_N (1-75), OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4.
-    Returns the pushed data bytes, or None if not a valid push.
+    Returns the pushed data bytes, or None on failure.
+
+    .. note:: Prefer ``_parse_script_pushes`` for full script parsing.
+              This helper remains for callers that need positional reads.
     """
     if pos >= len(data):
         return None
     op = data[pos]
     pos += 1
-    if 1 <= op <= 75:  # OP_PUSHBYTES_N
+    if 1 <= op <= 75:
         end = pos + op
         if end <= len(data):
             return data[pos:end]
-    elif op == 0x4c:  # OP_PUSHDATA1
+    elif op == 0x4c:
         if pos < len(data):
-            dlen = data[pos]
-            pos += 1
+            dlen = data[pos]; pos += 1
             end = pos + dlen
             if end <= len(data):
                 return data[pos:end]
-    elif op == 0x4d:  # OP_PUSHDATA2
-        if pos + 1 < len(data):
-            dlen = data[pos] | (data[pos+1] << 8)
-            pos += 2
+    elif op == 0x4d:
+        if pos + 2 <= len(data):
+            dlen = data[pos] | (data[pos + 1] << 8); pos += 2
             end = pos + dlen
             if end <= len(data):
                 return data[pos:end]
-    elif op == 0x4e:  # OP_PUSHDATA4
-        if pos + 3 < len(data):
-            dlen = data[pos] | (data[pos+1] << 8) | (data[pos+2] << 16) | (data[pos+3] << 24)
+    elif op == 0x4e:
+        if pos + 4 <= len(data):
+            dlen = (data[pos] | (data[pos + 1] << 8)
+                    | (data[pos + 2] << 16) | (data[pos + 3] << 24))
             pos += 4
             end = pos + dlen
             if end <= len(data):

@@ -23,6 +23,7 @@ from electrumx.lib.glyph import (
     get_token_type_id,
     get_token_type,
     contains_glyph_magic,
+    is_glyph_op_return,
     parse_glyph_from_output,
     format_ref,
     parse_ref,
@@ -470,6 +471,61 @@ class GlyphIndex:
                 vin_idx if not output_ref else output_ref[32:36],
                 height, tx_idx, envelope, metadata, tx
             )
+        
+        # ===================================================================
+        # PHASE 2b: Check OUTPUTS for v2 Style A OP_RETURN envelopes
+        # v2 tokens may embed the Glyph envelope in an OP_RETURN output
+        # instead of the scriptSig.  Only runs when Phase 2 found nothing.
+        # ===================================================================
+        if result_envelope is None:
+            for vout_idx, output in enumerate(tx.outputs):
+                script = output.pk_script
+                if not script or not is_glyph_op_return(script):
+                    continue
+                
+                envelope = parse_glyph_envelope(script)
+                if not envelope:
+                    continue
+                
+                if not envelope.get('is_reveal'):
+                    continue
+                
+                metadata = parse_glyph_metadata(envelope)
+                if not metadata:
+                    continue
+                if not isinstance(metadata, dict):
+                    self.logger.warning(
+                        f'Invalid Glyph metadata (output) type: tx={hash_to_hex_str(tx_hash)} '
+                        f'output={vout_idx} type={type(metadata).__name__}'
+                    )
+                    continue
+                
+                protocols = metadata.get('p', [])
+                token_type = get_token_type(protocols)
+                self.logger.info(
+                    f'Glyph REVEAL (v2 Style A): tx={hash_to_hex_str(tx_hash)} '
+                    f'output={vout_idx} type={token_type} protocols={protocols}'
+                )
+                
+                if result_envelope is None:
+                    result_envelope = envelope.copy()
+                    result_envelope['metadata'] = metadata
+                    result_envelope['protocols'] = metadata.get('p', [])
+                    result_envelope['tx_hash'] = tx_hash
+                    result_envelope['vout_idx'] = vout_idx
+                
+                # For Style A reveals, the ref comes from the tx outputs
+                output_ref = self._find_output_ref(tx_hash, tx, metadata)
+                if output_ref:
+                    self._index_token_reveal(
+                        output_ref, tx_hash, output_ref[32:36],
+                        height, tx_idx, envelope, metadata, tx
+                    )
+                else:
+                    self.logger.warning(
+                        f'Glyph v2 Style A reveal with no output ref: '
+                        f'tx={hash_to_hex_str(tx_hash)} output={vout_idx}'
+                    )
         
         return result_envelope
     
