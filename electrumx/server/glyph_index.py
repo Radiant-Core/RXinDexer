@@ -291,6 +291,7 @@ class GlyphIndex:
         self.token_cache: Dict[bytes, GlyphTokenInfo] = {}
         self.balance_cache: Dict[bytes, int] = {}  # key -> amount
         self.balance_height: Dict[bytes, int] = {}
+        self.balance_deletes: Set[bytes] = set()  # balance keys to delete from DB on flush
         self.history_cache: List[Tuple[int, bytes, bytes]] = []  # (height, key, value)
         self.metadata_cache: Dict[bytes, bytes] = {}  # hash -> cbor
         self.metadata_height: Dict[bytes, int] = {}
@@ -353,6 +354,8 @@ class GlyphIndex:
         
         result_envelope = None
         is_token_tx = False
+        # Track FT refs that were already known before this tx — candidates for mint
+        known_ft_refs_seen = set()
         
         # ===================================================================
         # PHASE 1: Detect token UTXOs by OUTPUT SCRIPT PATTERNS
@@ -366,6 +369,9 @@ class GlyphIndex:
                     is_token_tx = True
                     # Check if this token ref is already known
                     known = self._is_known_token(ref_bytes)
+                    if known and ref_type == 0:
+                        # Known FT ref — potential dMint mint event
+                        known_ft_refs_seen.add(ref_bytes)
                     if not known:
                         # New token ref discovered — register it
                         token = GlyphTokenInfo()
@@ -397,6 +403,8 @@ class GlyphIndex:
                 for ref_bytes, ref_type in refs_found:
                     is_token_tx = True
                     known = self._is_known_token(ref_bytes)
+                    if known and ref_type == 0:
+                        known_ft_refs_seen.add(ref_bytes)
                     if not known:
                         token = GlyphTokenInfo()
                         token.ref = ref_bytes
@@ -527,6 +535,16 @@ class GlyphIndex:
                         f'tx={hash_to_hex_str(tx_hash)} output={vout_idx}'
                     )
         
+        # ===================================================================
+        # PHASE 3: Detect dMint MINT events
+        # If a known FT ref (already deployed) appears in this tx's outputs,
+        # it could be a mint event.  _process_mint checks if the token is
+        # actually a dMint token and if the tx minted new supply.
+        # ===================================================================
+        for token_ref in known_ft_refs_seen:
+            self._process_mint(tx_hash, tx, height, tx_idx, token_ref,
+                               output_refs_by_vout or {})
+        
         return result_envelope
     
     def _is_known_token(self, ref: bytes) -> bool:
@@ -614,6 +632,151 @@ class GlyphIndex:
         
         return None
     
+    def _find_contract_ref(self, tx: 'Tx', token_ref: bytes) -> Optional[bytes]:
+        """
+        Find the dMint contract ref from the deploy transaction outputs.
+        
+        The contract UTXO uses OP_PUSHINPUTREFSINGLETON (0xd8) with a ref
+        that differs from the token ref (which uses OP_PUSHINPUTREF 0xd0).
+        
+        Returns the 36-byte contract ref hex string, or None.
+        """
+        for vout, output in enumerate(tx.outputs):
+            script = output.pk_script
+            refs = self._extract_refs_from_script(script)
+            for ref_bytes, ref_type in refs:
+                if ref_type == 1 and ref_bytes != token_ref:
+                    # Found a singleton ref that is not the token ref — contract ref
+                    return ref_bytes.hex()
+        return None
+    
+    def _parse_deploy_contract_state(self, token: 'GlyphTokenInfo', tx: 'Tx'):
+        """
+        Parse initial contract state from the deploy transaction's outputs.
+        
+        The dMint contract output script encodes live state values.
+        Uses parse_dmint_contract_state() from glyph.py for the actual parsing.
+        """
+        from electrumx.lib.glyph import parse_dmint_contract_state
+        
+        for vout, output in enumerate(tx.outputs):
+            script = output.pk_script
+            if len(script) < 80:
+                continue
+            # Look for outputs with both d8 (contract singleton) and bd (OP_CHECKTEMPLATEVERIFY)
+            if b'\xd8' not in script:
+                continue
+            
+            state = parse_dmint_contract_state(script)
+            if state:
+                # Override with on-chain state values if present
+                if state.get('reward'):
+                    token.reward = state['reward']
+                if state.get('target'):
+                    token.current_difficulty = state['target']
+                    if not token.start_difficulty:
+                        token.start_difficulty = state['target']
+                if state.get('max_height'):
+                    # max_height encodes total supply via reward * max_height
+                    pass  # total_supply already set from CBOR metadata
+                self.logger.info(
+                    f'Parsed dMint contract state: reward={state.get("reward")} '
+                    f'target={state.get("target")} algo={state.get("algo_id")}'
+                )
+                return
+    
+    def _process_mint(self, tx_hash: bytes, tx: 'Tx', height: int,
+                      tx_idx: int, token_ref: bytes,
+                      output_refs_by_vout: Dict[int, List[Tuple[bytes, int]]]):
+        """
+        Process a dMint mint event.
+        
+        Detects when a dMint contract UTXO is spent and recreated with
+        updated state. Updates mint_count, current_supply, mined_supply,
+        current_difficulty. Records a MINT event in history.
+        
+        A mint tx has these characteristics:
+        - An input spending a known dMint token ref UTXO
+        - An output recreating that ref (the contract carries forward)
+        - New minted token outputs with the same FT ref (OP_PUSHINPUTREF 0xd0)
+        
+        Args:
+            tx_hash: Transaction hash
+            tx: Transaction object
+            height: Block height
+            tx_idx: Transaction index in block
+            token_ref: The 36-byte token ref that was detected
+            output_refs_by_vout: Pre-parsed ref data from block processor
+        """
+        from electrumx.lib.glyph import parse_dmint_contract_state
+        
+        # Load the token from cache or DB
+        token = self.token_cache.get(token_ref)
+        if not token:
+            key = pack_token_key(token_ref)
+            data = self.db.utxo_db.get(key)
+            if data:
+                token = GlyphTokenInfo.from_bytes(data)
+            else:
+                return  # Token not found — skip
+        
+        # Only process dMint tokens
+        if GlyphProtocol.GLYPH_DMINT not in token.protocols:
+            return
+        
+        # Calculate minted amount from FT outputs with the token ref.
+        # In a mint tx, new FT outputs carry the token's OP_PUSHINPUTREF (0xd0)
+        # ref. The minted amount is the sum of values of those outputs.
+        minted_amount = 0
+        for vout, output in enumerate(tx.outputs):
+            script = output.pk_script
+            refs = self._extract_refs_from_script(script)
+            for ref_bytes, ref_type in refs:
+                if ref_bytes == token_ref and ref_type == 0:
+                    minted_amount += output.value
+        
+        if minted_amount <= 0:
+            return  # Not a mint — just a transfer or other operation
+        
+        # Update token state (guard against None for tokens indexed before dMint fields existed)
+        token.mint_count = (token.mint_count or 0) + 1
+        token.mined_supply = (token.mined_supply or 0) + minted_amount
+        token.current_supply = (token.current_supply or 0) + minted_amount
+        
+        # Try to parse updated contract state from the new contract output
+        for vout, output in enumerate(tx.outputs):
+            script = output.pk_script
+            if len(script) < 80 or b'\xd8' not in script:
+                continue
+            state = parse_dmint_contract_state(script)
+            if state:
+                if state.get('target'):
+                    token.current_difficulty = state['target']
+                if state.get('reward'):
+                    token.reward = state['reward']
+                break
+        
+        # Check if fully mined
+        if (token.total_supply or 0) > 0 and (token.mined_supply or 0) >= token.total_supply:
+            token.is_spent = True
+        
+        # Put back into cache so it gets flushed
+        self.token_cache[token_ref] = token
+        self.token_height[token_ref] = height
+        
+        # Record MINT event in history
+        history_key = pack_history_key(token_ref, height, tx_idx)
+        history_value = (struct.pack('<B', GlyphEventType.MINT) + tx_hash +
+                         struct.pack('<Q', minted_amount))
+        self.history_cache.append((height, history_key, history_value))
+        
+        if token.mint_count % 100 == 1 or token.mint_count <= 1:
+            self.logger.info(
+                f'dMint MINT: token={hash_to_hex_str(token_ref[:32])} '
+                f'amount={minted_amount} count={token.mint_count} '
+                f'supply={token.mined_supply}/{token.total_supply}'
+            )
+    
     def _index_token_reveal(self, ref: bytes, tx_hash: bytes, vout_or_vin,
                             height: int, tx_idx: int, envelope: Dict,
                             metadata: Dict, tx: 'Tx'):
@@ -660,8 +823,25 @@ class GlyphIndex:
         if GlyphProtocol.GLYPH_FT in token.protocols:
             # Initial supply from metadata or 0 for dMint
             if GlyphProtocol.GLYPH_DMINT in token.protocols:
-                token.total_supply = token_info.get('dmint', {}).get('max_supply', 0)
-                token.current_supply = 0
+                dmint_info = token_info.get('dmint', {})
+                token.total_supply = dmint_info.get('max_supply', 0) or 0
+                token.premine = dmint_info.get('premine', 0) or 0
+                token.current_supply = token.premine
+                token.mined_supply = 0
+                token.mint_count = 0
+                # Copy dMint metadata fields
+                token.algorithm = dmint_info.get('algorithm', 0) or 0
+                token.start_difficulty = dmint_info.get('start_difficulty', 0) or 0
+                token.current_difficulty = dmint_info.get('start_difficulty', 0) or 0
+                token.reward = dmint_info.get('reward', 0) or 0
+                token.daa_mode = dmint_info.get('daa_mode', 0) or 0
+                token.halving_interval = dmint_info.get('halflife', 0) or 0
+                # Find the contract ref from the deploy tx outputs.
+                # The contract UTXO uses OP_PUSHINPUTREFSINGLETON (0xd8) with a
+                # ref that is different from the token ref (which uses 0xd0).
+                token.contract_ref = self._find_contract_ref(tx, ref)
+                # Also try to parse initial state from the contract output
+                self._parse_deploy_contract_state(token, tx)
             else:
                 # For non-dMint FTs, get initial supply from output value
                 # Find the FT output to get its value
@@ -707,15 +887,54 @@ class GlyphIndex:
         holder_key = pack_holder_key(ref, scripthash)
         self._record_undo(height, key)
         self._record_undo(height, holder_key)
-        current = self.balance_cache.get(key, 0)
+
+        # Check cache first, then DB for existing balance
+        if key in self.balance_cache:
+            current = self.balance_cache[key]
+        else:
+            db_val = self.db.utxo_db.get(key)
+            current = struct.unpack('<Q', db_val)[0] if db_val and len(db_val) == 8 else 0
+
         new_balance = max(0, current + delta)
 
         if new_balance > 0:
             self.balance_cache[key] = new_balance
             self.balance_height[key] = height
-        elif key in self.balance_cache:
-            del self.balance_cache[key]
+            self.balance_deletes.discard(key)
+        else:
+            self.balance_cache.pop(key, None)
             self.balance_height.pop(key, None)
+            # Mark for deletion from DB on next flush
+            self.balance_deletes.add(key)
+
+    # Ref data format: each entry is 36 bytes ref_id + 1 byte ref_type
+    REF_ENTRY_SIZE = 37
+
+    def process_balance_changes(self, height: int, debits, credits):
+        """Process token balance changes for a transaction.
+
+        debits:  list of (hashX, value, refs_bytes) for spent inputs
+        credits: list of (hashX, value, refs_dict_keys) for new outputs
+
+        Only known Glyph tokens are tracked; other refs are ignored.
+        """
+        if not self.enabled:
+            return
+
+        # Debits: subtract balance for each spent input carrying a token ref
+        for hashX, value, refs_data in debits:
+            if not refs_data:
+                continue
+            for i in range(0, len(refs_data), self.REF_ENTRY_SIZE):
+                ref = refs_data[i:i + 36]
+                if len(ref) == 36 and self._is_known_token(ref):
+                    self.update_balance(height, hashX, ref, -value)
+
+        # Credits: add balance for each new output carrying a token ref
+        for hashX, value, ref_keys in credits:
+            for ref in ref_keys:
+                if len(ref) == 36 and self._is_known_token(ref):
+                    self.update_balance(height, hashX, ref, value)
     
     def _undo_key(self, height: int) -> bytes:
         return GlyphDBKeys.UNDO + pack_be_uint32(height)
@@ -801,18 +1020,27 @@ class GlyphIndex:
                 batch.put(ticker_key, ref)
         
         # Flush balances (primary + secondary index)
+        # Balance key format: GB(2) + hashX(HASHX_LEN) + ref(36)
+        hx_off = 2 + HASHX_LEN  # offset where ref starts in balance key
         for key, amount in self.balance_cache.items():
             height = self.balance_height.get(key)
             if height is None:
                 continue
             packed = struct.pack('<Q', amount)
             batch.put(key, packed)
-            # Write secondary holder-by-ref index:
-            # key = GB + scripthash(32) + ref(36) → extract parts
-            scripthash = key[2:2+32]
-            ref = key[2+32:2+32+36]
+            # Write secondary holder-by-ref index
+            scripthash = key[2:hx_off]
+            ref = key[hx_off:hx_off + 36]
             holder_key = pack_holder_key(ref, scripthash)
             batch.put(holder_key, packed)
+
+        # Delete zero-balance entries from DB (primary + secondary)
+        for key in self.balance_deletes:
+            batch.delete(key)
+            scripthash = key[2:hx_off]
+            ref = key[hx_off:hx_off + 36]
+            holder_key = pack_holder_key(ref, scripthash)
+            batch.delete(holder_key)
         
         # Flush history
         for height, key, value in self.history_cache:
@@ -837,6 +1065,7 @@ class GlyphIndex:
         self.token_cache.clear()
         self.balance_cache.clear()
         self.balance_height.clear()
+        self.balance_deletes.clear()
         self.history_cache.clear()
         self.metadata_cache.clear()
         self.metadata_height.clear()
@@ -1002,6 +1231,89 @@ class GlyphIndex:
         
         return results
     
+    def get_mint_history(self, ref: bytes, limit: int = 100,
+                         offset: int = 0) -> Dict[str, Any]:
+        """
+        Get dMint mint history for a token.
+        
+        Returns only MINT events, including minted_amount per event.
+        """
+        mints = []
+        total_mints = 0
+        prefix = GlyphDBKeys.HISTORY + ref
+        
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
+            if len(value) < 1:
+                continue
+            event_type = value[0]
+            if event_type != GlyphEventType.MINT:
+                continue
+            
+            total_mints += 1
+            if total_mints > offset and len(mints) < limit:
+                height = struct.unpack('>I', key[-6:-2])[0]
+                tx_idx = struct.unpack('>H', key[-2:])[0]
+                tx_hash = value[1:33] if len(value) >= 33 else b''
+                # MINT events store minted_amount as uint64 after txid
+                minted_amount = 0
+                if len(value) >= 41:
+                    minted_amount = struct.unpack('<Q', value[33:41])[0]
+                
+                mints.append({
+                    'height': height,
+                    'tx_idx': tx_idx,
+                    'txid': hash_to_hex_str(tx_hash) if tx_hash else None,
+                    'minted_amount': minted_amount,
+                })
+        
+        # Get token info for context
+        token = self.get_token(ref)
+        
+        return {
+            'ref': ref.hex(),
+            'name': token.name if token else None,
+            'ticker': token.ticker if token else None,
+            'total_mints': total_mints,
+            'total_supply': token.total_supply if token else 0,
+            'mined_supply': token.mined_supply if token else 0,
+            'percent_mined': token.percent_mined() if token and token.total_supply > 0 else None,
+            'mints': mints,
+            'limit': limit,
+            'offset': offset,
+        }
+    
+    def get_dmint_tokens(self, limit: int = 100, offset: int = 0,
+                         active_only: bool = True) -> Dict[str, Any]:
+        """
+        Get all dMint tokens with full mining details.
+        
+        Optionally filter to active-only (not fully mined).
+        """
+        tokens = []
+        total = 0
+        
+        prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', GlyphTokenType.DMINT)
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix):
+            ref = key[len(prefix):]
+            token = self.get_token(ref)
+            if not token:
+                continue
+            
+            if active_only and token.is_spent:
+                continue
+            
+            total += 1
+            if total > offset and len(tokens) < limit:
+                tokens.append(self._token_to_dict(token))
+        
+        return {
+            'total': total,
+            'tokens': tokens,
+            'limit': limit,
+            'offset': offset,
+            'active_only': active_only,
+        }
+    
     def search_tokens(self, query: str, protocols: List[int] = None,
                       limit: int = 50) -> List[Dict]:
         """Search tokens by name or ticker."""
@@ -1121,6 +1433,7 @@ class GlyphIndex:
                 'start_difficulty': token.start_difficulty,
                 'current_difficulty': token.current_difficulty,
                 'reward': token.reward,
+                'premine': token.premine,
                 'halving_interval': token.halving_interval,
                 'daa_mode': token.daa_mode,
                 'daa_mode_name': self._daa_mode_name(token.daa_mode),
@@ -1251,6 +1564,10 @@ class GlyphIndex:
             if len(value) >= 1 and value[0] == GlyphEventType.BURN:
                 burn_count += 1
         
+        # Fall back to current_supply as circulating when holder index is empty
+        if circulating == 0 and token.current_supply > 0:
+            circulating = token.current_supply
+
         return {
             'ref': ref.hex(),
             'name': token.name,
