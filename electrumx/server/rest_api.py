@@ -729,6 +729,39 @@ async def get_dmint_contract_daa(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/dmint/contracts/{ref}/mints", tags=["dMint"])
+async def get_dmint_mint_history(
+    ref: str = Path(..., min_length=72, max_length=72),
+    limit: int = Query(default=100, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Get mint history for a dMint token, including minted amounts per event."""
+    _ensure_glyph_index()
+
+    try:
+        ref_bytes = bytes.fromhex(ref)
+        return _glyph_index.get_mint_history(ref_bytes, limit=limit, offset=offset)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/dmint/tokens", tags=["dMint"])
+async def get_dmint_tokens(
+    limit: int = Query(default=100, le=500),
+    offset: int = Query(default=0, ge=0),
+    active_only: bool = Query(default=True),
+):
+    """Get all dMint tokens with full mining details (algorithm, difficulty, reward, supply)."""
+    _ensure_glyph_index()
+
+    try:
+        return _glyph_index.get_dmint_tokens(limit=limit, offset=offset, active_only=active_only)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # =============================================================================
 # V2 HARD FORK STATUS
 # =============================================================================
@@ -1060,6 +1093,19 @@ async def mempool_user_swap_orders(
         raise HTTPException(status_code=400, detail="Invalid hex format")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mempool/info", tags=["Mempool"])
+async def mempool_node_info():
+    """Get standard mempool info from the Radiant node (tx count, size, fees)."""
+    if not _daemon:
+        raise HTTPException(status_code=503, detail="Daemon not available")
+
+    try:
+        info = await _daemon._send_single('getmempoolinfo')
+        return info
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get mempool info: {str(e)}")
 
 
 @app.get("/mempool/stats", tags=["Mempool"])

@@ -451,15 +451,17 @@ def extract_token_info(metadata: Dict[str, Any], envelope: Optional[Dict[str, An
     if 'attrs' in metadata:
         token_info['attrs'] = metadata['attrs']
 
-    # dMint fields
+    # dMint fields — check both top-level and nested 'dmint' object
     if GlyphProtocol.GLYPH_DMINT in protocols:
+        dm_nested = metadata.get('dmint', {}) if isinstance(metadata.get('dmint'), dict) else {}
         token_info['dmint'] = {
-            'algorithm': metadata.get('algorithm'),
-            'start_difficulty': metadata.get('startDiff'),
-            'max_supply': metadata.get('maxSupply'),
-            'reward': metadata.get('reward'),
+            'algorithm': metadata.get('algorithm') or dm_nested.get('algorithm'),
+            'start_difficulty': metadata.get('startDiff') or dm_nested.get('startDiff'),
+            'max_supply': metadata.get('maxSupply') or dm_nested.get('maxSupply'),
+            'reward': metadata.get('reward') or dm_nested.get('reward'),
+            'premine': metadata.get('premine') or dm_nested.get('premine', 0),
         }
-        daa = metadata.get('daa')
+        daa = metadata.get('daa') or dm_nested.get('daa')
         if daa and isinstance(daa, dict):
             token_info['dmint']['daa_mode'] = daa.get('mode')
             token_info['dmint']['halflife'] = daa.get('halflife')
@@ -537,6 +539,117 @@ def is_mutable(protocols: List[int]) -> bool:
 def is_container(protocols: List[int]) -> bool:
     """Check if protocols indicate a container."""
     return GlyphProtocol.GLYPH_CONTAINER in protocols
+
+
+def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse dMint contract state from a UTXO output script.
+
+    The v1/v2 dMint contract output script encodes live state as data pushes
+    before the contract bytecode (which starts at ``OP_CHECKTEMPLATEVERIFY``
+    0xbd or the first non-push opcode).  The layout is:
+
+        <height:4B> d8<contractRef:36B> d0<tokenRef:36B>
+        <maxHeight> <reward> <target>
+        [<algoId:1B> <lastTime:4B> <targetTime:minimal>]
+        bd <contract_bytecode>
+
+    All numeric values are minimal CScriptNum encoded pushes.
+
+    Returns a dict with parsed fields, or None if the script does not look
+    like a dMint contract output.
+    """
+    if not script or len(script) < 80:
+        return None
+
+    # Must contain OP_PUSHINPUTREFSINGLETON (0xd8)
+    if b'\xd8' not in script:
+        return None
+
+    try:
+        pushes = _parse_script_pushes(script)
+        if len(pushes) < 4:
+            return None
+
+        # Heuristic: find the contract ref (36 bytes after a d8 opcode) and
+        # token ref (36 bytes after a d0 opcode) by scanning the raw script.
+        contract_ref = None
+        token_ref = None
+        pos = 0
+        while pos < len(script) - 36:
+            op = script[pos]
+            if op == 0xd8 and pos + 37 <= len(script):
+                contract_ref = script[pos + 1:pos + 37]
+                pos += 37
+            elif op == 0xd0 and pos + 37 <= len(script):
+                token_ref = script[pos + 1:pos + 37]
+                pos += 37
+            elif 1 <= op <= 75:
+                pos += 1 + op
+            elif op == 0x4c and pos + 1 < len(script):
+                pos += 2 + script[pos + 1]
+            elif op == 0x4d and pos + 2 < len(script):
+                dlen = script[pos + 1] | (script[pos + 2] << 8)
+                pos += 3 + dlen
+            elif op == 0x4e and pos + 4 < len(script):
+                dlen = (script[pos + 1] | (script[pos + 2] << 8)
+                        | (script[pos + 3] << 16) | (script[pos + 4] << 24))
+                pos += 5 + dlen
+            else:
+                pos += 1
+
+        if not contract_ref:
+            return None
+
+        # Now extract the numeric data pushes that precede the contract
+        # bytecode.  Filter out the 36-byte ref pushes.
+        numeric_pushes = [p for p in pushes if len(p) <= 8 and len(p) != 36]
+
+        result: Dict[str, Any] = {
+            'contract_ref': contract_ref.hex() if contract_ref else None,
+            'token_ref': token_ref.hex() if token_ref else None,
+        }
+
+        # First numeric push is often the height (4 bytes LE)
+        if len(numeric_pushes) >= 1:
+            result['height'] = _scriptnum_to_int(numeric_pushes[0])
+
+        # Subsequent pushes: maxHeight, reward, target
+        if len(numeric_pushes) >= 2:
+            result['max_height'] = _scriptnum_to_int(numeric_pushes[1])
+        if len(numeric_pushes) >= 3:
+            result['reward'] = _scriptnum_to_int(numeric_pushes[2])
+        if len(numeric_pushes) >= 4:
+            result['target'] = _scriptnum_to_int(numeric_pushes[3])
+
+        # Optional v2 fields: algo_id, lastTime, targetTime
+        if len(numeric_pushes) >= 5:
+            result['algo_id'] = _scriptnum_to_int(numeric_pushes[4])
+        if len(numeric_pushes) >= 6:
+            result['last_time'] = _scriptnum_to_int(numeric_pushes[5])
+        if len(numeric_pushes) >= 7:
+            result['target_time'] = _scriptnum_to_int(numeric_pushes[6])
+
+        return result
+    except Exception:
+        return None
+
+
+def _scriptnum_to_int(data: bytes) -> int:
+    """Convert a CScriptNum-encoded byte string to a Python int.
+
+    CScriptNum uses minimal little-endian encoding with the MSB of the
+    last byte as a sign bit.  An empty byte string encodes 0.
+    """
+    if not data:
+        return 0
+    # Little-endian magnitude with sign bit in top bit of last byte
+    negative = (data[-1] & 0x80) != 0
+    # Strip sign bit for magnitude
+    raw = bytearray(data)
+    raw[-1] &= 0x7f
+    value = int.from_bytes(raw, 'little')
+    return -value if negative else value
 
 
 def is_dmint_reveal(script_or_envelope) -> bool:

@@ -617,6 +617,53 @@ class GlyphAPIMixin:
         
         return result
 
+    async def dmint_get_mint_history(self, ref: str, limit: int = 100, offset: int = 0):
+        """
+        Get mint history for a dMint token.
+        
+        Args:
+            ref: Token ref in format "txid_vout"
+            limit: Maximum results (default 100)
+            offset: Pagination offset (default 0)
+            
+        Returns:
+            Dict with mint events, total counts, and supply info
+        """
+        self.bump_cost(2.0)
+        
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+        
+        try:
+            ref_bytes = self._parse_ref(ref)
+            return self.glyph_index.get_mint_history(
+                ref_bytes, limit=min(limit, 500), offset=offset
+            )
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def dmint_get_tokens(self, limit: int = 100, offset: int = 0,
+                               active_only: bool = True):
+        """
+        Get all dMint tokens with full mining details.
+        
+        Args:
+            limit: Maximum results (default 100)
+            offset: Pagination offset (default 0)
+            active_only: If True, exclude fully-mined tokens
+            
+        Returns:
+            Dict with dMint token list and pagination info
+        """
+        self.bump_cost(2.0)
+        
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+        
+        return self.glyph_index.get_dmint_tokens(
+            limit=min(limit, 500), offset=offset, active_only=active_only
+        )
+
     # ========================================================================
     # Mempool Glyph/Swap API
     # ========================================================================
@@ -1055,6 +1102,10 @@ GLYPH_METHODS = {
     'dmint.get_contract': 'dmint_get_contract',
     'dmint.get_by_algorithm': 'dmint_get_by_algorithm',
     'dmint.get_most_profitable': 'dmint_get_most_profitable',
+    'dmint.get_stats': 'dmint_get_stats',
+    'dmint.get_contract_daa': 'dmint_get_contract_daa',
+    'dmint.get_mint_history': 'dmint_get_mint_history',
+    'dmint.get_tokens': 'dmint_get_tokens',
     # Mempool Glyph/Swap
     'glyph.get_unconfirmed_balance': 'glyph_get_unconfirmed_balance',
     'glyph.get_unconfirmed_txs': 'glyph_get_unconfirmed_txs',

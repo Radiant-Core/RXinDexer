@@ -519,13 +519,28 @@ class BlockProcessor:
             # Maps vout -> list of (ref_bytes, ref_type) where 0=normal/FT, 1=singleton/NFT
             output_refs_by_vout = {}
 
+            # Balance tracking data for Glyph tokens
+            balance_debits = []
+            balance_credits = []
+
             # Spend the inputs
             for txin in tx.inputs:
                 if txin.is_generation():
                     continue
+                # Look up refs for this outpoint BEFORE spending
+                if self.glyph_index:
+                    outpoint = txin.prev_hash + to_le_uint32(txin.prev_idx)
+                    spent_refs = self.ref_cache.get(outpoint) or self.db.utxo_db.get(b'ri' + outpoint)
+                else:
+                    spent_refs = None
                 cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
                 undo_info_append(cache_value)
                 append_hashX(cache_value[:HASHX_LEN])
+                # Collect debit: hashX(11) + codeScriptHash(32) + tx_numb(5) + value(8)
+                if spent_refs:
+                    spent_hashX = cache_value[:HASHX_LEN]
+                    spent_value = unpack_le_uint64(cache_value[-8:])[0]
+                    balance_debits.append((spent_hashX, spent_value, spent_refs))
 
             # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
@@ -594,6 +609,10 @@ class BlockProcessor:
                 # We could check for refs used in inputs that are burnt in this tx,
                 # but current burn implementations are done using op return so this may not be needed
 
+                # Collect credit for balance tracking
+                if self.glyph_index and all_refs_dedup:
+                    balance_credits.append((hashX, txout.value, list(all_refs_dedup.keys())))
+
             append_hashXs(hashXs)
             update_touched(hashXs)
             update_touched(refs)
@@ -609,6 +628,12 @@ class BlockProcessor:
                 # Process for Swap orders if this is a Glyph tx
                 if self.swap_index and glyph_envelope:
                     self.swap_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope)
+
+                # Update token holder balances (debits from spent inputs, credits from new outputs)
+                if balance_debits or balance_credits:
+                    self.glyph_index.process_balance_changes(
+                        self.height + 1, balance_debits, balance_credits
+                    )
 
             tx_num += 1
 
