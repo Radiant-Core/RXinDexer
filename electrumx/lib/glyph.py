@@ -215,6 +215,9 @@ def _parse_script_pushes(data: bytes) -> list:
 
     Skips non-push opcodes (OP_RETURN, OP_3, OP_DROP, etc.).
     Handles:
+      • OP_0 / OP_FALSE (0x00)
+      • OP_1NEGATE      (0x4f)
+      • OP_1 .. OP_16   (0x51-0x60)
       • OP_PUSHBYTES_N  (0x01-0x4b)
       • OP_PUSHDATA1    (0x4c)
       • OP_PUSHDATA2    (0x4d)
@@ -228,7 +231,13 @@ def _parse_script_pushes(data: bytes) -> list:
         op = data[pos]
         pos += 1
 
-        if 1 <= op <= 75:                            # OP_PUSHBYTES_N
+        if op == 0x00:                                # OP_0 / OP_FALSE
+            pushes.append(b'')
+        elif op == 0x4f:                             # OP_1NEGATE
+            pushes.append(b'\x81')
+        elif 0x51 <= op <= 0x60:                     # OP_1 .. OP_16
+            pushes.append(bytes([op - 0x50]))
+        elif 1 <= op <= 75:                          # OP_PUSHBYTES_N
             end = pos + op
             if end <= length:
                 pushes.append(data[pos:end])
@@ -567,18 +576,20 @@ def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        pushes = _parse_script_pushes(script)
-        if len(pushes) < 4:
-            return None
-
         # Heuristic: find the contract ref (36 bytes after a d8 opcode) and
         # token ref (36 bytes after a d0 opcode) by scanning the raw script.
+        # Also locate the boundary (0xbd = OP_CHECKTEMPLATEVERIFY) where
+        # the state prefix ends and the contract bytecode begins.
         contract_ref = None
         token_ref = None
+        state_end = len(script)
         pos = 0
-        while pos < len(script) - 36:
+        while pos < len(script):
             op = script[pos]
-            if op == 0xd8 and pos + 37 <= len(script):
+            if op == 0xbd:
+                state_end = pos
+                break
+            elif op == 0xd8 and pos + 37 <= len(script):
                 contract_ref = script[pos + 1:pos + 37]
                 pos += 37
             elif op == 0xd0 and pos + 37 <= len(script):
@@ -601,8 +612,13 @@ def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
         if not contract_ref:
             return None
 
-        # Now extract the numeric data pushes that precede the contract
-        # bytecode.  Filter out the 36-byte ref pushes.
+        # Parse only the state prefix (before OP_CHECKTEMPLATEVERIFY)
+        # to avoid picking up pushes from the contract bytecode.
+        pushes = _parse_script_pushes(script[:state_end])
+        if len(pushes) < 4:
+            return None
+
+        # Extract numeric data pushes, filtering out 36-byte ref pushes.
         numeric_pushes = [p for p in pushes if len(p) <= 8 and len(p) != 36]
 
         result: Dict[str, Any] = {

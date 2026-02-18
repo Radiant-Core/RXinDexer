@@ -111,7 +111,7 @@ class GlyphTokenInfo:
         'icon_ref', 'icon_type', 'icon_size', 'embedded_data_hash',
         # dMint specific
         'contract_ref', 'algorithm', 'start_difficulty', 'current_difficulty',
-        'reward', 'halving_interval', 'daa_mode', 'mint_count',
+        'reward', 'halving_interval', 'daa_mode', 'mint_count', 'num_contracts',
         # Relationships
         'container_ref', 'authority_ref', 'parent_ref',
         # NFT specific
@@ -154,6 +154,7 @@ class GlyphTokenInfo:
         self.halving_interval = 0  # Blocks between halvings
         self.daa_mode = 0  # Difficulty adjustment algorithm
         self.mint_count = 0  # Number of mint transactions
+        self.num_contracts = 0  # Number of parallel mining contracts
         # Relationships
         self.container_ref = None  # Parent container (if contained)
         self.authority_ref = None  # Authority token reference
@@ -202,6 +203,7 @@ class GlyphTokenInfo:
             'hi': self.halving_interval,
             'da': self.daa_mode,
             'mc': self.mint_count,
+            'nc': self.num_contracts,
             # Relationships
             'co': self.container_ref,
             'ar': self.authority_ref,
@@ -257,6 +259,7 @@ class GlyphTokenInfo:
         info.halving_interval = d.get('hi', 0)
         info.daa_mode = d.get('da', 0)
         info.mint_count = d.get('mc', 0)
+        info.num_contracts = d.get('nc', 0)
         # Relationships
         info.container_ref = d.get('co')
         info.authority_ref = d.get('ar')
@@ -656,34 +659,51 @@ class GlyphIndex:
         
         The dMint contract output script encodes live state values.
         Uses parse_dmint_contract_state() from glyph.py for the actual parsing.
+        Also counts the number of parallel contract outputs so that
+        total_supply reflects all contracts (num_contracts * reward * max_height).
         """
         from electrumx.lib.glyph import parse_dmint_contract_state
+        
+        num_contracts = 0
+        parsed_state = None
         
         for vout, output in enumerate(tx.outputs):
             script = output.pk_script
             if len(script) < 80:
                 continue
-            # Look for outputs with both d8 (contract singleton) and bd (OP_CHECKTEMPLATEVERIFY)
             if b'\xd8' not in script:
                 continue
             
             state = parse_dmint_contract_state(script)
             if state:
-                # Override with on-chain state values if present
-                if state.get('reward'):
-                    token.reward = state['reward']
-                if state.get('target'):
-                    token.current_difficulty = state['target']
-                    if not token.start_difficulty:
-                        token.start_difficulty = state['target']
-                if state.get('max_height'):
-                    # max_height encodes total supply via reward * max_height
-                    pass  # total_supply already set from CBOR metadata
-                self.logger.info(
-                    f'Parsed dMint contract state: reward={state.get("reward")} '
-                    f'target={state.get("target")} algo={state.get("algo_id")}'
-                )
-                return
+                num_contracts += 1
+                if parsed_state is None:
+                    parsed_state = state
+        
+        if not parsed_state:
+            return
+        
+        # Override with on-chain state values if present
+        if parsed_state.get('reward'):
+            token.reward = parsed_state['reward']
+        if parsed_state.get('target'):
+            token.current_difficulty = parsed_state['target']
+            if not token.start_difficulty:
+                token.start_difficulty = parsed_state['target']
+        if parsed_state.get('max_height'):
+            # Calculate total_supply from on-chain state if CBOR
+            # metadata didn't provide it.  Multiply by num_contracts
+            # since each parallel contract can mint independently.
+            reward = parsed_state.get('reward') or token.reward or 0
+            if reward and not token.total_supply:
+                token.total_supply = num_contracts * reward * parsed_state['max_height']
+        
+        token.num_contracts = num_contracts
+        self.logger.info(
+            f'Parsed dMint contract state: reward={parsed_state.get("reward")} '
+            f'target={parsed_state.get("target")} algo={parsed_state.get("algo_id")} '
+            f'contracts={num_contracts}'
+        )
     
     def _process_mint(self, tx_hash: bytes, tx: 'Tx', height: int,
                       tx_idx: int, token_ref: bytes,
@@ -724,37 +744,45 @@ class GlyphIndex:
         if GlyphProtocol.GLYPH_DMINT not in token.protocols:
             return
         
-        # Calculate minted amount from FT outputs with the token ref.
-        # In a mint tx, new FT outputs carry the token's OP_PUSHINPUTREF (0xd0)
-        # ref. The minted amount is the sum of values of those outputs.
-        minted_amount = 0
+        # Scan outputs to count contract UTXOs mined and parse contract state.
+        # Contract outputs carry both a singleton ref (0xd8) and the token ref
+        # (0xd0).  Each contract output represents one parallel contract that
+        # was mined in this tx.  The newly minted amount is
+        # num_contracts_mined * reward (from the contract state), which avoids
+        # double-counting transferred/consolidated tokens in the same tx.
+        num_contracts_mined = 0
+        latest_state = None
         for vout, output in enumerate(tx.outputs):
             script = output.pk_script
             refs = self._extract_refs_from_script(script)
-            for ref_bytes, ref_type in refs:
-                if ref_bytes == token_ref and ref_type == 0:
-                    minted_amount += output.value
+            has_singleton = any(rt == 1 for _, rt in refs)
+            has_token_ref = any(rb == token_ref and rt == 0 for rb, rt in refs)
+            if has_singleton and has_token_ref:
+                num_contracts_mined += 1
+                if latest_state is None and len(script) >= 80:
+                    latest_state = parse_dmint_contract_state(script)
+        
+        if num_contracts_mined <= 0:
+            return  # Not a mint — just a transfer or other operation
+        
+        # Update difficulty and reward from the contract state
+        if latest_state:
+            if latest_state.get('target'):
+                token.current_difficulty = latest_state['target']
+            if latest_state.get('reward'):
+                token.reward = latest_state['reward']
+        
+        # Calculate minted amount: each contract mined produces `reward` tokens
+        reward = token.reward or 0
+        minted_amount = num_contracts_mined * reward
         
         if minted_amount <= 0:
-            return  # Not a mint — just a transfer or other operation
+            return
         
         # Update token state (guard against None for tokens indexed before dMint fields existed)
         token.mint_count = (token.mint_count or 0) + 1
         token.mined_supply = (token.mined_supply or 0) + minted_amount
         token.current_supply = (token.current_supply or 0) + minted_amount
-        
-        # Try to parse updated contract state from the new contract output
-        for vout, output in enumerate(tx.outputs):
-            script = output.pk_script
-            if len(script) < 80 or b'\xd8' not in script:
-                continue
-            state = parse_dmint_contract_state(script)
-            if state:
-                if state.get('target'):
-                    token.current_difficulty = state['target']
-                if state.get('reward'):
-                    token.reward = state['reward']
-                break
         
         # Check if fully mined
         if (token.total_supply or 0) > 0 and (token.mined_supply or 0) >= token.total_supply:
@@ -888,9 +916,14 @@ class GlyphIndex:
         self._record_undo(height, key)
         self._record_undo(height, holder_key)
 
-        # Check cache first, then DB for existing balance
+        # Check cache first, then balance_deletes (zeroed this cycle),
+        # then DB for existing balance.  This ordering prevents stale-read
+        # bugs where the DB returns a value from a previous flush cycle
+        # after the balance was zeroed in the current cycle.
         if key in self.balance_cache:
             current = self.balance_cache[key]
+        elif key in self.balance_deletes:
+            current = 0
         else:
             db_val = self.db.utxo_db.get(key)
             current = struct.unpack('<Q', db_val)[0] if db_val and len(db_val) == 8 else 0
@@ -1581,6 +1614,7 @@ class GlyphIndex:
             'burned_count': burn_count,
             'holder_count': holder_count,
             'is_dmint': GlyphProtocol.GLYPH_DMINT in token.protocols,
+            'percent_mined': token.percent_mined() if token.total_supply > 0 else None,
         }
     
     def get_token_burns(self, ref: bytes, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
