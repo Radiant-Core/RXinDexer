@@ -44,14 +44,14 @@ RUN groupadd -r electrumx && useradd -r -g electrumx -u 1000 electrumx
 # Create directory for DB
 RUN mkdir -p /data/electrumdb && chown -R electrumx:electrumx /data
 
-WORKDIR /root
+WORKDIR /opt
 
 # Clone RXinDexer from GitHub
 ARG RXINDEXER_BRANCH=main
 RUN git clone --depth 1 --branch ${RXINDEXER_BRANCH} \
     https://github.com/Radiant-Core/RXinDexer.git electrumx
 
-WORKDIR /root/electrumx
+WORKDIR /opt/electrumx
 
 # Install Python dependencies
 # Pin Cython<3 BEFORE installing python-rocksdb to avoid Cython 3 incompatibility
@@ -66,8 +66,10 @@ RUN python3 -m pip install plyvel 'aiorpcX[ws]>=0.22,<0.23' attrs pylru 'aiohttp
 # Install python-rocksdb with build isolation disabled to use Cython<3
 RUN python3 -m pip install --no-build-isolation 'python-rocksdb<=0.7.0'
 
-# Make the repo world-readable so the electrumx user can import it via PYTHONPATH
-RUN chmod -R a+rX /root/electrumx
+# Ensure the electrumx user can read and execute the repo
+RUN chown -R root:electrumx /opt/electrumx && \
+    chmod -R g+rX /opt/electrumx && \
+    chmod g+x /opt/electrumx/electrumx_server
 
 # Core configuration
 ENV DAEMON_URL=http://user:pass@localhost:7332/
@@ -125,11 +127,11 @@ RUN openssl genrsa -out server.key 2048
 RUN openssl req -new -key server.key -out server.csr -subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=radiantblockchain.org"
 RUN openssl x509 -req -days 1825 -in server.csr -signkey server.key -out server.crt
 
-WORKDIR /root/electrumx
+WORKDIR /opt/electrumx
 
 EXPOSE 50010 50011 50012 8000
 
-ENV PYTHONPATH=/root/electrumx
+ENV PYTHONPATH=/opt/electrumx
 
 ENTRYPOINT ["python3", "electrumx_server"]
 
