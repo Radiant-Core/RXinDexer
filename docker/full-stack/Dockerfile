@@ -66,6 +66,9 @@ RUN python3 -m pip install plyvel 'aiorpcX>=0.22.0,<0.23.0' pylru cbor2 websocke
 # Install python-rocksdb with build isolation disabled to use Cython<3
 RUN python3 -m pip install --no-build-isolation python-rocksdb
 
+# Make the repo world-readable so the electrumx user can import it via PYTHONPATH
+RUN chmod -R a+rX /root/electrumx
+
 # Database engine
 ENV DB_ENGINE=rocksdb
 
@@ -93,9 +96,11 @@ ENV MAX_SESSIONS=10000
 ENV MAX_SEND=10000000
 ENV MAX_RECV=10000000
 
-# Rate limiting (security)
-ENV COST_SOFT_LIMIT=1000
-ENV COST_HARD_LIMIT=10000
+# Rate limiting (relaxed to prevent local RPC throttling disconnects during sync)
+ENV COST_SOFT_LIMIT=10000
+ENV COST_HARD_LIMIT=100000
+ENV INITIAL_CONCURRENT=50
+ENV REQUEST_SLEEP=500
 
 # RocksDB production tuning
 ENV ROCKSDB_COMPRESSION=lz4
@@ -134,6 +139,8 @@ RUN openssl req -new -key server.key -out server.csr -subj "/C=US/ST=Denial/L=Sp
 RUN openssl x509 -req -days 1825 -in server.csr -signkey server.key -out server.crt
 
 WORKDIR /root/electrumx
+
+ENV PYTHONPATH=/root/electrumx
 
 EXPOSE 50010 50011 50012 8000
 
