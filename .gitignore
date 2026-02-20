@@ -64,6 +64,9 @@ electrumx-standalone-deploy.zip
 test.env
 *.env.local
 
+# Production override (contains credentials — never commit)
+docker-compose.prod.yml
+
 # Test databases
 tests/.pytest_cache/
 
