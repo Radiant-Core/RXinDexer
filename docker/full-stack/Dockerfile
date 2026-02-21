@@ -132,13 +132,11 @@ ENV DMINT_CONTRACTS_FILE=/data/contracts/contracts.json
 # Logging
 ENV LOG_LEVEL=INFO
 
-USER electrumx
+# Copy entrypoint script (generates SSL certs at runtime into the mounted volume)
+COPY entrypoint.sh /opt/electrumx/entrypoint.sh
+RUN chmod +x /opt/electrumx/entrypoint.sh
 
-# Create SSL certificates
-WORKDIR /data/electrumdb
-RUN openssl genrsa -out server.key 2048
-RUN openssl req -new -key server.key -out server.csr -subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=radiantblockchain.org"
-RUN openssl x509 -req -days 1825 -in server.csr -signkey server.key -out server.crt
+USER electrumx
 
 WORKDIR /opt/electrumx
 
@@ -146,4 +144,4 @@ ENV PYTHONPATH=/opt/electrumx
 
 EXPOSE 50010 50011 50012 8000
 
-ENTRYPOINT ["python3", "electrumx_server"]
+ENTRYPOINT ["/opt/electrumx/entrypoint.sh"]
