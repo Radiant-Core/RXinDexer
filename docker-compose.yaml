@@ -15,8 +15,12 @@ services:
     # For debugging, uncomment the following:
     # cap_add:
     #   - SYS_PTRACE
+    networks:
+      - default
+      - radiant-net
     environment:
-      - DAEMON_URL=${DAEMON_URL}
+      - ALLOW_ROOT=1
+      - DAEMON_URL=http://radiant_user:RxS3cur3P@ssw0rd!2025@radiant-node-mainnet:7332
       - COIN=${COIN}
       - NET=${NET}
       - REQUEST_TIMEOUT=${REQUEST_TIMEOUT}
@@ -30,32 +34,11 @@ services:
       - REST_API_PORT=${REST_API_PORT:-8000}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - REST_API_KEY=${REST_API_KEY}
-      - CACHE_MB=${CACHE_MB:-2000}
-      - MAX_SESSIONS=${MAX_SESSIONS:-10000}
-      - MAX_SEND=${MAX_SEND:-10000000}
-      - MAX_RECV=${MAX_RECV:-10000000}
-      # Rate limiting (relaxed to prevent local RPC throttling disconnects)
-      - COST_SOFT_LIMIT=${COST_SOFT_LIMIT:-10000}
-      - COST_HARD_LIMIT=${COST_HARD_LIMIT:-100000}
-      - INITIAL_CONCURRENT=${INITIAL_CONCURRENT:-50}
-      - REQUEST_SLEEP=${REQUEST_SLEEP:-500}
-      # RXinDexer: Glyph token indexing (FT, NFT, dMint, Mutable, Containers)
-      - GLYPH_INDEX=${GLYPH_INDEX:-1}
-      # RXinDexer: WAVE naming system indexing
-      - WAVE_INDEX=${WAVE_INDEX:-1}
-      - WAVE_HOT_NAMES=${WAVE_HOT_NAMES:-10000}
-      # RXinDexer: Swap DEX order indexing
-      - SWAP_INDEX=${SWAP_INDEX:-1}
-      # RXinDexer: Real-time WebSocket subscriptions
-      - GLYPH_SUBSCRIPTIONS=${GLYPH_SUBSCRIPTIONS:-1}
-      # RXinDexer: Mempool indexing for unconfirmed transactions
-      - MEMPOOL_GLYPH_INDEX=${MEMPOOL_GLYPH_INDEX:-1}
-      - MEMPOOL_SWAP_INDEX=${MEMPOOL_SWAP_INDEX:-1}
-      # RXinDexer: dMint contracts file
-      - DMINT_CONTRACTS_FILE=${DMINT_CONTRACTS_FILE:-/data/electrumdb/contracts.json}
-      # Logging
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    user: "1000:1000"
+      - CACHE_MB=${CACHE_MB}
+      - MAX_SESSIONS=${MAX_SESSIONS}
+      - MAX_SEND=${MAX_SEND}
+      - MAX_RECV=${MAX_RECV}
+    user: "0:0"
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -79,3 +62,9 @@ services:
           memory: 4G
     volumes:
       - ./electrumdb:/data/electrumdb   # Mount local directory for database and SSL keys
+    entrypoint: ["python3", "electrumx_server"]
+
+networks:
+  radiant-net:
+    external: true
+    name: radiant-stratum-proxy-main_radiant-net
