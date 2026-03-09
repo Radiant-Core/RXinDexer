@@ -885,6 +885,31 @@ class GlyphIndex:
         token.description = token_info.get('description')
         if 'attrs' in token_info and token_info['attrs']:
             token.attrs = token_info['attrs']
+
+        # Extract image/content fields from CBOR remote/embed
+        # remote: { t: MIME, u: URL/IPFS, h: sha256_bytes, hs: hashstamp_webp }
+        # embed:  { t: MIME, b: raw_bytes }
+        remote = metadata.get('remote') or metadata.get('rm')
+        embed = metadata.get('embed') or metadata.get('em') or metadata.get('main')
+        if remote and isinstance(remote, dict):
+            token.icon_ref = remote.get('u') or remote.get('url')
+            token.icon_type = remote.get('t') or remote.get('type')
+            # Store hashstamp (compressed on-chain thumbnail) if present
+            hs = remote.get('hs')
+            if isinstance(hs, (bytes, bytearray)):
+                token.icon_size = len(hs)
+            h = remote.get('h')
+            if isinstance(h, (bytes, bytearray)):
+                token.embedded_data_hash = bytes(h)
+        elif embed and isinstance(embed, dict):
+            token.icon_type = embed.get('t') or embed.get('type')
+            b = embed.get('b')
+            # CBORTag 64 = typed array; value may be hex str or bytes
+            if hasattr(b, 'value'):
+                b = bytes.fromhex(b.value) if isinstance(b.value, str) else b.value
+            if isinstance(b, (bytes, bytearray)):
+                token.icon_size = len(b)
+                token.icon_ref = 'embedded'
         
         # Store in cache
         self.token_cache[ref] = token
@@ -1456,6 +1481,30 @@ class GlyphIndex:
                 'icon_size': token.icon_size,
                 'embedded_data_hash': hash_to_hex_str(token.embedded_data_hash) if token.embedded_data_hash else None,
             })
+            # Re-parse CBOR metadata to expose remote/embed for explorer image rendering
+            if token.metadata_hash:
+                raw_meta = self.get_metadata(token.metadata_hash)
+                if raw_meta and isinstance(raw_meta, dict):
+                    remote = raw_meta.get('remote') or raw_meta.get('rm')
+                    embed = raw_meta.get('embed') or raw_meta.get('em') or raw_meta.get('main')
+                    if remote and isinstance(remote, dict):
+                        hs = remote.get('hs')
+                        result['remote'] = {
+                            'url': remote.get('u') or remote.get('url'),
+                            'type': remote.get('t') or remote.get('type'),
+                            'hash': (remote.get('h') or b'').hex() if isinstance(remote.get('h'), (bytes, bytearray)) else None,
+                            'hashstamp': (bytes(hs).hex() if isinstance(hs, (bytes, bytearray)) else None),
+                        }
+                    elif embed and isinstance(embed, dict):
+                        b = embed.get('b')
+                        # CBORTag 64 = typed array; value may be hex str or bytes
+                        if hasattr(b, 'value'):
+                            b = bytes.fromhex(b.value) if isinstance(b.value, str) else b.value
+                        result['embed'] = {
+                            'type': embed.get('t') or embed.get('type'),
+                            'size': len(b) if isinstance(b, (bytes, bytearray)) else None,
+                            'data': bytes(b).hex() if isinstance(b, (bytes, bytearray)) else None,
+                        }
         
         # Include dMint-specific fields for minable tokens
         if include_dmint and GlyphProtocol.GLYPH_DMINT in token.protocols:
@@ -1759,7 +1808,7 @@ class GlyphIndex:
                 
                 total += 1
                 if total > offset and len(tokens) < limit:
-                    tokens.append({
+                    entry = {
                         'ref': token.ref.hex(),
                         'name': token.name,
                         'ticker': token.ticker,
@@ -1770,7 +1819,33 @@ class GlyphIndex:
                         'current_supply': token.current_supply,
                         'deploy_height': token.deploy_height,
                         'is_spent': token.is_spent,
-                    })
+                        'icon_ref': token.icon_ref,
+                        'icon_type': token.icon_type,
+                    }
+                    # Include embed/remote for image rendering in the grid
+                    if token.metadata_hash:
+                        raw_meta = self.get_metadata(token.metadata_hash)
+                        if raw_meta and isinstance(raw_meta, dict):
+                            remote = raw_meta.get('remote') or raw_meta.get('rm')
+                            embed = raw_meta.get('embed') or raw_meta.get('em') or raw_meta.get('main')
+                            if remote and isinstance(remote, dict):
+                                hs = remote.get('hs')
+                                entry['remote'] = {
+                                    'url': remote.get('u') or remote.get('url'),
+                                    'type': remote.get('t') or remote.get('type'),
+                                    'hash': (remote.get('h') or b'').hex() if isinstance(remote.get('h'), (bytes, bytearray)) else None,
+                                    'hashstamp': bytes(hs).hex() if isinstance(hs, (bytes, bytearray)) else None,
+                                }
+                            elif embed and isinstance(embed, dict):
+                                b = embed.get('b')
+                                if hasattr(b, 'value'):
+                                    b = bytes.fromhex(b.value) if isinstance(b.value, str) else b.value
+                                entry['embed'] = {
+                                    'type': embed.get('t') or embed.get('type'),
+                                    'size': len(b) if isinstance(b, (bytes, bytearray)) else None,
+                                    'data': bytes(b).hex() if isinstance(b, (bytes, bytearray)) else None,
+                                }
+                    tokens.append(entry)
             except Exception:
                 continue
         

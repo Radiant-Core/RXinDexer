@@ -436,7 +436,7 @@ def extract_token_info(metadata: Dict[str, Any], envelope: Optional[Dict[str, An
 
     Handles both v1 (``type`` field) and v2 (``p`` list) formats.
     """
-    version = metadata.get('v', (envelope or {}).get('version', GlyphVersion.V2))
+    version = metadata.get('v', (envelope or {}).get('version', GlyphVersion.V1))
     protocols = metadata.get('p', []) or []
 
     # v1 legacy: infer protocols from 'type' string
