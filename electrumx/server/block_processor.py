@@ -318,6 +318,7 @@ class BlockProcessor:
                 glyph_index=self.glyph_index,
                 wave_index=self.wave_index,
                 swap_index=self.swap_index,
+                dmint_contracts=self.dmint_contracts,
             )
             height -= 1
 
@@ -396,7 +397,8 @@ class BlockProcessor:
         self.db.flush_dbs(self.flush_data(), flush_utxos, self.estimate_txs_remaining,
                          glyph_index=self.glyph_index,
                          wave_index=self.wave_index,
-                         swap_index=self.swap_index)
+                         swap_index=self.swap_index,
+                         dmint_contracts=self.dmint_contracts)
         self.next_cache_check = time.monotonic() + 30
 
     def check_cache_size(self):

@@ -527,6 +527,24 @@ async def get_token_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _sanitize_cbor(obj):
+    """Recursively convert CBOR-decoded objects to JSON-serializable types.
+
+    Handles CBORTag (unknown tags → str repr), bytes (→ hex str), and
+    nested dicts/lists.
+    """
+    import cbor2
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_cbor(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_cbor(i) for i in obj]
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.hex()
+    if isinstance(obj, cbor2.CBORTag):
+        return {"_cbor_tag": obj.tag, "value": _sanitize_cbor(obj.value)}
+    return obj
+
+
 @app.get("/tokens/{ref}/metadata", tags=["Token Analytics"])
 async def get_token_metadata(ref: str = Path(..., min_length=72, max_length=72)):
     """Get parsed CBOR metadata for a token."""
@@ -541,7 +559,7 @@ async def get_token_metadata(ref: str = Path(..., min_length=72, max_length=72))
         if token.metadata_hash:
             metadata = _glyph_index.get_metadata(token.metadata_hash)
             if metadata:
-                return {"ref": ref, "metadata": metadata}
+                return {"ref": ref, "metadata": _sanitize_cbor(metadata)}
         return {"ref": ref, "metadata": None}
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")

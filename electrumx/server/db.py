@@ -192,9 +192,10 @@ class DB(object):
         self.history.assert_flushed()
 
     def flush_dbs(self, flush_data, flush_utxos, estimate_txs_remaining, 
-                  glyph_index=None, wave_index=None, swap_index=None):
+                  glyph_index=None, wave_index=None, swap_index=None, dmint_contracts=None):
         '''Flush out cached state.  History is always flushed; UTXOs are
-        flushed if flush_utxos. Glyph/WAVE/Swap indexes are flushed if provided.'''
+        flushed if flush_utxos. Glyph/WAVE/Swap indexes are flushed if provided.
+        dMint contracts manager syncs from Glyph index if provided.'''
         if flush_data.height == self.db_height:
             self.assert_flushed(flush_data)
             return
@@ -223,6 +224,10 @@ class DB(object):
             if swap_index:
                 swap_index.flush(batch)
             self.flush_state(batch)
+        
+        # Sync dMint contracts from Glyph index (after batch commit)
+        if dmint_contracts and glyph_index:
+            dmint_contracts.sync_from_index(flush_data.height)
 
         # Update and put the wall time again - otherwise we drop the
         # time it took to commit the batch
@@ -365,8 +370,9 @@ class DB(object):
         self.last_flush_tx_count = self.fs_tx_count
         self.write_utxo_state(batch)
 
-    def flush_backup(self, flush_data, touched, *, glyph_index=None, wave_index=None, swap_index=None):
-        '''Like flush_dbs() but when backing up.  All UTXOs are flushed.'''
+    def flush_backup(self, flush_data, touched, *, glyph_index=None, wave_index=None, swap_index=None, dmint_contracts=None):
+        '''Like flush_dbs() but when backing up.  All UTXOs are flushed.
+        dMint contracts re-sync from Glyph index after reorg.'''
         assert not flush_data.headers
         assert not flush_data.block_tx_hashes
         assert flush_data.height < self.db_height
@@ -391,6 +397,10 @@ class DB(object):
             self.flush_utxo_db(batch, flush_data)
             # Flush state last as it reads the wall time.
             self.flush_state(batch)
+        
+        # Re-sync dMint contracts from Glyph index after reorg
+        if dmint_contracts and glyph_index:
+            dmint_contracts.sync_from_index(flush_data.height)
 
         elapsed = self.last_flush - start_time
         self.logger.info(f'backup flush #{self.history.flush_count:,d} took '

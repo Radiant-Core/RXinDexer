@@ -707,3 +707,387 @@ class TestDmintMintProcessing:
         updated = index.token_cache[token_ref]
         assert updated.mined_supply == 100
         assert updated.is_spent is True
+
+
+# =============================================================================
+# Image / Content Field Tests
+# =============================================================================
+
+class TestImageExtraction:
+    """Tests for remote/embed image field extraction in _index_token_reveal."""
+
+    @pytest.fixture
+    def index(self):
+        """Create a GlyphIndex with mock DB and env."""
+        try:
+            import cbor2
+        except ImportError:
+            pytest.skip('cbor2 not available')
+        from electrumx.server.glyph_index import GlyphIndex
+        db = Mock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(return_value=None)
+        db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
+        env = Mock()
+        env.glyph_index = True
+        env.reorg_limit = 10
+        return GlyphIndex(db, env)
+
+    def _make_reveal_envelope(self, cbor_payload: bytes) -> dict:
+        """Build a minimal reveal envelope dict as produced by parse_glyph_envelope."""
+        return {
+            'version': 2,
+            'flags': 0x80,
+            'is_reveal': True,
+            'metadata_bytes': cbor_payload,
+        }
+
+    def _make_tx(self, token_ref: bytes) -> Mock:
+        """Build a minimal mock transaction with one NFT output."""
+        output = Mock()
+        output.value = 1000
+        output.pk_script = b'\xd8' + token_ref
+        tx = Mock()
+        tx.outputs = [output]
+        tx.inputs = []
+        return tx
+
+    # ------------------------------------------------------------------
+    # remote field tests
+    # ------------------------------------------------------------------
+
+    def test_remote_ipfs_image_populates_icon_ref(self, index):
+        """remote.u (IPFS URL) is stored in icon_ref."""
+        import cbor2
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x01' * 36
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'IPFS NFT',
+            'remote': {'t': 'image/png', 'u': 'ipfs://QmTest123'},
+        }
+        envelope = self._make_reveal_envelope(cbor2.dumps(metadata))
+        tx = self._make_tx(token_ref)
+        index._index_token_reveal(token_ref, b'\x00' * 32, 0, 1, 0, envelope, metadata, tx)
+
+        token = index.token_cache[token_ref]
+        assert token.icon_ref == 'ipfs://QmTest123'
+        assert token.icon_type == 'image/png'
+
+    def test_remote_http_image_populates_icon_ref(self, index):
+        """remote.u (HTTP URL) is stored in icon_ref."""
+        import cbor2
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x02' * 36
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'HTTP NFT',
+            'remote': {'t': 'image/webp', 'u': 'https://example.com/img.webp'},
+        }
+        envelope = self._make_reveal_envelope(cbor2.dumps(metadata))
+        tx = self._make_tx(token_ref)
+        index._index_token_reveal(token_ref, b'\x00' * 32, 0, 1, 0, envelope, metadata, tx)
+
+        token = index.token_cache[token_ref]
+        assert token.icon_ref == 'https://example.com/img.webp'
+        assert token.icon_type == 'image/webp'
+
+    def test_remote_hashstamp_sets_icon_size(self, index):
+        """remote.hs (hashstamp bytes) length is stored in icon_size."""
+        import cbor2
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x03' * 36
+        hashstamp = b'\xff' * 512  # 512-byte on-chain thumbnail
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'Hashstamp NFT',
+            'remote': {'t': 'image/png', 'u': 'ipfs://QmAbc', 'hs': hashstamp},
+        }
+        envelope = self._make_reveal_envelope(cbor2.dumps(metadata))
+        tx = self._make_tx(token_ref)
+        index._index_token_reveal(token_ref, b'\x00' * 32, 0, 1, 0, envelope, metadata, tx)
+
+        token = index.token_cache[token_ref]
+        assert token.icon_size == 512
+
+    def test_remote_hash_stored_as_embedded_data_hash(self, index):
+        """remote.h (SHA-256 bytes) is stored in embedded_data_hash."""
+        import cbor2
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x04' * 36
+        sha256_bytes = b'\xab' * 32
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'Hashed NFT',
+            'remote': {'t': 'image/jpeg', 'u': 'ipfs://QmXyz', 'h': sha256_bytes},
+        }
+        envelope = self._make_reveal_envelope(cbor2.dumps(metadata))
+        tx = self._make_tx(token_ref)
+        index._index_token_reveal(token_ref, b'\x00' * 32, 0, 1, 0, envelope, metadata, tx)
+
+        token = index.token_cache[token_ref]
+        assert token.embedded_data_hash == sha256_bytes
+
+    def test_remote_shorthand_rm_key(self, index):
+        """remote stored under 'rm' shorthand key is also parsed."""
+        import cbor2
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x05' * 36
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'RM NFT',
+            'rm': {'t': 'image/svg+xml', 'u': 'https://example.com/icon.svg'},
+        }
+        envelope = self._make_reveal_envelope(cbor2.dumps(metadata))
+        tx = self._make_tx(token_ref)
+        index._index_token_reveal(token_ref, b'\x00' * 32, 0, 1, 0, envelope, metadata, tx)
+
+        token = index.token_cache[token_ref]
+        assert token.icon_ref == 'https://example.com/icon.svg'
+        assert token.icon_type == 'image/svg+xml'
+
+    # ------------------------------------------------------------------
+    # embed field tests
+    # ------------------------------------------------------------------
+
+    def test_embed_sets_icon_type_and_size(self, index):
+        """embed.t and len(embed.b) are stored in icon_type and icon_size."""
+        import cbor2
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x06' * 36
+        img_bytes = b'\x89PNG' + b'\x00' * 100  # fake PNG
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'Embedded NFT',
+            'embed': {'t': 'image/png', 'b': img_bytes},
+        }
+        envelope = self._make_reveal_envelope(cbor2.dumps(metadata))
+        tx = self._make_tx(token_ref)
+        index._index_token_reveal(token_ref, b'\x00' * 32, 0, 1, 0, envelope, metadata, tx)
+
+        token = index.token_cache[token_ref]
+        assert token.icon_type == 'image/png'
+        assert token.icon_size == len(img_bytes)
+        assert token.icon_ref == 'embedded'
+
+    def test_embed_shorthand_em_key(self, index):
+        """embed stored under 'em' shorthand key is also parsed."""
+        import cbor2
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x07' * 36
+        img_bytes = b'\x00\x01\x02\x03' * 10
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'EM NFT',
+            'em': {'t': 'image/gif', 'b': img_bytes},
+        }
+        envelope = self._make_reveal_envelope(cbor2.dumps(metadata))
+        tx = self._make_tx(token_ref)
+        index._index_token_reveal(token_ref, b'\x00' * 32, 0, 1, 0, envelope, metadata, tx)
+
+        token = index.token_cache[token_ref]
+        assert token.icon_type == 'image/gif'
+        assert token.icon_size == 40
+        assert token.icon_ref == 'embedded'
+
+    # ------------------------------------------------------------------
+    # no-image token
+    # ------------------------------------------------------------------
+
+    def test_no_image_fields_remain_none(self, index):
+        """Tokens without remote/embed have None image fields."""
+        import cbor2
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x08' * 36
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_FT],
+            'name': 'Plain FT', 'ticker': 'PLN',
+        }
+        envelope = self._make_reveal_envelope(cbor2.dumps(metadata))
+        output = Mock()
+        output.value = 1000000
+        output.pk_script = b'\xd0' + token_ref
+        tx = Mock()
+        tx.outputs = [output]
+        tx.inputs = []
+        index._index_token_reveal(token_ref, b'\x00' * 32, 0, 1, 0, envelope, metadata, tx)
+
+        token = index.token_cache[token_ref]
+        assert token.icon_ref is None
+        assert token.icon_type is None
+        assert token.icon_size == 0
+        assert token.embedded_data_hash is None
+
+    # ------------------------------------------------------------------
+    # GlyphTokenInfo serialization roundtrip with image fields
+    # ------------------------------------------------------------------
+
+    def test_image_fields_survive_cbor_roundtrip(self):
+        """icon_ref, icon_type, icon_size, embedded_data_hash survive to_bytes/from_bytes."""
+        try:
+            import cbor2
+        except ImportError:
+            pytest.skip('cbor2 not available')
+        from electrumx.server.glyph_index import GlyphTokenInfo
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+
+        token = GlyphTokenInfo()
+        token.ref = b'\xaa' * 36
+        token.protocols = [GlyphProtocol.GLYPH_NFT]
+        token.token_type = GlyphTokenType.NFT
+        token.name = 'Image NFT'
+        token.icon_ref = 'ipfs://QmTest'
+        token.icon_type = 'image/png'
+        token.icon_size = 512
+        token.embedded_data_hash = b'\xab' * 32
+
+        restored = GlyphTokenInfo.from_bytes(token.to_bytes())
+
+        assert restored.icon_ref == 'ipfs://QmTest'
+        assert restored.icon_type == 'image/png'
+        assert restored.icon_size == 512
+        assert restored.embedded_data_hash == b'\xab' * 32
+
+
+class TestTokenToDictImages:
+    """Tests for remote/embed fields in _token_to_dict API response."""
+
+    @pytest.fixture
+    def index(self):
+        """Create a GlyphIndex with mock DB and env."""
+        try:
+            import cbor2
+        except ImportError:
+            pytest.skip('cbor2 not available')
+        from electrumx.server.glyph_index import GlyphIndex
+        db = Mock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(return_value=None)
+        db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
+        env = Mock()
+        env.glyph_index = True
+        env.reorg_limit = 10
+        return GlyphIndex(db, env)
+
+    def _make_token_with_metadata(self, index, token_ref: bytes, metadata: dict):
+        """Register a token and store its CBOR metadata in the index cache."""
+        import cbor2
+        from electrumx.server.glyph_index import GlyphTokenInfo
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+        from electrumx.lib.hash import sha256
+
+        token = GlyphTokenInfo()
+        token.ref = token_ref
+        token.protocols = metadata.get('p', [GlyphProtocol.GLYPH_NFT])
+        token.token_type = GlyphTokenType.NFT
+        token.name = metadata.get('name', 'Test')
+        token.deploy_height = 100
+        token.deploy_txid = b'\x00' * 32
+
+        cbor_bytes = cbor2.dumps(metadata)
+        token.metadata_hash = sha256(cbor_bytes)
+        index.metadata_cache[token.metadata_hash] = cbor_bytes
+        index.token_cache[token_ref] = token
+        return token
+
+    def test_remote_url_in_api_response(self, index):
+        """_token_to_dict includes remote.url when token has remote image."""
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x10' * 36
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'Remote NFT',
+            'remote': {'t': 'image/png', 'u': 'ipfs://QmABC123'},
+        }
+        self._make_token_with_metadata(index, token_ref, metadata)
+        result = index._token_to_dict(index.token_cache[token_ref])
+
+        assert 'remote' in result
+        assert result['remote']['url'] == 'ipfs://QmABC123'
+        assert result['remote']['type'] == 'image/png'
+
+    def test_remote_hashstamp_in_api_response(self, index):
+        """_token_to_dict includes remote.hashstamp as hex string."""
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x11' * 36
+        hs_bytes = b'\xde\xad\xbe\xef' * 8  # 32-byte fake hashstamp
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'Hashstamp NFT',
+            'remote': {'t': 'image/webp', 'u': 'ipfs://QmXYZ', 'hs': hs_bytes},
+        }
+        self._make_token_with_metadata(index, token_ref, metadata)
+        result = index._token_to_dict(index.token_cache[token_ref])
+
+        assert 'remote' in result
+        assert result['remote']['hashstamp'] == hs_bytes.hex()
+
+    def test_remote_hash_in_api_response(self, index):
+        """_token_to_dict includes remote.hash as hex string."""
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x12' * 36
+        sha_bytes = b'\xca\xfe' * 16  # 32-byte fake SHA-256
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'Hashed NFT',
+            'remote': {'t': 'image/jpeg', 'u': 'https://cdn.example.com/img.jpg', 'h': sha_bytes},
+        }
+        self._make_token_with_metadata(index, token_ref, metadata)
+        result = index._token_to_dict(index.token_cache[token_ref])
+
+        assert 'remote' in result
+        assert result['remote']['hash'] == sha_bytes.hex()
+
+    def test_embed_data_in_api_response(self, index):
+        """_token_to_dict includes embed.data as hex and embed.type/size."""
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x13' * 36
+        img_bytes = b'\x89PNG' + b'\x00' * 60
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_NFT],
+            'name': 'Embedded NFT',
+            'embed': {'t': 'image/png', 'b': img_bytes},
+        }
+        self._make_token_with_metadata(index, token_ref, metadata)
+        result = index._token_to_dict(index.token_cache[token_ref])
+
+        assert 'embed' in result
+        assert result['embed']['type'] == 'image/png'
+        assert result['embed']['size'] == len(img_bytes)
+        assert result['embed']['data'] == img_bytes.hex()
+
+    def test_no_image_no_remote_embed_keys(self, index):
+        """_token_to_dict omits remote/embed keys when no image metadata."""
+        from electrumx.lib.glyph import GlyphProtocol
+        token_ref = b'\x14' * 36
+        metadata = {
+            'v': 2, 'p': [GlyphProtocol.GLYPH_FT],
+            'name': 'Plain FT', 'ticker': 'PLN',
+        }
+        self._make_token_with_metadata(index, token_ref, metadata)
+        result = index._token_to_dict(index.token_cache[token_ref])
+
+        assert 'remote' not in result
+        assert 'embed' not in result
+
+    def test_no_metadata_hash_no_remote_embed(self, index):
+        """_token_to_dict omits remote/embed when token has no metadata_hash."""
+        from electrumx.server.glyph_index import GlyphTokenInfo
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+        token_ref = b'\x15' * 36
+        token = GlyphTokenInfo()
+        token.ref = token_ref
+        token.protocols = [GlyphProtocol.GLYPH_NFT]
+        token.token_type = GlyphTokenType.NFT
+        token.name = 'No Meta NFT'
+        token.deploy_height = 100
+        token.deploy_txid = b'\x00' * 32
+        # metadata_hash left as default empty bytes
+        index.token_cache[token_ref] = token
+
+        result = index._token_to_dict(token)
+
+        assert 'remote' not in result
+        assert 'embed' not in result
