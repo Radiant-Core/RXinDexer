@@ -76,6 +76,7 @@ class Env(EnvBase):
         self.glyph_index = self.boolean('GLYPH_INDEX', True)
         self.wave_index = self.boolean('WAVE_INDEX', True)
         self.swap_index = self.boolean('SWAP_INDEX', True)
+        self.analytics_index = self.boolean('ANALYTICS_INDEX', True)
         self.glyph_subscriptions = self.boolean('GLYPH_SUBSCRIPTIONS', True)
         self.mempool_glyph_index = self.boolean('MEMPOOL_GLYPH_INDEX', True)
         self.mempool_swap_index = self.boolean('MEMPOOL_SWAP_INDEX', True)

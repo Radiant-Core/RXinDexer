@@ -74,6 +74,30 @@ def mock_swap_index():
 
 
 @pytest.fixture
+def mock_analytics_index():
+    idx = Mock()
+    idx.enabled = True
+    idx.get_stats = Mock(return_value={
+        'enabled': True,
+        'last_processed_height': 99999,
+        'rich_list_entries': 2,
+    })
+    idx.get_balance_distribution = Mock(return_value={'1-10': 1, '10-100': 2})
+    idx.get_supply_aging = Mock(return_value={'<1d': 123, '1d-1w': 456})
+    idx.get_top_addresses = Mock(return_value={
+        'total': 2,
+        'limit': 25,
+        'offset': 5,
+        'rows': [{'address': 'addr1', 'balance': 10}],
+    })
+    idx.get_movement = Mock(return_value={
+        'days': 14,
+        'series': [{'day': 10, 'coins_moved': 5, 'active_addresses': 2, 'new_addresses': 1}],
+    })
+    return idx
+
+
+@pytest.fixture
 def mock_dmint_contracts():
     mgr = Mock()
     mgr.get_contracts_simple = Mock(return_value=[])
@@ -99,13 +123,14 @@ def mock_daemon():
 
 @pytest.fixture
 def client(mock_glyph_index, mock_wave_index, mock_swap_index,
-           mock_dmint_contracts, mock_db, mock_daemon):
+           mock_analytics_index, mock_dmint_contracts, mock_db, mock_daemon):
     """Create a TestClient with all mocks wired in."""
     from electrumx.server.rest_api import app, set_indexer
     set_indexer(
         mock_glyph_index, mock_db, mock_daemon,
         wave_index=mock_wave_index,
         swap_index=mock_swap_index,
+        analytics_index=mock_analytics_index,
         dmint_contracts=mock_dmint_contracts,
     )
     return TestClient(app)
@@ -150,7 +175,41 @@ class TestHealthEndpoints:
         assert data['glyph_indexing'] is True
         assert data['wave_indexing'] is True
         assert data['swap_indexing'] is True
+        assert data['analytics_indexing'] is True
         assert data['dmint_contracts'] is True
+
+
+class TestChainAnalyticsEndpoints:
+
+    def test_get_analytics_stats(self, client, mock_analytics_index):
+        resp = client.get('/analytics/stats')
+        assert resp.status_code == 200
+        assert resp.json()['rich_list_entries'] == 2
+        mock_analytics_index.get_stats.assert_called_once()
+
+    def test_get_balance_distribution(self, client, mock_analytics_index):
+        resp = client.get('/analytics/balance-distribution')
+        assert resp.status_code == 200
+        assert resp.json()['10-100'] == 2
+        mock_analytics_index.get_balance_distribution.assert_called_once()
+
+    def test_get_supply_aging(self, client, mock_analytics_index):
+        resp = client.get('/analytics/supply-aging')
+        assert resp.status_code == 200
+        assert resp.json()['<1d'] == 123
+        mock_analytics_index.get_supply_aging.assert_called_once()
+
+    def test_get_top_addresses(self, client, mock_analytics_index):
+        resp = client.get('/analytics/top-addresses?limit=25&offset=5')
+        assert resp.status_code == 200
+        assert resp.json()['rows'][0]['address'] == 'addr1'
+        mock_analytics_index.get_top_addresses.assert_called_once_with(limit=25, offset=5)
+
+    def test_get_movement(self, client, mock_analytics_index):
+        resp = client.get('/analytics/movement?days=14')
+        assert resp.status_code == 200
+        assert resp.json()['days'] == 14
+        mock_analytics_index.get_movement.assert_called_once_with(days=14)
 
 
 # ===========================================================================
