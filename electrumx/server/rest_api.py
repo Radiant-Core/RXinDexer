@@ -141,7 +141,8 @@ def _rate_limit(request: Request):
 @app.middleware("http")
 async def _security_middleware(request: Request, call_next):
     path = request.url.path
-    if path.startswith('/health'):
+    # Public endpoints (no API key required)
+    if path.startswith('/health') or path.startswith('/analytics/'):
         return await call_next(request)
 
     _require_api_key(request.headers.get('x-api-key'))
