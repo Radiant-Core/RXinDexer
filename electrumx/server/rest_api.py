@@ -141,10 +141,19 @@ def _rate_limit(request: Request):
 @app.middleware("http")
 async def _security_middleware(request: Request, call_next):
     path = request.url.path
-    # Public endpoints (no API key required)
-    public_paths = ('/health', '/status', '/analytics/', '/blocks/recent', '/glyphs/stats', 
-                    '/dmint/stats', '/v2/activation-status', '/wave/stats', '/mempool/stats',
-                    '/mempool/info')
+    # Public endpoints (no API key required) - all read-only GET endpoints for explorer
+    # Only require API key for transaction broadcast and detailed queries
+    public_paths = ('/health', '/status', '/analytics/', '/blocks/', '/glyphs/', 
+                    '/dmint/', '/v2/', '/wave/', '/mempool/', '/swap/')
+    
+    # Require API key for these specific operations even if they match public paths
+    protected_operations = ('/broadcast', '/submit')
+    
+    if any(path.startswith(p) for p in protected_operations):
+        _require_api_key(request.headers.get('x-api-key'))
+        _rate_limit(request)
+        return await call_next(request)
+    
     if any(path.startswith(p) for p in public_paths):
         return await call_next(request)
 
