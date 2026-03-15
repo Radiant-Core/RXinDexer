@@ -75,14 +75,14 @@ _require_rest_api_key_prod = os.getenv('REST_REQUIRE_API_KEY_IN_PROD', '1').stri
 if _is_prod and _require_rest_api_key_prod and not os.getenv('REST_API_KEY', '').strip():
     raise RuntimeError('REST_API_KEY must be set in production (or set REST_REQUIRE_API_KEY_IN_PROD=0)')
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins if _allowed_origins else [],
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+# CORS middleware - DISABLED: nginx handles CORS to avoid duplicate headers
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=_allowed_origins if _allowed_origins else [],
+#     allow_credentials=False,
+#     allow_methods=["GET", "POST"],
+#     allow_headers=["*"],
+# )
 
 
 def _require_api_key(x_api_key: Optional[str] = Header(default=None, alias='X-API-Key')):
