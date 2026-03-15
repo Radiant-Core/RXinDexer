@@ -142,7 +142,9 @@ def _rate_limit(request: Request):
 async def _security_middleware(request: Request, call_next):
     path = request.url.path
     # Public endpoints (no API key required)
-    if path.startswith('/health') or path.startswith('/analytics/'):
+    public_paths = ('/health', '/status', '/analytics/', '/blocks/recent', '/glyphs/stats', 
+                    '/dmint/stats', '/v2/activation-status', '/wave/stats', '/mempool/stats')
+    if any(path.startswith(p) for p in public_paths):
         return await call_next(request)
 
     _require_api_key(request.headers.get('x-api-key'))
