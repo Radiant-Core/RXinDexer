@@ -143,7 +143,8 @@ async def _security_middleware(request: Request, call_next):
     path = request.url.path
     # Public endpoints (no API key required)
     public_paths = ('/health', '/status', '/analytics/', '/blocks/recent', '/glyphs/stats', 
-                    '/dmint/stats', '/v2/activation-status', '/wave/stats', '/mempool/stats')
+                    '/dmint/stats', '/v2/activation-status', '/wave/stats', '/mempool/stats',
+                    '/mempool/info')
     if any(path.startswith(p) for p in public_paths):
         return await call_next(request)
 
