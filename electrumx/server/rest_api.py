@@ -152,6 +152,7 @@ async def _security_middleware(request: Request, call_next):
 _glyph_index = None
 _wave_index = None
 _swap_index = None
+_analytics_index = None
 _dmint_contracts = None
 _mempool = None
 _db = None
@@ -160,14 +161,15 @@ _start_time = time.time()
 
 
 def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
-                dmint_contracts=None, mempool=None):
+                analytics_index=None, dmint_contracts=None, mempool=None):
     """Set the indexer references from the main server."""
-    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _dmint_contracts, _mempool
+    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _analytics_index, _dmint_contracts, _mempool
     _glyph_index = glyph_index
     _db = db
     _daemon = daemon
     _wave_index = wave_index
     _swap_index = swap_index
+    _analytics_index = analytics_index
     _dmint_contracts = dmint_contracts
     _mempool = mempool
 
@@ -262,9 +264,63 @@ async def get_status():
 
     status["wave_indexing"] = _wave_index is not None
     status["swap_indexing"] = _swap_index is not None
+    status["analytics_indexing"] = _analytics_index is not None
     status["dmint_contracts"] = _dmint_contracts is not None
 
     return status
+
+
+def _ensure_analytics_index():
+    if not _analytics_index:
+        raise HTTPException(status_code=503, detail="Analytics index not available")
+
+
+@app.get("/analytics/stats", tags=["Analytics"])
+async def get_analytics_stats():
+    _ensure_analytics_index()
+    try:
+        return _analytics_index.get_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/balance-distribution", tags=["Analytics"])
+async def get_balance_distribution():
+    _ensure_analytics_index()
+    try:
+        return _analytics_index.get_balance_distribution()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/supply-aging", tags=["Analytics"])
+async def get_supply_aging():
+    _ensure_analytics_index()
+    try:
+        return _analytics_index.get_supply_aging()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/top-addresses", tags=["Analytics"])
+async def get_top_addresses(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    _ensure_analytics_index()
+    try:
+        return _analytics_index.get_top_addresses(limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/movement", tags=["Analytics"])
+async def get_movement(days: int = Query(default=30, ge=1, le=3650)):
+    _ensure_analytics_index()
+    try:
+        return _analytics_index.get_movement(days=days)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================

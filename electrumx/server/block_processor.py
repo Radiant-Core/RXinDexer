@@ -48,6 +48,13 @@ except ImportError:
     HAS_SWAP_INDEX = False
     SwapIndex = None
 
+try:
+    from electrumx.server.analytics_index import AnalyticsIndex
+    HAS_ANALYTICS_INDEX = True
+except ImportError:
+    HAS_ANALYTICS_INDEX = False
+    AnalyticsIndex = None
+
 # Import subscription manager
 try:
     from electrumx.server.glyph_subscriptions import GlyphSubscriptionManager
@@ -256,6 +263,10 @@ class BlockProcessor:
         if HAS_SWAP_INDEX and getattr(env, 'swap_index', True):
             self.swap_index = SwapIndex(db, env)
             self.logger.info('Swap order indexing initialized')
+        self.analytics_index = None
+        if HAS_ANALYTICS_INDEX and getattr(env, 'analytics_index', True):
+            self.analytics_index = AnalyticsIndex(db, env)
+            self.logger.info('Chain analytics indexing initialized')
 
         # Subscription manager for real-time notifications
         self.subscriptions = None
@@ -318,6 +329,7 @@ class BlockProcessor:
                 glyph_index=self.glyph_index,
                 wave_index=self.wave_index,
                 swap_index=self.swap_index,
+                analytics_index=self.analytics_index,
                 dmint_contracts=self.dmint_contracts,
             )
             height -= 1
@@ -398,6 +410,7 @@ class BlockProcessor:
                          glyph_index=self.glyph_index,
                          wave_index=self.wave_index,
                          swap_index=self.swap_index,
+                         analytics_index=self.analytics_index,
                          dmint_contracts=self.dmint_contracts)
         self.next_cache_check = time.monotonic() + 30
 
@@ -493,6 +506,8 @@ class BlockProcessor:
         # Use local vars for speed in the loops
         undo_info = []
         ref_loc_undo = {}
+        analytics_spends = []
+        analytics_adds = []
         tx_num = self.tx_count
         script_hashX = self.coin.hashX_from_script
         script_codeScriptHash = self.coin.codeScriptHash_from_script
@@ -538,6 +553,13 @@ class BlockProcessor:
                 cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
                 undo_info_append(cache_value)
                 append_hashX(cache_value[:HASHX_LEN])
+                if self.analytics_index:
+                    analytics_spends.append((
+                        txin.prev_hash,
+                        txin.prev_idx,
+                        cache_value[:HASHX_LEN],
+                        unpack_le_uint64(cache_value[-8:])[0],
+                    ))
                 # Collect debit: hashX(11) + codeScriptHash(32) + tx_numb(5) + value(8)
                 if spent_refs:
                     spent_hashX = cache_value[:HASHX_LEN]
@@ -557,6 +579,8 @@ class BlockProcessor:
                 append_hashX(hashX)
                 cache_key = tx_hash + to_le_uint32(idx)
                 put_utxo(cache_key, hashX + codeScriptHash + tx_numb + to_le_uint64(txout.value))
+                if self.analytics_index:
+                    analytics_adds.append((tx_hash, idx, hashX, txout.value, zero_refs))
 
                 all_refs, normal_refs, singleton_refs = Script.get_push_input_refs(txout.pk_script)
                 all_refs_dedup = Script.dedup_refs(all_refs)
@@ -638,6 +662,9 @@ class BlockProcessor:
                     )
 
             tx_num += 1
+
+        if self.analytics_index and (analytics_spends or analytics_adds):
+            self.analytics_index.process_block(self.height + 1, analytics_spends, analytics_adds)
 
         self.db.history.add_unflushed(hashXs_by_tx, self.tx_count)
 
@@ -931,6 +958,8 @@ class BlockProcessor:
         self.height = self.db.db_height
         self.tip = self.db.db_tip
         self.tx_count = self.db.db_tx_count
+        if self.analytics_index and self.height >= 0:
+            self.analytics_index.backfill(self.height)
 
     # --- External API
 

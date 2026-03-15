@@ -43,9 +43,15 @@ class FakeEnv:
     glyph_index = True
     wave_index = True
     swap_index = True
+    analytics_index = True
     wave_hot_names = 100
     wave_genesis_ref = None
     reorg_limit = 10
+    coin = type("FakeCoin", (), {
+        "VALUE_PER_COIN": 100_000_000,
+        "P2PKH_VERBYTE": bytes.fromhex("00"),
+        "P2SH_VERBYTES": [bytes.fromhex("05")],
+    })()
 
 
 def test_glyph_undo_backup_roundtrip():
@@ -153,4 +159,36 @@ def test_swap_undo_backup_roundtrip():
     idx.backup(batch2, height)
 
     assert db.utxo_db.get(order_key) == b"old_order"
+    assert undo_key not in db.utxo_db._store
+
+
+def test_analytics_undo_backup_roundtrip():
+    from electrumx.server.analytics_index import AnalyticsDBKeys, AnalyticsIndex
+
+    db = FakeDB()
+    env = FakeEnv()
+    idx = AnalyticsIndex(db, env)
+
+    height = 400
+    hashX = b"\x88" * 11
+    balance_key = AnalyticsDBKeys.BALANCE + hashX
+    db.utxo_db._store[balance_key] = (25 * env.coin.VALUE_PER_COIN).to_bytes(8, "little")
+
+    idx.process_block(
+        height,
+        spends=[],
+        adds=[(b"\x99" * 32, 0, hashX, 10 * env.coin.VALUE_PER_COIN, "analytics-addr")],
+    )
+
+    batch = FakeBatch(db.utxo_db._store)
+    idx.flush(batch)
+
+    undo_key = AnalyticsDBKeys.UNDO + height.to_bytes(4, "big")
+    assert undo_key in db.utxo_db._store
+    assert int.from_bytes(db.utxo_db.get(balance_key), "little") == 35 * env.coin.VALUE_PER_COIN
+
+    batch2 = FakeBatch(db.utxo_db._store)
+    idx.backup(batch2, height)
+
+    assert int.from_bytes(db.utxo_db.get(balance_key), "little") == 25 * env.coin.VALUE_PER_COIN
     assert undo_key not in db.utxo_db._store
