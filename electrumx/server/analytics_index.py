@@ -226,16 +226,16 @@ class AnalyticsIndex:
 
     def _bucket_name(self, value_sats: int) -> str:
         coins = value_sats / self.coin.VALUE_PER_COIN
-        for threshold, label in BALANCE_BUCKETS:
+        for threshold, label in reversed(BALANCE_BUCKETS):
             if coins >= threshold:
                 return label
-        return BALANCE_BUCKETS[-1][1]
+        return BALANCE_BUCKETS[0][1]
 
     def _age_bucket_name(self, age_days: int) -> str:
-        for threshold, label in AGE_BUCKETS:
+        for threshold, label in reversed(AGE_BUCKETS):
             if age_days >= threshold:
                 return label
-        return AGE_BUCKETS[-1][1]
+        return AGE_BUCKETS[0][1]
 
     def _estimate_block_day(self, height: int) -> int:
         return max(0, height // 144)
@@ -423,7 +423,7 @@ class AnalyticsIndex:
         return {'days': days, 'series': items}
 
     def get_stats(self) -> Dict[str, Any]:
-        top = self.get_top_addresses(limit=1)
+        top = {'total': sum(1 for _ in self.db.utxo_db.iterator(prefix=AnalyticsDBKeys.BALANCE, include_value=False))}
         return {
             'enabled': self.enabled,
             'last_processed_height': self._get_summary(AnalyticsDBKeys.SUMMARY + b'last_processed_height', 0),
