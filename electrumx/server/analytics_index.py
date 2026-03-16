@@ -423,7 +423,7 @@ class AnalyticsIndex:
         return {'days': days, 'series': items}
 
     def get_stats(self) -> Dict[str, Any]:
-        top = {'total': sum(1 for _ in self.db.utxo_db.iterator(prefix=AnalyticsDBKeys.BALANCE, include_value=False))}
+        top = {'total': sum(1 for _ in self.db.utxo_db.iterator(prefix=AnalyticsDBKeys.BALANCE))}
         return {
             'enabled': self.enabled,
             'last_processed_height': self._get_summary(AnalyticsDBKeys.SUMMARY + b'last_processed_height', 0),
