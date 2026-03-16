@@ -53,6 +53,23 @@ from dataclasses import dataclass, field
 from fastapi import FastAPI, HTTPException, Query, Path, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import time as _time
+
+class _TTLCache:
+    """Simple TTL cache for expensive endpoint responses."""
+    def __init__(self):
+        self._store = {}
+
+    def get(self, key, ttl=30):
+        entry = self._store.get(key)
+        if entry and _time.monotonic() - entry[1] < ttl:
+            return entry[0]
+        return None
+
+    def put(self, key, value):
+        self._store[key] = (value, _time.monotonic())
+
+_cache = _TTLCache()
 
 # App instance
 app = FastAPI(
@@ -289,51 +306,58 @@ def _ensure_analytics_index():
 
 
 @app.get("/analytics/stats", tags=["Analytics"])
-async def get_analytics_stats():
+def get_analytics_stats():
     _ensure_analytics_index()
-    try:
-        return _analytics_index.get_stats()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    c = _cache.get('a_stats', 30)
+    if c: return c
+    r = _analytics_index.get_stats()
+    _cache.put('a_stats', r)
+    return r
 
 
 @app.get("/analytics/balance-distribution", tags=["Analytics"])
-async def get_balance_distribution():
+def get_balance_distribution():
     _ensure_analytics_index()
-    try:
-        return _analytics_index.get_balance_distribution()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    c = _cache.get('a_bdist', 30)
+    if c: return c
+    r = _analytics_index.get_balance_distribution()
+    _cache.put('a_bdist', r)
+    return r
 
 
 @app.get("/analytics/supply-aging", tags=["Analytics"])
-async def get_supply_aging():
+def get_supply_aging():
     _ensure_analytics_index()
-    try:
-        return _analytics_index.get_supply_aging()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    c = _cache.get('a_aging', 30)
+    if c: return c
+    r = _analytics_index.get_supply_aging()
+    _cache.put('a_aging', r)
+    return r
 
 
 @app.get("/analytics/top-addresses", tags=["Analytics"])
-async def get_top_addresses(
+def get_top_addresses(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
     _ensure_analytics_index()
-    try:
-        return _analytics_index.get_top_addresses(limit=limit, offset=offset)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    ck = f'a_top_{limit}_{offset}'
+    c = _cache.get(ck, 30)
+    if c: return c
+    r = _analytics_index.get_top_addresses(limit=limit, offset=offset)
+    _cache.put(ck, r)
+    return r
 
 
 @app.get("/analytics/movement", tags=["Analytics"])
-async def get_movement(days: int = Query(default=30, ge=1, le=3650)):
+def get_movement(days: int = Query(default=30, ge=1, le=3650)):
     _ensure_analytics_index()
-    try:
-        return _analytics_index.get_movement(days=days)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    ck = f'a_move_{days}'
+    c = _cache.get(ck, 30)
+    if c: return c
+    r = _analytics_index.get_movement(days=days)
+    _cache.put(ck, r)
+    return r
 
 
 # =============================================================================
@@ -442,14 +466,14 @@ async def search_glyphs(
 
 
 @app.get("/glyphs/stats", tags=["Glyphs"])
-async def get_glyph_stats():
+def get_glyph_stats():
     """Get Glyph token indexing statistics (counts by type and version)."""
     _ensure_glyph_index()
-
-    try:
-        return _glyph_index.get_stats()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    c = _cache.get('g_stats', 60)
+    if c: return c
+    r = _glyph_index.get_stats()
+    _cache.put('g_stats', r)
+    return r
 
 
 @app.get("/glyphs/by-type/{type_id}", tags=["Glyphs"])
