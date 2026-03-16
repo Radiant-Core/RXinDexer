@@ -415,11 +415,16 @@ class AnalyticsIndex:
     def get_movement(self, days: int = 30) -> Dict[str, Any]:
         last_height = self._get_summary(AnalyticsDBKeys.SUMMARY + b'last_processed_height', 0)
         current_day = self._estimate_block_day(last_height)
-        items = []
         start = max(0, current_day - days + 1)
-        for day in range(start, current_day + 1):
-            daily = self._get_daily(day)
-            items.append({'day': day, **daily})
+        pfx = AnalyticsDBKeys.DAILY
+        plen = len(pfx)
+        dd = {}
+        for k, v in self.db.utxo_db.iterator(prefix=pfx):
+            d = struct.unpack('>I', k[plen:plen+4])[0]
+            if start <= d <= current_day:
+                dd[d] = ast.literal_eval(v.decode())
+        empty = {'coins_moved': 0, 'active_addresses': 0, 'new_addresses': 0}
+        items = [{'day': d, **dd.get(d, empty)} for d in range(start, current_day + 1)]
         return {'days': days, 'series': items}
 
     def get_stats(self) -> Dict[str, Any]:
