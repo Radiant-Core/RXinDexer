@@ -1520,6 +1520,7 @@ class GlyphIndex:
                 'daa_mode': token.daa_mode,
                 'daa_mode_name': self._daa_mode_name(token.daa_mode),
                 'mint_count': token.mint_count,
+                'num_contracts': token.num_contracts,
             }
         
         # Include NFT attributes
