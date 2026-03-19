@@ -136,7 +136,12 @@ class DMintContractsManager:
             'percent_mined': 0,
             'active': True,
             'deploy_height': deploy_height,
-            'version': 2  # v2 contract version
+            'daa_mode': 0,
+            'daa_mode_name': 'Fixed',
+            'icon_type': None,
+            'icon_data': None,
+            'total_supply': 0,
+            'mined_supply': 0,
         }
         
         # Insert in order by deploy_height
@@ -159,8 +164,7 @@ class DMintContractsManager:
         for c in self.contracts:
             if c['ref'] == ref:
                 for key, value in kwargs.items():
-                    if key in c:
-                        c[key] = value
+                    c[key] = value
                 return True
         return False
     
@@ -197,11 +201,26 @@ class DMintContractsManager:
             existing = next((c for c in self.contracts if c['ref'] == ref), None)
             
             if existing:
-                # Update existing
+                # Update existing contract with latest data
                 changed = False
-                for key in ['difficulty', 'reward', 'percent_mined']:
-                    if key in token and token[key] != existing.get(key):
-                        existing[key] = token[key]
+                dmint = token.get('dmint', {})
+                embed = token.get('embed')
+                sync_fields = {
+                    'difficulty': dmint.get('current_difficulty', existing.get('difficulty', 0)),
+                    'reward': dmint.get('reward', existing.get('reward', 0)),
+                    'percent_mined': token.get('percent_mined', existing.get('percent_mined', 0)),
+                    'outputs': dmint.get('num_contracts') or existing.get('outputs', 1),
+                    'daa_mode': dmint.get('daa_mode', existing.get('daa_mode', 0)),
+                    'daa_mode_name': dmint.get('daa_mode_name', existing.get('daa_mode_name', 'Fixed')),
+                    'total_supply': token.get('total_supply', existing.get('total_supply', 0)),
+                    'mined_supply': token.get('mined_supply', existing.get('mined_supply', 0)),
+                }
+                if embed:
+                    sync_fields['icon_type'] = embed.get('type')
+                    sync_fields['icon_data'] = embed.get('data')
+                for key, value in sync_fields.items():
+                    if value and value != existing.get(key):
+                        existing[key] = value
                         changed = True
                 
                 # Check if fully mined
@@ -214,18 +233,36 @@ class DMintContractsManager:
             else:
                 # Add new contract
                 # Need to get outputs count from contract data
-                outputs = token.get('dmint', {}).get('outputs', 1)
+                outputs = token.get('dmint', {}).get('num_contracts', 1) or 1
                 
-                if self.add_contract(
+                dmint = token.get('dmint', {})
+                # Extract icon data if available
+                embed = token.get('embed')
+                icon_type = embed.get('type') if embed else None
+                icon_data = embed.get('data') if embed else None
+                
+                added = self.add_contract(
                     ref=ref,
                     outputs=outputs,
                     ticker=token.get('ticker'),
                     name=token.get('name'),
-                    algorithm=token.get('dmint', {}).get('algorithm', self.ALGO_SHA256D),
-                    difficulty=token.get('dmint', {}).get('current_difficulty', 0),
-                    reward=token.get('dmint', {}).get('reward', 0),
-                    deploy_height=token.get('deploy_height', 0)
-                ):
+                    algorithm=dmint.get('algorithm', self.ALGO_SHA256D),
+                    difficulty=dmint.get('current_difficulty', 0),
+                    reward=dmint.get('reward', 0),
+                    deploy_height=token.get('deploy_height', 0),
+                )
+                if added:
+                    # Set extra fields on the newly added contract
+                    self.update_contract(
+                        ref,
+                        daa_mode=dmint.get('daa_mode', 0),
+                        daa_mode_name=dmint.get('daa_mode_name', 'Fixed'),
+                        icon_type=icon_type,
+                        icon_data=icon_data,
+                        total_supply=token.get('total_supply', 0),
+                        mined_supply=token.get('mined_supply', 0),
+                        percent_mined=token.get('percent_mined', 0),
+                    )
                     updated += 1
         
         if updated > 0:
