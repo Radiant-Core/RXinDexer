@@ -140,6 +140,7 @@ class DMintContractsManager:
             'daa_mode_name': 'Fixed',
             'icon_type': None,
             'icon_data': None,
+            'icon_url': None,
             'total_supply': 0,
             'mined_supply': 0,
         }
@@ -215,9 +216,13 @@ class DMintContractsManager:
                     'total_supply': token.get('total_supply', existing.get('total_supply', 0)),
                     'mined_supply': token.get('mined_supply', existing.get('mined_supply', 0)),
                 }
+                remote = token.get('remote')
                 if embed:
                     sync_fields['icon_type'] = embed.get('type')
                     sync_fields['icon_data'] = embed.get('data')
+                elif remote:
+                    sync_fields['icon_type'] = remote.get('type')
+                    sync_fields['icon_url'] = remote.get('url')
                 for key, value in sync_fields.items():
                     if value and value != existing.get(key):
                         existing[key] = value
@@ -238,8 +243,10 @@ class DMintContractsManager:
                 dmint = token.get('dmint', {})
                 # Extract icon data if available
                 embed = token.get('embed')
-                icon_type = embed.get('type') if embed else None
+                remote = token.get('remote')
+                icon_type = embed.get('type') if embed else (remote.get('type') if remote else None)
                 icon_data = embed.get('data') if embed else None
+                icon_url = remote.get('url') if remote else None
                 
                 added = self.add_contract(
                     ref=ref,
@@ -259,6 +266,7 @@ class DMintContractsManager:
                         daa_mode_name=dmint.get('daa_mode_name', 'Fixed'),
                         icon_type=icon_type,
                         icon_data=icon_data,
+                        icon_url=icon_url,
                         total_supply=token.get('total_supply', 0),
                         mined_supply=token.get('mined_supply', 0),
                         percent_mined=token.get('percent_mined', 0),
