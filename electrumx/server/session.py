@@ -1175,7 +1175,14 @@ class ElectrumX(SessionBase):
         '''
         # Note history is ordered and mempool unordered in electrum-server
         # For mempool, height is -1 if it has unconfirmed inputs, otherwise 0
-        db_history, cost = await self.session_mgr.limited_history(hashX)
+        try:
+            db_history, cost = await self.session_mgr.limited_history(hashX)
+        except RPCError:
+            # History too large for send limit, but we only need it for
+            # status hash computation (never sent raw to client).
+            # Fetch unlimited history directly from DB.
+            db_history = await self.db.limited_history(hashX, limit=None)
+            cost = 0.1 + len(db_history) * 0.001
         mempool = await self.mempool.transaction_summaries(hashX)
 
         status = ''.join(f'{hash_to_hex_str(tx_hash)}:'
