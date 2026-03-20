@@ -384,8 +384,45 @@ class AnalyticsIndex:
         self._set_summary(height, b'last_processed_height', height)
         self.logger.info('Chain analytics backfill prepared')
 
+    def _recompute_balance_distribution(self) -> Dict[str, int]:
+        """Recompute balance distribution from actual per-address balances."""
+        distribution = {label: 0 for _, label in BALANCE_BUCKETS}
+        prefix = AnalyticsDBKeys.BALANCE
+        count = 0
+        for key, raw in self.db.utxo_db.iterator(prefix=prefix):
+            amount = struct.unpack('<Q', raw)[0]
+            if amount <= 0:
+                continue
+            bucket = self._bucket_name(amount)
+            distribution[bucket] = distribution.get(bucket, 0) + 1
+            count += 1
+        self.logger.info(
+            'Balance distribution recomputed from %d addresses: %s',
+            count, distribution
+        )
+        return distribution
+
     def get_balance_distribution(self) -> Dict[str, Any]:
-        return self._get_summary(AnalyticsDBKeys.SUMMARY + b'balance_distribution', {label: 0 for _, label in BALANCE_BUCKETS})
+        dist = self._get_summary(
+            AnalyticsDBKeys.SUMMARY + b'balance_distribution',
+            {label: 0 for _, label in BALANCE_BUCKETS},
+        )
+        # Detect legacy '1M+' bucket and auto-migrate
+        if dist.get('1M+', 0) > 0:
+            self.logger.info(
+                'Legacy 1M+ bucket detected (%d entries) — recomputing',
+                dist['1M+'],
+            )
+            dist = self._recompute_balance_distribution()
+            height = self._get_summary(
+                AnalyticsDBKeys.SUMMARY + b'last_processed_height', 0,
+            )
+            self._set_summary(height, b'balance_distribution', dist)
+            # Persist immediately so subsequent calls are fast
+            key = AnalyticsDBKeys.SUMMARY + b'balance_distribution'
+            self.db.utxo_db.put(key, repr(dist).encode())
+            self.summary_cache.pop(key, None)
+        return dist
 
     def get_supply_aging(self) -> Dict[str, Any]:
         return self._get_summary(AnalyticsDBKeys.SUMMARY + b'age_distribution', {label: 0 for _, label in AGE_BUCKETS})
