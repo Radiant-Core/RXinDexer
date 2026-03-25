@@ -384,6 +384,24 @@ class TestDMintEndpoints:
         resp = client.get(f'/dmint/contracts/{ref}')
         assert resp.status_code == 404
 
+    def test_get_single_contract_icon_debug(self, client, mock_dmint_contracts):
+        ref = _make_ref()
+        mock_dmint_contracts.get_contract.return_value = {
+            'ref': ref,
+            'icon_type': 'image/png',
+            'icon_url': 'https://example.com/icon.png',
+            'icon_ref': 'ipfs://bafybeigdyrzt',
+            'icon_data': 'aabbccdd',
+        }
+        resp = client.get(f'/dmint/contracts/{ref}/icon-debug')
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data['ref'] == ref
+        assert data['icon_type'] == 'image/png'
+        assert data['icon_url'] == 'https://example.com/icon.png'
+        assert data['icon_ref'] == 'ipfs://bafybeigdyrzt'
+        assert data['icon_data'] == 'aabbccdd'
+
     def test_get_algorithms(self, client):
         resp = client.get('/dmint/algorithms')
         assert resp.status_code == 200

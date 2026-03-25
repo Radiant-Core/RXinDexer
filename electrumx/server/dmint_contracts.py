@@ -36,6 +36,20 @@ class DMintContractsManager:
     ALGO_K12 = 0x02
     ALGO_ARGON2ID_LIGHT = 0x03
     ALGO_RANDOMX_LIGHT = 0x04
+    ALGORITHM_NAMES = {
+        ALGO_SHA256D: "sha256d",
+        ALGO_BLAKE3: "blake3",
+        ALGO_K12: "k12",
+        ALGO_ARGON2ID_LIGHT: "argon2id-light",
+        ALGO_RANDOMX_LIGHT: "randomx-light",
+    }
+    DAA_MODE_NAMES = {
+        0: "fixed",
+        1: "epoch",
+        2: "asert",
+        3: "lwma",
+        4: "schedule",
+    }
     
     def __init__(self, data_dir: str, glyph_index=None):
         self.logger = util.class_logger(__name__, self.__class__.__name__)
@@ -141,6 +155,7 @@ class DMintContractsManager:
             'icon_type': None,
             'icon_data': None,
             'icon_url': None,
+            'icon_ref': None,
             'total_supply': 0,
             'mined_supply': 0,
         }
@@ -172,6 +187,45 @@ class DMintContractsManager:
     def deactivate_contract(self, ref: str) -> bool:
         """Mark a contract as inactive (100% mined)."""
         return self.update_contract(ref, active=False, percent_mined=100)
+
+    @staticmethod
+    def _normalize_icon_data(value: Any) -> Optional[str]:
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).hex()
+        if isinstance(value, str) and value:
+            return value
+        return None
+
+    def _extract_icon_fields(self, token: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        embed = token.get('embed') if isinstance(token.get('embed'), dict) else None
+        remote = token.get('remote') if isinstance(token.get('remote'), dict) else None
+
+        icon_type = None
+        icon_data = None
+        icon_url = None
+
+        if embed:
+            icon_type = embed.get('type') or embed.get('t')
+            icon_data = self._normalize_icon_data(embed.get('data') or embed.get('b'))
+
+        if remote:
+            icon_type = icon_type or remote.get('type') or remote.get('t')
+            icon_url = remote.get('url') or remote.get('u')
+
+        token_icon_type = token.get('icon_type')
+        if not icon_type and isinstance(token_icon_type, str):
+            icon_type = token_icon_type
+
+        token_icon_ref = token.get('icon_ref')
+        if not icon_url and isinstance(token_icon_ref, str) and token_icon_ref and token_icon_ref != 'embedded':
+            icon_url = token_icon_ref
+
+        return {
+            'icon_type': icon_type,
+            'icon_data': icon_data,
+            'icon_url': icon_url,
+            'icon_ref': token_icon_ref if isinstance(token_icon_ref, str) else None,
+        }
     
     def sync_from_index(self, height: int) -> int:
         """
@@ -205,7 +259,7 @@ class DMintContractsManager:
                 # Update existing contract with latest data
                 changed = False
                 dmint = token.get('dmint', {})
-                embed = token.get('embed')
+                icon_fields = self._extract_icon_fields(token)
                 sync_fields = {
                     'difficulty': dmint.get('current_difficulty', existing.get('difficulty', 0)),
                     'reward': dmint.get('reward', existing.get('reward', 0)),
@@ -215,14 +269,11 @@ class DMintContractsManager:
                     'daa_mode_name': dmint.get('daa_mode_name', existing.get('daa_mode_name', 'Fixed')),
                     'total_supply': token.get('total_supply', existing.get('total_supply', 0)),
                     'mined_supply': token.get('mined_supply', existing.get('mined_supply', 0)),
+                    'icon_type': icon_fields.get('icon_type'),
+                    'icon_data': icon_fields.get('icon_data'),
+                    'icon_url': icon_fields.get('icon_url'),
+                    'icon_ref': icon_fields.get('icon_ref'),
                 }
-                remote = token.get('remote')
-                if embed:
-                    sync_fields['icon_type'] = embed.get('type')
-                    sync_fields['icon_data'] = embed.get('data')
-                elif remote:
-                    sync_fields['icon_type'] = remote.get('type')
-                    sync_fields['icon_url'] = remote.get('url')
                 for key, value in sync_fields.items():
                     if value and value != existing.get(key):
                         existing[key] = value
@@ -241,12 +292,7 @@ class DMintContractsManager:
                 outputs = token.get('dmint', {}).get('num_contracts', 1) or 1
                 
                 dmint = token.get('dmint', {})
-                # Extract icon data if available
-                embed = token.get('embed')
-                remote = token.get('remote')
-                icon_type = embed.get('type') if embed else (remote.get('type') if remote else None)
-                icon_data = embed.get('data') if embed else None
-                icon_url = remote.get('url') if remote else None
+                icon_fields = self._extract_icon_fields(token)
                 
                 added = self.add_contract(
                     ref=ref,
@@ -264,9 +310,10 @@ class DMintContractsManager:
                         ref,
                         daa_mode=dmint.get('daa_mode', 0),
                         daa_mode_name=dmint.get('daa_mode_name', 'Fixed'),
-                        icon_type=icon_type,
-                        icon_data=icon_data,
-                        icon_url=icon_url,
+                        icon_type=icon_fields.get('icon_type'),
+                        icon_data=icon_fields.get('icon_data'),
+                        icon_url=icon_fields.get('icon_url'),
+                        icon_ref=icon_fields.get('icon_ref'),
                         total_supply=token.get('total_supply', 0),
                         mined_supply=token.get('mined_supply', 0),
                         percent_mined=token.get('percent_mined', 0),
@@ -300,6 +347,155 @@ class DMintContractsManager:
             'updated_height': self.last_updated_height,
             'count': len(contracts),
             'contracts': contracts
+        }
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _to_token_summary_item(self, contract: Dict[str, Any]) -> Dict[str, Any]:
+        total_contracts = max(self._to_int(contract.get('outputs'), 0), 0)
+        total_supply = max(self._to_int(contract.get('total_supply'), 0), 0)
+        mined_supply = max(self._to_int(contract.get('mined_supply'), 0), 0)
+        remaining_supply = max(total_supply - mined_supply, 0)
+
+        percent_mined = self._to_float(contract.get('percent_mined'), 0.0)
+        if total_supply > 0:
+            percent_mined = (mined_supply / total_supply) * 100.0
+
+        active = bool(contract.get('active', True))
+        fully_mined = (not active) or percent_mined >= 100.0
+        mineable_contracts_remaining = 0 if fully_mined else None
+
+        algorithm_id = self._to_int(contract.get('algorithm'), self.ALGO_SHA256D)
+        daa_mode_id = self._to_int(contract.get('daa_mode'), 0)
+
+        return {
+            'token_ref': contract.get('ref'),
+            'ticker': contract.get('ticker') or '???',
+            'name': contract.get('name') or '',
+            'algorithm': {
+                'id': algorithm_id,
+                'name': self.ALGORITHM_NAMES.get(algorithm_id, f'unknown({algorithm_id})'),
+            },
+            'daa_mode': {
+                'id': daa_mode_id,
+                'name': self.DAA_MODE_NAMES.get(daa_mode_id, contract.get('daa_mode_name') or f'unknown({daa_mode_id})'),
+            },
+            'contracts': {
+                'total': total_contracts,
+                'mineable_remaining': mineable_contracts_remaining,
+                'fully_mined': total_contracts if fully_mined else None,
+            },
+            'supply': {
+                'total': str(total_supply),
+                'minted': str(mined_supply),
+                'remaining': str(remaining_supply),
+                'unit': 'photons',
+            },
+            'reward_per_mint': str(max(self._to_int(contract.get('reward'), 0), 0)),
+            'target': str(max(self._to_int(contract.get('difficulty'), 0), 0)),
+            'percent_mined': round(percent_mined, 8),
+            'deploy_height': max(self._to_int(contract.get('deploy_height'), 0), 0),
+            'active': active,
+            'is_fully_mined': fully_mined,
+            'icon': {
+                'type': contract.get('icon_type') or None,
+                'url': contract.get('icon_url') or contract.get('icon_ref') or None,
+                'data_hex': contract.get('icon_data') or None,
+            },
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+
+    def get_contracts_v2(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Get contracts using the v2 token summary schema."""
+        params = params or {}
+        if not isinstance(params, dict):
+            raise ValueError('params must be an object')
+
+        version = self._to_int(params.get('version', 2), 2)
+        if version != 2:
+            raise ValueError('unsupported version')
+
+        view = params.get('view', 'token_summary')
+        if view != 'token_summary':
+            raise ValueError('unsupported view')
+
+        filters = params.get('filters') or {}
+        sort = params.get('sort') or {}
+        pagination = params.get('pagination') or {}
+
+        status = (filters.get('status') or 'mineable').lower()
+        algorithm_ids = filters.get('algorithm_ids') or []
+        algorithm_ids = {
+            self._to_int(algo)
+            for algo in algorithm_ids
+            if isinstance(algo, (int, float, str))
+        }
+
+        items = [self._to_token_summary_item(c) for c in self.contracts]
+
+        if status == 'mineable':
+            items = [i for i in items if not i.get('is_fully_mined')]
+        elif status == 'finished':
+            items = [i for i in items if i.get('is_fully_mined')]
+        elif status != 'all':
+            raise ValueError('invalid status filter')
+
+        if algorithm_ids:
+            items = [
+                i for i in items
+                if self._to_int(i.get('algorithm', {}).get('id')) in algorithm_ids
+            ]
+
+        sort_field = sort.get('field', 'deploy_height')
+        sort_dir = (sort.get('dir') or 'desc').lower()
+        reverse = sort_dir != 'asc'
+
+        def sort_key(item: Dict[str, Any]):
+            if sort_field == 'ticker':
+                return (item.get('ticker') or '').lower()
+            if sort_field == 'reward_per_mint':
+                return self._to_int(item.get('reward_per_mint'))
+            if sort_field == 'percent_mined':
+                return self._to_float(item.get('percent_mined'))
+            if sort_field == 'mineable_contracts_remaining':
+                value = item.get('contracts', {}).get('mineable_remaining')
+                return self._to_int(value, -1)
+            if sort_field == 'total_contracts':
+                return self._to_int(item.get('contracts', {}).get('total'))
+            return self._to_int(item.get('deploy_height'))
+
+        items.sort(key=sort_key, reverse=reverse)
+
+        limit = max(1, min(self._to_int(pagination.get('limit'), 1000), 5000))
+        offset = max(0, self._to_int(pagination.get('cursor'), 0))
+        paged_items = items[offset:offset + limit]
+        next_offset = offset + len(paged_items)
+        cursor_next = str(next_offset) if next_offset < len(items) else None
+
+        return {
+            'version': 2,
+            'view': 'token_summary',
+            'schema': 'dmint.get_contracts.v2',
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'network': 'mainnet',
+            'indexed_height': self.last_updated_height,
+            'reorg_safe_depth': 0,
+            'cursor_next': cursor_next,
+            'count': len(paged_items),
+            'total_estimate': len(items),
+            'items': paged_items,
         }
     
     def get_contract(self, ref: str) -> Optional[Dict[str, Any]]:
