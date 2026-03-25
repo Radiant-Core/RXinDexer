@@ -235,33 +235,65 @@ Get full CBOR metadata for a token.
 
 Get list of mineable dMint contracts.
 
-**Parameters:**
+**Parameters (v2):**
 | Name | Type | Description |
 |------|------|-------------|
-| `format` | string | `simple` for [[ref, outputs], ...] or `extended` for full details |
+| `request` | object | Request envelope with `version=2`, `view="token_summary"`, optional `filters`, `sort`, and `pagination` |
 
-**Returns (simple):**
+**Request (v2) example:**
 ```json
-[
-  ["abc123...def0123456789...", 100],
-  ["xyz789...ghi0987654321...", 50]
-]
-```
-
-**Returns (extended):**
-```json
-[
-  {
-    "ref": "abc123...def_0",
-    "name": "Mining Token",
-    "ticker": "MINE",
-    "algorithm": 1,
-    "difficulty": 12345678,
-    "reward": 50000000,
-    "remaining_supply": 19500000
+{
+  "version": 2,
+  "view": "token_summary",
+  "filters": {
+    "status": "mineable",
+    "algorithm_ids": [1, 2]
+  },
+  "sort": {
+    "field": "deploy_height",
+    "dir": "desc"
+  },
+  "pagination": {
+    "limit": 1000
   }
-]
+}
 ```
+
+**Returns (v2 token_summary):**
+```json
+{
+  "version": 2,
+  "view": "token_summary",
+  "schema": "dmint.get_contracts.v2",
+  "generated_at": "2026-03-23T00:00:00+00:00",
+  "indexed_height": 123456,
+  "cursor_next": null,
+  "count": 1,
+  "total_estimate": 1,
+  "items": [
+    {
+      "token_ref": "abc123...def_0",
+      "ticker": "MINE",
+      "name": "Mining Token",
+      "algorithm": { "id": 1, "name": "blake3" },
+      "daa_mode": { "id": 0, "name": "fixed" },
+      "contracts": { "total": 100, "mineable_remaining": null, "fully_mined": null },
+      "supply": { "total": "21000000", "minted": "1500000", "remaining": "19500000", "unit": "photons" },
+      "reward_per_mint": "50",
+      "target": "12345678",
+      "percent_mined": 7.14285714,
+      "deploy_height": 123000,
+      "active": true,
+      "is_fully_mined": false,
+      "icon": { "type": null, "url": null, "data_hex": null }
+    }
+  ]
+}
+```
+
+**Legacy compatibility:**
+- Passing string param `"simple"` returns `[[ref, outputs], ...]`.
+- Passing string param `"extended"` returns legacy version 1 extended response.
 
 ---
 
@@ -421,7 +453,7 @@ RXinDexer also provides a FastAPI-based REST API for HTTP access. Enable it with
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/dmint/contracts` | All active dMint contracts (`format=simple\|extended`) |
+| GET | `/dmint/contracts` | Contracts endpoint (v2 via `version=2`; legacy via `format=simple\|extended`) |
 | GET | `/dmint/contracts/{ref}` | Single contract detail |
 | GET | `/dmint/algorithms` | Supported algorithm and DAA mode definitions |
 | GET | `/dmint/by-algorithm/{id}` | Contracts filtered by algorithm (0=SHA256D, 1=BLAKE3, 2=K12) |

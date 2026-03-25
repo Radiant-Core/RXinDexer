@@ -452,25 +452,35 @@ class GlyphAPIMixin:
     # dMint Contracts API (for Glyph Miner)
     # ========================================================================
 
-    async def dmint_get_contracts(self, format: str = 'simple'):
+    async def dmint_get_contracts(self, request: Optional[Dict[str, Any]] = None):
         """
         Get list of mineable dMint contracts.
         
         Args:
-            format: 'simple' for [[ref, outputs], ...] or 'extended' for full details
+            request: v2 request object (preferred)
             
         Returns:
-            List of contracts in requested format
+            v2 response object (or legacy format when explicitly requested)
         """
         self.bump_cost(1.0)
         
         if not hasattr(self, 'dmint_contracts') or not self.dmint_contracts:
             return {'error': 'dMint contracts manager not initialized'}
-        
-        if format == 'extended':
-            return self.dmint_contracts.get_contracts_extended(active_only=True)
-        else:
-            return self.dmint_contracts.get_contracts_simple()
+
+        try:
+            if isinstance(request, dict):
+                return self.dmint_contracts.get_contracts_v2(request)
+
+            if request == 'extended':
+                return self.dmint_contracts.get_contracts_extended(active_only=True)
+            if request == 'simple' or request is None:
+                return self.dmint_contracts.get_contracts_simple()
+
+            return {'error': 'invalid dmint.get_contracts request'}
+        except ValueError as e:
+            return {'error': str(e)}
+        except Exception as e:
+            return {'error': str(e)}
 
     async def dmint_get_contract(self, ref: str):
         """

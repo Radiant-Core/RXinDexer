@@ -406,6 +406,29 @@ async def get_block(height: int = Path(..., ge=0)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/dmint/contracts/{ref}/icon-debug", tags=["dMint"])
+async def get_dmint_contract_icon_debug(ref: str = Path(..., min_length=72, max_length=72)):
+    """Debug helper: inspect icon fields for a specific dMint contract."""
+    _ensure_dmint()
+
+    try:
+        contract = _dmint_contracts.get_contract(ref)
+        if not contract:
+            raise HTTPException(status_code=404, detail="Contract not found")
+
+        return {
+            "ref": ref,
+            "icon_type": contract.get("icon_type"),
+            "icon_url": contract.get("icon_url"),
+            "icon_ref": contract.get("icon_ref"),
+            "icon_data": contract.get("icon_data"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/transaction/{txid}", tags=["Transactions"])
 async def get_transaction(txid: str = Path(..., min_length=64, max_length=64)):
     """Get transaction by txid."""
@@ -673,16 +696,58 @@ def _ensure_dmint():
 
 @app.get("/dmint/contracts", tags=["dMint"])
 async def get_dmint_contracts(
-    format: str = Query(default="extended", description="'simple' for [[ref,outputs],...] or 'extended' for full details"),
-    active_only: bool = Query(default=True),
+    request: Request,
+    version: int = Query(default=2, ge=1, le=2),
+    view: str = Query(default="token_summary"),
+    status: str = Query(default="mineable", description="mineable | finished | all"),
+    algorithm_ids: Optional[str] = Query(default=None, description="Comma-separated algorithm IDs"),
+    sort_field: str = Query(default="deploy_height"),
+    sort_dir: str = Query(default="desc"),
+    limit: int = Query(default=1000, ge=1, le=5000),
+    cursor: Optional[str] = Query(default=None),
+    format: Optional[str] = Query(default=None, description="Legacy only: 'simple' | 'extended'"),
+    active_only: bool = Query(default=True, description="Legacy only"),
 ):
     """Get list of mineable dMint contracts."""
     _ensure_dmint()
 
     try:
-        if format == 'simple':
-            return _dmint_contracts.get_contracts_simple()
+        if format in ('simple', 'extended'):
+            if format == 'simple':
+                return _dmint_contracts.get_contracts_simple()
+            return _dmint_contracts.get_contracts_extended(active_only=active_only)
+
+        use_v2 = 'version' in request.query_params and version == 2
+        if use_v2:
+            parsed_algorithm_ids = []
+            if algorithm_ids:
+                parsed_algorithm_ids = [
+                    int(part.strip())
+                    for part in algorithm_ids.split(',')
+                    if part.strip()
+                ]
+
+            params = {
+                "version": 2,
+                "view": view,
+                "filters": {
+                    "status": status,
+                    "algorithm_ids": parsed_algorithm_ids,
+                },
+                "sort": {
+                    "field": sort_field,
+                    "dir": sort_dir,
+                },
+                "pagination": {
+                    "limit": limit,
+                    "cursor": cursor,
+                },
+            }
+            return _dmint_contracts.get_contracts_v2(params)
+
         return _dmint_contracts.get_contracts_extended(active_only=active_only)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
