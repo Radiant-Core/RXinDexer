@@ -698,11 +698,17 @@ class GlyphIndex:
             if reward and not token.total_supply:
                 token.total_supply = num_contracts * reward * parsed_state['max_height']
         
+        # V2-specific fields from on-chain state
+        if 'algo_id' in parsed_state:
+            token.algorithm = parsed_state['algo_id']
+        if 'daa_mode' in parsed_state:
+            token.daa_mode = parsed_state['daa_mode']
+        
         token.num_contracts = num_contracts
         self.logger.info(
             f'Parsed dMint contract state: reward={parsed_state.get("reward")} '
             f'target={parsed_state.get("target")} algo={parsed_state.get("algo_id")} '
-            f'contracts={num_contracts}'
+            f'daa_mode={parsed_state.get("daa_mode")} contracts={num_contracts}'
         )
     
     def _process_mint(self, tx_hash: bytes, tx: 'Tx', height: int,

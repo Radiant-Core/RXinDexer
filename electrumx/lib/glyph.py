@@ -554,13 +554,19 @@ def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
     """
     Parse dMint contract state from a UTXO output script.
 
-    The v1/v2 dMint contract output script encodes live state as data pushes
+    The dMint contract output script encodes live state as data pushes
     before the contract bytecode (which starts at ``OP_CHECKTEMPLATEVERIFY``
-    0xbd or the first non-push opcode).  The layout is:
+    0xbd).  Two layouts exist:
 
+    V1 (4 numeric pushes after refs):
         <height:4B> d8<contractRef:36B> d0<tokenRef:36B>
         <maxHeight> <reward> <target>
-        [<algoId:1B> <lastTime:4B> <targetTime:minimal>]
+        bd <contract_bytecode>
+
+    V2 (8 numeric pushes after refs — algoId/daaMode in range 0-4):
+        <height:4B> d8<contractRef:36B> d0<tokenRef:36B>
+        <maxHeight> <reward> <algoId> <daaMode> <targetTime>
+        <lastTime:4B> <target>
         bd <contract_bytecode>
 
     All numeric values are minimal CScriptNum encoded pushes.
@@ -626,25 +632,34 @@ def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
             'token_ref': token_ref.hex() if token_ref else None,
         }
 
-        # First numeric push is often the height (4 bytes LE)
+        # First three numeric pushes are common to V1 and V2
         if len(numeric_pushes) >= 1:
             result['height'] = _scriptnum_to_int(numeric_pushes[0])
-
-        # Subsequent pushes: maxHeight, reward, target
         if len(numeric_pushes) >= 2:
             result['max_height'] = _scriptnum_to_int(numeric_pushes[1])
         if len(numeric_pushes) >= 3:
             result['reward'] = _scriptnum_to_int(numeric_pushes[2])
-        if len(numeric_pushes) >= 4:
-            result['target'] = _scriptnum_to_int(numeric_pushes[3])
 
-        # Optional v2 fields: algo_id, lastTime, targetTime
-        if len(numeric_pushes) >= 5:
-            result['algo_id'] = _scriptnum_to_int(numeric_pushes[4])
-        if len(numeric_pushes) >= 6:
-            result['last_time'] = _scriptnum_to_int(numeric_pushes[5])
-        if len(numeric_pushes) >= 7:
-            result['target_time'] = _scriptnum_to_int(numeric_pushes[6])
+        # Detect V2: 8+ numeric pushes where [3]=algoId(0-4), [4]=daaMode(0-4)
+        is_v2 = False
+        if len(numeric_pushes) >= 8:
+            algo_candidate = _scriptnum_to_int(numeric_pushes[3])
+            daa_candidate = _scriptnum_to_int(numeric_pushes[4])
+            if 0 <= algo_candidate <= 4 and 0 <= daa_candidate <= 4:
+                is_v2 = True
+
+        if is_v2:
+            # V2 layout: height, maxHeight, reward, algoId, daaMode,
+            #            targetTime, lastTime, target
+            result['algo_id'] = _scriptnum_to_int(numeric_pushes[3])
+            result['daa_mode'] = _scriptnum_to_int(numeric_pushes[4])
+            result['target_time'] = _scriptnum_to_int(numeric_pushes[5])
+            result['last_time'] = _scriptnum_to_int(numeric_pushes[6])
+            result['target'] = _scriptnum_to_int(numeric_pushes[7])
+        else:
+            # V1 layout: height, maxHeight, reward, target
+            if len(numeric_pushes) >= 4:
+                result['target'] = _scriptnum_to_int(numeric_pushes[3])
 
         return result
     except Exception:
