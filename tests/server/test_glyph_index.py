@@ -464,7 +464,7 @@ class TestDmintContractStateParsing:
         assert parse_dmint_contract_state(script) is None
 
     def test_parse_dmint_contract_state_basic(self):
-        """Test parsing a minimal dMint contract script."""
+        """Test parsing a minimal V1 dMint contract script."""
         from electrumx.lib.glyph import parse_dmint_contract_state
         # Build a minimal contract script:
         # <height:4B push> d8<contractRef:36B> d0<tokenRef:36B> <maxHeight> <reward> <target> bd ...
@@ -484,8 +484,99 @@ class TestDmintContractStateParsing:
         assert result is not None
         assert result['contract_ref'] == contract_ref.hex()
         assert result['token_ref'] == token_ref.hex()
-        assert result.get('height') is not None
-        assert result.get('reward') is not None
+        assert result['height'] == 1
+        assert result['max_height'] == 1000
+        assert result['reward'] == 50
+        assert result['target'] == 100000
+        # V1 should NOT have V2-specific fields
+        assert 'daa_mode' not in result
+
+    def test_parse_dmint_contract_state_v2_blake3_asert(self):
+        """Test parsing a V2 dMint contract with blake3 algo and ASERT DAA."""
+        from electrumx.lib.glyph import parse_dmint_contract_state
+        contract_ref = b'\xaa' * 36
+        token_ref = b'\xbb' * 36
+        # V2 layout: height, contractRef, tokenRef, maxHeight, reward,
+        #            algoId, daaMode, targetTime, lastTime, target
+        script = (
+            b'\x04\x05\x00\x00\x00'     # push 4 bytes: height=5
+            + b'\xd8' + contract_ref      # OP_PUSHINPUTREFSINGLETON + 36B ref
+            + b'\xd0' + token_ref          # OP_PUSHINPUTREF + 36B ref
+            + b'\x02\xe8\x03'             # push 2 bytes: maxHeight=1000
+            + b'\x01\x32'                 # push 1 byte: reward=50
+            + b'\x51'                      # OP_1: algoId=1 (blake3)
+            + b'\x52'                      # OP_2: daaMode=2 (asert)
+            + b'\x01\x3c'                 # push 1 byte: targetTime=60
+            + b'\x04\x00\xf1\x53\x65'    # push 4 bytes: lastTime=1700000000
+            + b'\x03\x40\x42\x0f'         # push 3 bytes: target=1000000
+            + b'\xbd'                      # OP_CHECKTEMPLATEVERIFY
+            + b'\x00' * 20                # contract bytecode padding
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['height'] == 5
+        assert result['max_height'] == 1000
+        assert result['reward'] == 50
+        assert result['algo_id'] == 1       # blake3
+        assert result['daa_mode'] == 2      # asert
+        assert result['target_time'] == 60
+        assert result['last_time'] == 1700000000
+        assert result['target'] == 1000000
+
+    def test_parse_dmint_contract_state_v2_sha256d_fixed(self):
+        """Test parsing a V2 dMint contract with sha256d algo and fixed DAA (both zero)."""
+        from electrumx.lib.glyph import parse_dmint_contract_state
+        contract_ref = b'\xcc' * 36
+        token_ref = b'\xdd' * 36
+        # algoId=0 (sha256d) and daaMode=0 (fixed) are encoded as OP_0 (0x00)
+        script = (
+            b'\x04\x00\x00\x00\x00'     # push 4 bytes: height=0 (genesis)
+            + b'\xd8' + contract_ref      # OP_PUSHINPUTREFSINGLETON + 36B ref
+            + b'\xd0' + token_ref          # OP_PUSHINPUTREF + 36B ref
+            + b'\x02\xe8\x03'             # push 2 bytes: maxHeight=1000
+            + b'\x01\x32'                 # push 1 byte: reward=50
+            + b'\x00'                      # OP_0: algoId=0 (sha256d)
+            + b'\x00'                      # OP_0: daaMode=0 (fixed)
+            + b'\x01\x3c'                 # push 1 byte: targetTime=60
+            + b'\x04\x00\xf1\x53\x65'    # push 4 bytes: lastTime=1700000000
+            + b'\x03\x40\x42\x0f'         # push 3 bytes: target=1000000
+            + b'\xbd'                      # OP_CHECKTEMPLATEVERIFY
+            + b'\x00' * 20                # contract bytecode padding
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['algo_id'] == 0       # sha256d
+        assert result['daa_mode'] == 0      # fixed
+        assert result['target'] == 1000000  # NOT algoId — target is at position [7]
+        assert result['target_time'] == 60
+        assert result['last_time'] == 1700000000
+
+    def test_parse_dmint_contract_state_v2_k12_lwma(self):
+        """Test parsing a V2 dMint contract with K12 algo and LWMA DAA."""
+        from electrumx.lib.glyph import parse_dmint_contract_state
+        contract_ref = b'\xee' * 36
+        token_ref = b'\xff' * 36
+        script = (
+            b'\x04\x0a\x00\x00\x00'     # push 4 bytes: height=10
+            + b'\xd8' + contract_ref
+            + b'\xd0' + token_ref
+            + b'\x02\x10\x27'             # push 2 bytes: maxHeight=10000
+            + b'\x02\xc8\x00'             # push 2 bytes: reward=200
+            + b'\x52'                      # OP_2: algoId=2 (k12)
+            + b'\x53'                      # OP_3: daaMode=3 (lwma)
+            + b'\x01\x2d'                 # push 1 byte: targetTime=45
+            + b'\x04\x50\xf1\x53\x65'    # push 4 bytes: lastTime=1700000080
+            + b'\x04\x80\x96\x98\x00'    # push 4 bytes: target=10000000
+            + b'\xbd'
+            + b'\x00' * 20
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['algo_id'] == 2       # k12
+        assert result['daa_mode'] == 3      # lwma
+        assert result['target_time'] == 45
+        assert result['target'] == 10000000
+        assert result['reward'] == 200
 
 
 class TestDmintMetadataCopy:
