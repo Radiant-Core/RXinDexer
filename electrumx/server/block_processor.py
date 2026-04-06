@@ -539,6 +539,8 @@ class BlockProcessor:
             # Balance tracking data for Glyph tokens
             balance_debits = []
             balance_credits = []
+            # Singleton refs consumed by inputs (for burn detection)
+            spent_singleton_refs = set() if self.glyph_index else None
 
             # Spend the inputs
             for txin in tx.inputs:
@@ -565,6 +567,10 @@ class BlockProcessor:
                     spent_hashX = cache_value[:HASHX_LEN]
                     spent_value = unpack_le_uint64(cache_value[-8:])[0]
                     balance_debits.append((spent_hashX, spent_value, spent_refs))
+                    # Extract singleton refs for burn detection (37 bytes per entry)
+                    for i in range(0, len(spent_refs), 37):
+                        if i + 37 <= len(spent_refs) and spent_refs[i + 36] == 1:
+                            spent_singleton_refs.add(spent_refs[i:i + 36])
 
             # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
@@ -645,7 +651,7 @@ class BlockProcessor:
 
             # Process transaction for Glyph tokens
             if self.glyph_index:
-                glyph_envelope = self.glyph_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, output_refs_by_vout)
+                glyph_envelope = self.glyph_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, output_refs_by_vout, spent_singleton_refs)
                 
                 # Process for WAVE naming if this is a Glyph tx
                 if self.wave_index and glyph_envelope:
