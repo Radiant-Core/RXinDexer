@@ -69,10 +69,13 @@ class TestGlyphEnvelope:
     """Tests for Glyph envelope parsing."""
 
     def test_parse_v2_commit_envelope(self):
-        """Test parsing a v2 commit envelope."""
-        # Build a commit envelope: magic + version + flags + commit_hash
+        """Test parsing a v2 commit envelope (Style B - standalone gly push)."""
+        # Build a commit envelope: OP_3 OP_PUSHBYTES_3 'gly' <payload_push>
+        # Style B: 'gly' is a standalone 3-byte push, next push is the payload
         commit_hash = bytes(32)  # 32 zero bytes
-        data = GLYPH_MAGIC + bytes([GlyphVersion.V2, 0x00]) + commit_hash
+        payload = bytes([GlyphVersion.V2, 0x00]) + commit_hash  # 34 bytes
+        # Script: OP_3 (0x53) OP_PUSHBYTES_3 (0x03) 'gly' OP_PUSHBYTES_34 (0x22) <payload>
+        data = bytes([0x53, 0x03]) + GLYPH_MAGIC + bytes([0x22]) + payload
         
         result = parse_glyph_envelope(data)
         
@@ -82,10 +85,14 @@ class TestGlyphEnvelope:
         assert result['commit_hash'] == '00' * 32
 
     def test_parse_v2_reveal_envelope(self):
-        """Test parsing a v2 reveal envelope."""
-        # Build a reveal envelope: magic + version + flags(reveal) + metadata
+        """Test parsing a v2 reveal envelope (Style B - standalone gly push with reveal flag)."""
+        # Build a reveal envelope: OP_3 OP_PUSHBYTES_3 'gly' <cbor_payload>
+        # Style B reveal: 'gly' standalone push, next push is CBOR metadata
         metadata = b'\xa1\x01\x02'  # Simple CBOR: {1: 2}
-        data = GLYPH_MAGIC + bytes([GlyphVersion.V2, 0x80]) + metadata
+        # Payload: version + flags(IS_REVEAL) + inline metadata (Style B reveal with inline CBOR)
+        payload = bytes([GlyphVersion.V2, 0x80]) + metadata
+        # Script: OP_3 (0x53) OP_PUSHBYTES_3 (0x03) 'gly' OP_PUSHBYTES_5 (0x05) <payload>
+        data = bytes([0x53, 0x03]) + GLYPH_MAGIC + bytes([0x05]) + payload
         
         result = parse_glyph_envelope(data)
         
@@ -700,6 +707,7 @@ class TestDmintMintProcessing:
         index = GlyphIndex(mock_db, mock_env)
 
         token_ref = b'\xaa' * 36
+        contract_ref = b'\xcc' * 36  # Singleton ref for the contract
         token = GlyphTokenInfo()
         token.ref = token_ref
         token.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
@@ -712,11 +720,16 @@ class TestDmintMintProcessing:
         index.token_cache[token_ref] = token
         index.token_height[token_ref] = 100
 
-        # Build a mock tx with one FT output carrying the token ref
+        # Build a mock tx with a contract output carrying BOTH singleton AND token ref
         mock_output = Mock()
         mock_output.value = 50  # 50 satoshis minted
-        # Script: d0 + 36-byte ref (OP_PUSHINPUTREF)
-        mock_output.pk_script = b'\xd0' + token_ref + b'\x00' * 20
+        # Script MUST have BOTH d8 (singleton) AND d0 (token ref) for mint detection
+        # Format: d8 + contract_ref + d0 + token_ref + padding
+        mock_output.pk_script = (
+            b'\xd8' + contract_ref +    # OP_PUSHINPUTREFSINGLETON + 36B contract ref
+            b'\xd0' + token_ref +        # OP_PUSHINPUTREF + 36B token ref
+            b'\x00' * 20                 # padding
+        )
 
         tx = Mock()
         tx.outputs = [mock_output]
@@ -773,6 +786,7 @@ class TestDmintMintProcessing:
         index = GlyphIndex(mock_db, mock_env)
 
         token_ref = b'\xaa' * 36
+        contract_ref = b'\xdd' * 36  # Singleton ref for the contract
         token = GlyphTokenInfo()
         token.ref = token_ref
         token.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
@@ -781,14 +795,20 @@ class TestDmintMintProcessing:
         token.mined_supply = 50
         token.current_supply = 50
         token.mint_count = 1
+        token.reward = 50  # Need reward for mint calculation
         token.is_spent = False
         index.token_cache[token_ref] = token
         index.token_height[token_ref] = 100
 
-        # Mint the remaining 50
+        # Mint the remaining 50 - need BOTH singleton AND token ref
         mock_output = Mock()
         mock_output.value = 50
-        mock_output.pk_script = b'\xd0' + token_ref + b'\x00' * 20
+        # Script MUST have BOTH d8 (singleton) AND d0 (token ref) for mint detection
+        mock_output.pk_script = (
+            b'\xd8' + contract_ref +    # OP_PUSHINPUTREFSINGLETON + 36B contract ref
+            b'\xd0' + token_ref +        # OP_PUSHINPUTREF + 36B token ref
+            b'\x00' * 20                 # padding
+        )
 
         tx = Mock()
         tx.outputs = [mock_output]
