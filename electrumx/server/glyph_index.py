@@ -322,7 +322,8 @@ class GlyphIndex:
             self.logger.info('Glyph token indexing enabled')
     
     def process_tx(self, tx_hash: bytes, tx: 'Tx', height: int, tx_idx: int,
-                    output_refs_by_vout: Dict[int, List[Tuple[bytes, int]]] = None):
+                    output_refs_by_vout: Dict[int, List[Tuple[bytes, int]]] = None,
+                    spent_singleton_refs: set = None):
         """
         Process a transaction for Glyph tokens.
         
@@ -347,6 +348,8 @@ class GlyphIndex:
             output_refs_by_vout: Pre-parsed ref data from block processor.
                 Dict mapping vout -> list of (ref_bytes, ref_type) where
                 ref_type is 0 for normal (FT) and 1 for singleton (NFT).
+            spent_singleton_refs: Set of 36-byte singleton refs consumed by
+                inputs.  Used to detect burned dMint contract UTXOs.
         
         Returns:
             dict or None: The parsed Glyph envelope if found, for chaining to
@@ -547,6 +550,27 @@ class GlyphIndex:
         for token_ref in known_ft_refs_seen:
             self._process_mint(tx_hash, tx, height, tx_idx, token_ref,
                                output_refs_by_vout or {})
+        
+        # ===================================================================
+        # PHASE 4: Detect burned dMint contract singletons
+        # A singleton ref consumed by an input but NOT recreated in any
+        # output is permanently destroyed.  If it belongs to a known dMint
+        # token, mark that token as burned so it is removed from the
+        # mineable contracts listing.
+        # ===================================================================
+        if spent_singleton_refs:
+            # Collect all singleton refs that survived in outputs
+            output_singletons = set()
+            if output_refs_by_vout:
+                for ref_list in output_refs_by_vout.values():
+                    for ref_bytes, ref_type in ref_list:
+                        if ref_type == 1:
+                            output_singletons.add(ref_bytes)
+            
+            destroyed = spent_singleton_refs - output_singletons
+            for singleton_ref in destroyed:
+                self._process_contract_burn(
+                    tx_hash, height, tx_idx, singleton_ref)
         
         return result_envelope
     
@@ -810,6 +834,63 @@ class GlyphIndex:
                 f'amount={minted_amount} count={token.mint_count} '
                 f'supply={token.mined_supply}/{token.total_supply}'
             )
+    
+    def _process_contract_burn(self, tx_hash: bytes, height: int,
+                               tx_idx: int, singleton_ref: bytes):
+        """
+        Handle a destroyed dMint contract singleton.
+        
+        Called when a singleton ref was spent in inputs but NOT recreated in
+        any output — the contract UTXO is permanently destroyed.
+        
+        Finds the dMint token that owns this contract ref and marks it as
+        burned (is_spent=True), records a BURN event in history.
+        """
+        # Search token cache and DB for a dMint token whose contract_ref
+        # matches the destroyed singleton.  contract_ref is stored as hex.
+        singleton_hex = singleton_ref.hex()
+        
+        token_ref = None
+        token = None
+        
+        # Check in-memory cache first
+        for ref, t in self.token_cache.items():
+            if (getattr(t, 'contract_ref', None) == singleton_hex
+                    and GlyphProtocol.GLYPH_DMINT in (t.protocols or [])):
+                token_ref = ref
+                token = t
+                break
+        
+        # Fall back to DB scan if not found in cache
+        if token is None:
+            prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', GlyphTokenType.DMINT)
+            for key, _ in self.db.utxo_db.iterator(prefix=prefix):
+                ref = key[len(prefix):]
+                t = self.get_token(ref)
+                if t and getattr(t, 'contract_ref', None) == singleton_hex:
+                    token_ref = ref
+                    token = t
+                    break
+        
+        if token is None or token_ref is None:
+            return  # Singleton doesn't belong to a known dMint token
+        
+        if token.is_spent:
+            return  # Already marked
+        
+        token.is_spent = True
+        self.token_cache[token_ref] = token
+        self.token_height[token_ref] = height
+        
+        # Record BURN event in history
+        history_key = pack_history_key(token_ref, height, tx_idx)
+        history_value = struct.pack('<B', GlyphEventType.BURN) + tx_hash
+        self.history_cache.append((height, history_key, history_value))
+        
+        self.logger.info(
+            f'dMint CONTRACT BURNED: token={hash_to_hex_str(token_ref[:32])} '
+            f'contract={singleton_hex[:32]}... height={height}'
+        )
     
     def _index_token_reveal(self, ref: bytes, tx_hash: bytes, vout_or_vin,
                             height: int, tx_idx: int, envelope: Dict,

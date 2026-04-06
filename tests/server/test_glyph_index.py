@@ -1182,3 +1182,238 @@ class TestTokenToDictImages:
 
         assert 'remote' not in result
         assert 'embed' not in result
+
+
+class TestBurnDetection:
+    """Tests for dMint contract burn detection and deactivation."""
+
+    def test_process_contract_burn_marks_token_spent(self):
+        """_process_contract_burn sets is_spent=True and records BURN event."""
+        from electrumx.server.glyph_index import GlyphIndex, GlyphTokenInfo, GlyphEventType
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+
+        mock_db = MagicMock()
+        mock_db.utxo_db = MagicMock()
+        mock_db.utxo_db.get.return_value = None
+        mock_db.utxo_db.iterator.return_value = iter([])
+        mock_db.db_height = 100
+
+        mock_env = MagicMock()
+        mock_env.reorg_limit = 0
+
+        index = GlyphIndex.__new__(GlyphIndex)
+        index.db = mock_db
+        index.logger = MagicMock()
+        index.enabled = True
+        index.token_cache = {}
+        index.token_height = {}
+        index.history_cache = []
+        index._known_refs = set()
+        index._undo_seen = {}
+
+        # Create a dMint token with a known contract_ref
+        token_ref = b'\xaa' * 36
+        singleton_ref = b'\xbb' * 36
+        token = GlyphTokenInfo()
+        token.ref = token_ref
+        token.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
+        token.token_type = GlyphTokenType.DMINT
+        token.contract_ref = singleton_ref.hex()
+        token.is_spent = False
+        token.deploy_txid = b'\x00' * 32
+        index.token_cache[token_ref] = token
+
+        tx_hash = b'\xcc' * 32
+        index._process_contract_burn(tx_hash, 500, 0, singleton_ref)
+
+        # Token should be marked spent
+        assert index.token_cache[token_ref].is_spent is True
+        # BURN event recorded
+        assert len(index.history_cache) == 1
+        _, _, history_value = index.history_cache[0]
+        assert history_value[0] == GlyphEventType.BURN
+        assert history_value[1:33] == tx_hash
+
+    def test_process_contract_burn_ignores_unknown_singleton(self):
+        """_process_contract_burn is a no-op for singletons not owned by any dMint token."""
+        from electrumx.server.glyph_index import GlyphIndex, GlyphTokenInfo
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+
+        mock_db = MagicMock()
+        mock_db.utxo_db = MagicMock()
+        mock_db.utxo_db.get.return_value = None
+        mock_db.utxo_db.iterator.return_value = iter([])
+        mock_db.db_height = 100
+
+        mock_env = MagicMock()
+        mock_env.reorg_limit = 0
+
+        index = GlyphIndex.__new__(GlyphIndex)
+        index.db = mock_db
+        index.logger = MagicMock()
+        index.enabled = True
+        index.token_cache = {}
+        index.token_height = {}
+        index.history_cache = []
+        index._known_refs = set()
+
+        # Create a dMint token with a DIFFERENT contract ref
+        token_ref = b'\xaa' * 36
+        token = GlyphTokenInfo()
+        token.ref = token_ref
+        token.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
+        token.token_type = GlyphTokenType.DMINT
+        token.contract_ref = (b'\xdd' * 36).hex()
+        token.is_spent = False
+        token.deploy_txid = b'\x00' * 32
+        index.token_cache[token_ref] = token
+
+        unknown_singleton = b'\xee' * 36
+        index._process_contract_burn(b'\xcc' * 32, 500, 0, unknown_singleton)
+
+        # Token should NOT be marked spent
+        assert index.token_cache[token_ref].is_spent is False
+        assert len(index.history_cache) == 0
+
+    def test_process_contract_burn_skips_already_spent(self):
+        """_process_contract_burn is a no-op if token is already spent."""
+        from electrumx.server.glyph_index import GlyphIndex, GlyphTokenInfo
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+
+        mock_db = MagicMock()
+        mock_db.utxo_db = MagicMock()
+        mock_db.utxo_db.get.return_value = None
+        mock_db.utxo_db.iterator.return_value = iter([])
+        mock_db.db_height = 100
+
+        index = GlyphIndex.__new__(GlyphIndex)
+        index.db = mock_db
+        index.logger = MagicMock()
+        index.enabled = True
+        index.token_cache = {}
+        index.token_height = {}
+        index.history_cache = []
+        index._known_refs = set()
+
+        token_ref = b'\xaa' * 36
+        singleton_ref = b'\xbb' * 36
+        token = GlyphTokenInfo()
+        token.ref = token_ref
+        token.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
+        token.token_type = GlyphTokenType.DMINT
+        token.contract_ref = singleton_ref.hex()
+        token.is_spent = True  # Already spent
+        token.deploy_txid = b'\x00' * 32
+        index.token_cache[token_ref] = token
+
+        index._process_contract_burn(b'\xcc' * 32, 500, 0, singleton_ref)
+
+        # No new history event (was already burned)
+        assert len(index.history_cache) == 0
+
+
+class TestSyncBurnDeactivation:
+    """Tests for sync_from_index handling of burned and orphaned contracts."""
+
+    def _make_manager(self):
+        """Create a minimal DMintContractsManager for testing."""
+        from electrumx.server.dmint_contracts import DMintContractsManager
+        mgr = DMintContractsManager.__new__(DMintContractsManager)
+        mgr.contracts = []
+        mgr.glyph_index = MagicMock()
+        mgr.logger = MagicMock()
+        mgr.last_updated_height = 0
+        mgr.data_dir = '/tmp/test_dmint'
+        mgr._save_contracts = MagicMock()
+        mgr.ALGO_SHA256D = 0
+        mgr.ALGO_BLAKE3 = 1
+        mgr.ALGO_K12 = 2
+        mgr.ALGORITHM_NAMES = {0: 'sha256d', 1: 'blake3', 2: 'k12'}
+        mgr.DAA_MODE_NAMES = {0: 'Fixed', 1: 'Epoch', 2: 'ASERT', 3: 'LWMA'}
+        return mgr
+
+    def test_sync_deactivates_burned_contract(self):
+        """sync_from_index deactivates contracts whose tokens have is_spent=True."""
+        mgr = self._make_manager()
+        # Existing active contract
+        mgr.contracts = [{
+            'ref': 'aabb0000',
+            'active': True,
+            'ticker': 'BURN',
+            'outputs': 1,
+        }]
+        # Index returns this token as burned
+        mgr.glyph_index.get_tokens_by_type.return_value = [{
+            'ref': 'aabb_0000',
+            'is_spent': True,
+            'percent_mined': 50,
+            'ticker': 'BURN',
+            'dmint': {},
+        }]
+        mgr._extract_icon_fields = MagicMock(return_value={})
+
+        result = mgr.sync_from_index(1000)
+
+        assert result >= 1
+        assert mgr.contracts[0]['active'] is False
+        assert mgr.contracts[0].get('burned') is True
+
+    def test_sync_skips_adding_burned_token(self):
+        """sync_from_index does not add new contracts for burned tokens."""
+        mgr = self._make_manager()
+        mgr.contracts = []
+        # Index returns a burned token that's not yet in the contracts list
+        mgr.glyph_index.get_tokens_by_type.return_value = [{
+            'ref': 'aabb_0000',
+            'is_spent': True,
+            'percent_mined': 50,
+            'ticker': 'BURNED',
+            'dmint': {},
+        }]
+
+        result = mgr.sync_from_index(1000)
+
+        # No contract should be added
+        assert len(mgr.contracts) == 0
+
+    def test_sync_deactivates_orphaned_contracts(self):
+        """sync_from_index deactivates contracts not found in the index."""
+        mgr = self._make_manager()
+        mgr.contracts = [
+            {'ref': 'aabb0000', 'active': True, 'ticker': 'LIVE', 'outputs': 1},
+            {'ref': 'ccdd0000', 'active': True, 'ticker': 'ORPHAN', 'outputs': 1},
+        ]
+        # Index only knows about one of them
+        mgr.glyph_index.get_tokens_by_type.return_value = [{
+            'ref': 'aabb_0000',
+            'is_spent': False,
+            'percent_mined': 10,
+            'ticker': 'LIVE',
+            'dmint': {},
+        }]
+        mgr._extract_icon_fields = MagicMock(return_value={})
+
+        result = mgr.sync_from_index(1000)
+
+        # LIVE contract stays active
+        assert mgr.contracts[0]['active'] is True
+        # ORPHAN contract deactivated
+        assert mgr.contracts[1]['active'] is False
+        assert mgr.contracts[1].get('orphaned') is True
+
+    def test_sync_already_inactive_not_double_counted(self):
+        """Already-inactive contracts are not re-counted as updated."""
+        mgr = self._make_manager()
+        mgr.contracts = [{
+            'ref': 'dead0000',
+            'active': False,
+            'ticker': 'DONE',
+            'outputs': 1,
+        }]
+        # Not in index at all
+        mgr.glyph_index.get_tokens_by_type.return_value = []
+
+        result = mgr.sync_from_index(1000)
+
+        # Already inactive — should not increment updated counter
+        assert result == 0

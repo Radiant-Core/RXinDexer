@@ -232,6 +232,8 @@ class DMintContractsManager:
         Sync contracts from GlyphIndex.
         
         Scans for new dMint tokens and updates existing ones.
+        Deactivates contracts whose tokens are burned (is_spent=True).
+        Removes orphaned contracts that no longer appear in the index.
         Returns number of contracts added/updated.
         """
         if not self.glyph_index:
@@ -240,6 +242,8 @@ class DMintContractsManager:
         from electrumx.lib.glyph import GlyphProtocol
         
         updated = 0
+        # Track which refs the index knows about so we can detect orphans
+        index_refs = set()
         
         # Get all dMint tokens from index
         dmint_tokens = self.glyph_index.get_tokens_by_type(
@@ -251,6 +255,8 @@ class DMintContractsManager:
             ref = token.get('ref', '').replace('_', '')
             if not ref:
                 continue
+            
+            index_refs.add(ref)
             
             # Check if new
             existing = next((c for c in self.contracts if c['ref'] == ref), None)
@@ -281,12 +287,27 @@ class DMintContractsManager:
                 
                 # Check if fully mined
                 if token.get('percent_mined', 0) >= 100:
+                    if existing.get('active', True):
+                        existing['active'] = False
+                        changed = True
+                
+                # Check if burned (contract singleton destroyed)
+                if token.get('is_spent') and existing.get('active', True):
                     existing['active'] = False
+                    existing['burned'] = True
                     changed = True
+                    self.logger.info(
+                        f'Deactivated burned contract: {ref[:16]}... '
+                        f'({existing.get("ticker") or "unnamed"})'
+                    )
                 
                 if changed:
                     updated += 1
             else:
+                # Skip burned tokens — don't add them to listings
+                if token.get('is_spent'):
+                    continue
+                
                 # Add new contract
                 # Need to get outputs count from contract data
                 outputs = token.get('dmint', {}).get('num_contracts', 1) or 1
@@ -319,6 +340,19 @@ class DMintContractsManager:
                         percent_mined=token.get('percent_mined', 0),
                     )
                     updated += 1
+        
+        # Deactivate orphaned contracts not found in the index (e.g. after
+        # a reorg or if the token record was purged).
+        for contract in self.contracts:
+            cref = contract.get('ref', '')
+            if cref and cref not in index_refs and contract.get('active', True):
+                contract['active'] = False
+                contract['orphaned'] = True
+                updated += 1
+                self.logger.info(
+                    f'Deactivated orphaned contract: {cref[:16]}... '
+                    f'({contract.get("ticker") or "unnamed"})'
+                )
         
         if updated > 0:
             self.last_updated_height = height
