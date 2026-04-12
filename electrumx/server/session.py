@@ -180,6 +180,28 @@ class SessionManager:
             self._sslc.load_cert_chain(self.env.ssl_certfile, keyfile=self.env.ssl_keyfile)
         return self._sslc
 
+    async def _serve_ws_compat(self, session_factory, host, port, ssl=None, reuse_address=False):
+        '''Compatibility wrapper for websockets 10+.
+        websockets 10+ changed handler signature from (websocket, path) to (websocket,).
+        aiorpcx's serve_ws expects the old signature, so we wrap it.
+        '''
+        import websockets
+
+        async def handler(websocket):
+            # websockets 10+ passes only websocket, but aiorpcx expects (websocket, path)
+            # We call aiorpcx's serve_ws with the expected signature
+            # serve_ws internally creates the handler, so we need to use it directly
+            # Instead, we create a wrapper that adapts the signature
+            # The path is available at websocket.path in websockets 10+
+            path = getattr(websocket, 'path', '/')
+            # Create a transport-compatible handler
+            from aiorpcx.session import SessionKind
+            from electrumx.server.httpserver import HTTPTransport
+            transport = HTTPTransport(websocket, session_factory, SessionKind.SERVER)
+            await transport.process_messages()
+
+        return await websockets.serve(handler, host, port, ssl=ssl, reuse_address=reuse_address)
+
     async def _start_servers(self, services):
         for service in services:
             kind = service.protocol.upper()
@@ -192,10 +214,11 @@ class SessionManager:
             else:
                 session_class = self.env.coin.SESSIONCLS
             if service.protocol in ('ws', 'wss'):
-                serve = serve_ws
+                # websockets 10+ compatibility: wrap handler to match old signature
+                serve = self._serve_ws_compat
             # elif service.protocol in ('http', 'https'):
             #    serve = serve_http
-            else: 
+            else:
                 serve = serve_rs
             # FIXME: pass the service not the kind
             session_factory = partial(session_class, self, self.db, self.mempool,

@@ -49,7 +49,9 @@ class HTTPTransport:
         self.closing = False
 
     @classmethod
-    async def http_server(cls, session_factory, websocket, _path):
+    async def http_server(cls, session_factory, websocket):
+        # websockets 10+ changed handler signature from (websocket, path) to (websocket,)
+        # Path is now accessed via websocket.path if needed
         transport = cls(websocket, session_factory, SessionKind.SERVER)
         await transport.process_messages()
 
