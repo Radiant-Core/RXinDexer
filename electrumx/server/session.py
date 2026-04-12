@@ -186,18 +186,17 @@ class SessionManager:
         aiorpcx's serve_ws expects the old signature, so we wrap it.
         '''
         import websockets
+        from aiorpcx.session import SessionKind
+        from electrumx.server.httpserver import HTTPTransport
 
         async def handler(websocket):
             # websockets 10+ passes only websocket, but aiorpcx expects (websocket, path)
-            # We call aiorpcx's serve_ws with the expected signature
-            # serve_ws internally creates the handler, so we need to use it directly
-            # Instead, we create a wrapper that adapts the signature
-            # The path is available at websocket.path in websockets 10+
-            path = getattr(websocket, 'path', '/')
-            # Create a transport-compatible handler
-            from aiorpcx.session import SessionKind
-            from electrumx.server.httpserver import HTTPTransport
-            transport = HTTPTransport(websocket, session_factory, SessionKind.SERVER)
+            # Create transport and pass it to session_factory
+            transport = HTTPTransport(websocket, None, SessionKind.SERVER)
+            # session_factory expects (transport) as argument
+            session = session_factory(transport)
+            # Now set the session on the transport (HTTPTransport.__init__ creates session if session_factory is provided)
+            transport.session = session
             await transport.process_messages()
 
         return await websockets.serve(handler, host, port, ssl=ssl, reuse_address=reuse_address)
