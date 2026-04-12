@@ -61,7 +61,7 @@ WORKDIR /opt/electrumx
 # The --no-build-isolation flag forces pip to use our installed Cython version
 RUN python3 -m pip install --upgrade pip setuptools wheel
 RUN python3 -m pip install 'Cython<3'
-RUN python3 -m pip install plyvel 'aiorpcX>=0.22.0,<0.23.0' pylru cbor2 websockets aiohttp uvicorn fastapi
+RUN python3 -m pip install plyvel 'aiorpcX>=0.22.0,<0.23.0' pylru cbor2 'websockets>=9.0,<10.0' aiohttp uvicorn fastapi
 
 # Install python-rocksdb with build isolation disabled to use Cython<3
 RUN python3 -m pip install --no-build-isolation python-rocksdb
