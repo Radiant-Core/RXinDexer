@@ -175,7 +175,8 @@ class SessionManager:
 
     def _ssl_context(self):
         if self._sslc is None:
-            self._sslc = ssl.SSLContext(ssl.PROTOCOL_TLS)
+            self._sslc = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self._sslc.set_ciphers('HIGH:!aNULL:!MD5')
             self._sslc.load_cert_chain(self.env.ssl_certfile, keyfile=self.env.ssl_keyfile)
         return self._sslc
 

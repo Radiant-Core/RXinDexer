@@ -223,7 +223,9 @@ class PeerManager:
 
             kwargs = {'family': family}
             if kind == 'SSL':
-                kwargs['ssl'] = ssl.SSLContext(ssl.PROTOCOL_TLS)
+                sslc = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+                sslc.set_ciphers('HIGH:!aNULL:!MD5')
+                kwargs['ssl'] = sslc
 
             if self.env.force_proxy or peer.is_tor:
                 if not self.proxy:
