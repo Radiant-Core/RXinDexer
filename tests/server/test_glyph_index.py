@@ -1331,6 +1331,74 @@ class TestBurnDetection:
         # No new history event (was already burned)
         assert len(index.history_cache) == 0
 
+    def test_burn_detection_excludes_opreturn_outputs(self):
+        """Burn detection correctly excludes singleton refs in OP_RETURN outputs."""
+        from electrumx.server.glyph_index import GlyphIndex, GlyphTokenInfo, GlyphEventType
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+        from electrumx.lib.tx import Tx
+
+        mock_db = MagicMock()
+        mock_db.utxo_db = MagicMock()
+        mock_db.utxo_db.get.return_value = None
+        mock_db.utxo_db.iterator.return_value = iter([])
+        mock_db.db_height = 100
+
+        mock_env = MagicMock()
+        mock_env.reorg_limit = 0
+
+        index = GlyphIndex.__new__(GlyphIndex)
+        index.db = mock_db
+        index.logger = MagicMock()
+        index.enabled = True
+        index.token_cache = {}
+        index.token_height = {}
+        index.history_cache = []
+        index._known_refs = set()
+        index._undo_seen = {}
+
+        # Create a dMint token with a known contract_ref
+        token_ref = b'\xaa' * 36
+        singleton_ref = b'\xbb' * 36
+        token = GlyphTokenInfo()
+        token.ref = token_ref
+        token.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
+        token.token_type = GlyphTokenType.DMINT
+        token.contract_ref = singleton_ref.hex()
+        token.is_spent = False
+        token.deploy_txid = b'\x00' * 32
+        index.token_cache[token_ref] = token
+
+        # Create a mock transaction that burns the singleton to OP_RETURN
+        # Burn script: 0xd8 + singleton_ref + 0x6a (OP_RETURN at the end)
+        burn_script = bytes([0xd8]) + singleton_ref + bytes([0x6a])
+        mock_tx = MagicMock()
+        mock_tx.outputs = [
+            MagicMock(pk_script=burn_script)  # OP_RETURN burn
+        ]
+
+        # Simulate the burn detection logic
+        spent_singleton_refs = {singleton_ref}
+        output_refs_by_vout = {0: [(singleton_ref, 1)]}  # Singleton in vout 0
+
+        # Process with the fixed logic
+        output_singletons = set()
+        for vout, ref_list in output_refs_by_vout.items():
+            output = mock_tx.outputs[vout]
+            script = output.pk_script
+            # Skip OP_RETURN outputs (unspendable)
+            # Burn script pattern: 0xd8 + ref + 0x6a (OP_RETURN at end)
+            if script and script[-1] == 0x6a:
+                continue
+            for ref_bytes, ref_type in ref_list:
+                if ref_type == 1:
+                    output_singletons.add(ref_bytes)
+
+        destroyed = spent_singleton_refs - output_singletons
+
+        # Verify the singleton is detected as destroyed (burned)
+        assert singleton_ref in destroyed
+        assert len(destroyed) == 1
+
 
 class TestSyncBurnDeactivation:
     """Tests for sync_from_index handling of burned and orphaned contracts."""

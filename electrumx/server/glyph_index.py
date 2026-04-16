@@ -560,9 +560,16 @@ class GlyphIndex:
         # ===================================================================
         if spent_singleton_refs:
             # Collect all singleton refs that survived in outputs
+            # Exclude OP_RETURN outputs — burned contracts are locked in unspendable outputs
             output_singletons = set()
             if output_refs_by_vout:
-                for ref_list in output_refs_by_vout.values():
+                for vout, ref_list in output_refs_by_vout.items():
+                    output = tx.outputs[vout]
+                    script = output.pk_script
+                    # Skip OP_RETURN outputs (unspendable)
+                    # Burn script pattern: 0xd8 + ref + 0x6a (OP_RETURN at end)
+                    if script and script[-1] == 0x6a:
+                        continue
                     for ref_bytes, ref_type in ref_list:
                         if ref_type == 1:
                             output_singletons.add(ref_bytes)
