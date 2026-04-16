@@ -397,6 +397,20 @@ class DMintContractsManager:
         except Exception:
             return default
 
+    @staticmethod
+    def _normalize_ref(ref: str) -> str:
+        """Convert stored ref (txid_BE 64 hex + decimal vout) to 72-char hex ref
+        (txid_BE 64 hex + zero-padded 8-char hex vout) expected by the frontend."""
+        if not ref or len(ref) < 64:
+            return ref or ''
+        txid = ref[:64]
+        vout_str = ref[64:]
+        try:
+            vout_int = int(vout_str, 10)
+            return txid + format(vout_int, '08x')
+        except (ValueError, TypeError):
+            return ref
+
     def _to_token_summary_item(self, contract: Dict[str, Any]) -> Dict[str, Any]:
         total_contracts = max(self._to_int(contract.get('outputs'), 0), 0)
         total_supply = max(self._to_int(contract.get('total_supply'), 0), 0)
@@ -415,7 +429,7 @@ class DMintContractsManager:
         daa_mode_id = self._to_int(contract.get('daa_mode'), 0)
 
         return {
-            'token_ref': contract.get('ref'),
+            'token_ref': self._normalize_ref(contract.get('ref') or ''),
             'ticker': contract.get('ticker') or '???',
             'name': contract.get('name') or '',
             'algorithm': {
@@ -443,6 +457,7 @@ class DMintContractsManager:
             'deploy_height': max(self._to_int(contract.get('deploy_height'), 0), 0),
             'active': active,
             'is_fully_mined': fully_mined,
+            'burned': bool(contract.get('burned', False)),
             'icon': {
                 'type': contract.get('icon_type') or None,
                 'url': contract.get('icon_url') or contract.get('icon_ref') or None,

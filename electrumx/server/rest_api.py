@@ -705,6 +705,7 @@ async def get_dmint_contracts(
     sort_dir: str = Query(default="desc"),
     limit: int = Query(default=1000, ge=1, le=5000),
     cursor: Optional[str] = Query(default=None),
+    include_icon_data: bool = Query(default=False, description="Include embedded icon data_hex (large)"),
     format: Optional[str] = Query(default=None, description="Legacy only: 'simple' | 'extended'"),
     active_only: bool = Query(default=True, description="Legacy only"),
 ):
@@ -717,7 +718,7 @@ async def get_dmint_contracts(
                 return _dmint_contracts.get_contracts_simple()
             return _dmint_contracts.get_contracts_extended(active_only=active_only)
 
-        use_v2 = 'version' in request.query_params and version == 2
+        use_v2 = version == 2
         if use_v2:
             parsed_algorithm_ids = []
             if algorithm_ids:
@@ -743,7 +744,12 @@ async def get_dmint_contracts(
                     "cursor": cursor,
                 },
             }
-            return _dmint_contracts.get_contracts_v2(params)
+            result = _dmint_contracts.get_contracts_v2(params)
+            if not include_icon_data and isinstance(result, dict):
+                for item in result.get('items', []):
+                    if isinstance(item.get('icon'), dict):
+                        item['icon']['data_hex'] = None
+            return result
 
         return _dmint_contracts.get_contracts_extended(active_only=active_only)
     except ValueError as e:
