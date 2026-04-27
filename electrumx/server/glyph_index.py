@@ -49,6 +49,7 @@ class GlyphDBKeys:
     SUPPLY = b'GS'         # GS + ref -> current supply (FT only)
     HOLDER_BY_REF = b'GR'  # GR + ref + scripthash -> amount (reverse of BALANCE)
     UNDO = b'GXU'          # GXU + height(be) -> repr([(key, prev_value_or_None), ...])
+    KEY_REVEALS = b'GKR'   # GKR + ref -> CBOR key reveal record (Phase 6 / REP-3009)
 
 
 # History event types
@@ -116,6 +117,10 @@ class GlyphTokenInfo:
         'container_ref', 'authority_ref', 'parent_ref',
         # NFT specific
         'attrs',
+        # Encrypted content (Phase 6 / REP-3008)
+        'is_encrypted', 'cipher_hash', 'enc_scheme',
+        # Timelock (Phase 6 / REP-3009)
+        'is_timelocked', 'timelock_mode', 'timelock_unlock_at', 'timelock_cek_hash', 'timelock_hint',
     )
     
     def __init__(self):
@@ -161,6 +166,16 @@ class GlyphTokenInfo:
         self.parent_ref = None  # Parent token for child tokens
         # NFT specific
         self.attrs = None  # Serialized attributes JSON
+        # Encrypted content (Phase 6 / REP-3008)
+        self.is_encrypted = False       # True when GLYPH_ENCRYPTED (8) in protocols
+        self.cipher_hash = None         # sha256:hex of ciphertext (from metadata.main.hash)
+        self.enc_scheme = None          # Encryption scheme (e.g. 'chunked-aead-v1')
+        # Timelock (Phase 6 / REP-3009)
+        self.is_timelocked = False      # True when GLYPH_TIMELOCK (9) in protocols
+        self.timelock_mode = None       # 'block' or 'time'
+        self.timelock_unlock_at = None  # Block height or UNIX timestamp
+        self.timelock_cek_hash = None   # sha256:hex CEK commitment
+        self.timelock_hint = None       # Optional viewer hint
     
     def to_bytes(self) -> bytes:
         """Serialize token info to CBOR bytes for flexible storage."""
@@ -210,6 +225,16 @@ class GlyphTokenInfo:
             'pr': self.parent_ref,
             # NFT
             'at': self.attrs,
+            # Encrypted
+            'xe': self.is_encrypted or None,
+            'xh': self.cipher_hash,
+            'xs': self.enc_scheme,
+            # Timelock
+            'tl': self.is_timelocked or None,
+            'tm': self.timelock_mode,
+            'tu': self.timelock_unlock_at,
+            'tc': self.timelock_cek_hash,
+            'th': self.timelock_hint,
         }
         # Remove None values to save space
         data = {k: v for k, v in data.items() if v is not None and v != 0 and v != b''}
@@ -266,6 +291,16 @@ class GlyphTokenInfo:
         info.parent_ref = d.get('pr')
         # NFT
         info.attrs = d.get('at')
+        # Encrypted
+        info.is_encrypted = bool(d.get('xe', False))
+        info.cipher_hash = d.get('xh')
+        info.enc_scheme = d.get('xs')
+        # Timelock
+        info.is_timelocked = bool(d.get('tl', False))
+        info.timelock_mode = d.get('tm')
+        info.timelock_unlock_at = d.get('tu')
+        info.timelock_cek_hash = d.get('tc')
+        info.timelock_hint = d.get('th')
         
         return info
     
@@ -1004,7 +1039,29 @@ class GlyphIndex:
             if isinstance(b, (bytes, bytearray)):
                 token.icon_size = len(b)
                 token.icon_ref = 'embedded'
-        
+
+        # Encrypted content fields (Phase 6 / REP-3008)
+        if GlyphProtocol.GLYPH_ENCRYPTED in token.protocols:
+            token.is_encrypted = True
+            # 'main' sub-object holds enc scheme and ciphertext hash
+            main = metadata.get('main') or {}
+            if isinstance(main, dict):
+                token.cipher_hash = main.get('hash')  # e.g. 'sha256:abcd...'
+                token.enc_scheme = main.get('scheme') or main.get('enc')
+
+        # Timelock fields (Phase 6 / REP-3009)
+        if GlyphProtocol.GLYPH_TIMELOCK in token.protocols:
+            token.is_timelocked = True
+            # 'crypto' sub-object contains timelock commitment
+            crypto = metadata.get('crypto') or {}
+            if isinstance(crypto, dict):
+                tl = crypto.get('timelock') or {}
+                if isinstance(tl, dict):
+                    token.timelock_mode = tl.get('mode')
+                    token.timelock_unlock_at = tl.get('unlock_at')
+                    token.timelock_cek_hash = tl.get('cek_hash')  # 'sha256:hex'
+                    token.timelock_hint = tl.get('hint')
+
         # Store in cache
         self.token_cache[ref] = token
         self.token_height[ref] = height
@@ -1024,7 +1081,111 @@ class GlyphIndex:
         # For now, we don't need to store commits separately
         # The reveal will be self-contained
         pass
-    
+
+    # =========================================================================
+    # Key Reveal Index (Phase 6 / REP-3009)
+    # =========================================================================
+
+    def record_key_reveal(self, ref: bytes, reveal_tx_hash: bytes,
+                          revealed_key: str, reveal_height: int,
+                          created_at: int) -> None:
+        """
+        Persist a CEK reveal record.
+
+        Called when an OP_RETURN reveal transaction is confirmed containing
+        the plaintext CEK for a timelocked token.
+
+        Args:
+            ref: 36-byte token reference
+            reveal_tx_hash: 32-byte txid of the reveal transaction
+            revealed_key: Hex-encoded CEK (64 hex chars = 32 bytes)
+            reveal_height: Block height at which the reveal was confirmed
+            created_at: UNIX timestamp of the reveal tx
+        """
+        if not self.enabled or not HAS_CBOR:
+            return
+
+        record = {
+            'tx': reveal_tx_hash,
+            'key': revealed_key,
+            'h': reveal_height,
+            't': created_at,
+        }
+        db_key = GlyphDBKeys.KEY_REVEALS + ref
+        self.db.utxo_db.put(db_key, cbor2.dumps(record))
+
+    def get_key_reveal(self, ref: bytes) -> Optional[Dict]:
+        """
+        Retrieve a CEK reveal record for a token.
+
+        Returns a dict with fields tx, key, h (height), t (timestamp),
+        or None if no reveal is recorded.
+        """
+        if not self.enabled or not HAS_CBOR:
+            return None
+
+        db_key = GlyphDBKeys.KEY_REVEALS + ref
+        raw = self.db.utxo_db.get(db_key)
+        if not raw:
+            return None
+        try:
+            d = cbor2.loads(raw)
+            return {
+                'reveal_tx': d['tx'].hex() if isinstance(d.get('tx'), (bytes, bytearray)) else d.get('tx'),
+                'revealed_key': d.get('key'),
+                'reveal_height': d.get('h'),
+                'created_at': d.get('t'),
+            }
+        except Exception:
+            return None
+
+    def list_encrypted_tokens(self, limit: int = 100, offset: int = 0,
+                              timelocked_only: bool = False) -> List[Dict]:
+        """
+        Return a list of encrypted (and optionally timelocked) tokens.
+
+        Scans the token cache then falls back to DB scan.
+        Returns dicts safe for JSON serialisation (no raw bytes).
+
+        Args:
+            limit: Max results
+            offset: Skip first N results
+            timelocked_only: If True, only return tokens with GLYPH_TIMELOCK
+        """
+        if not self.enabled:
+            return []
+
+        results = []
+        # Search cache first
+        for ref_bytes, token in self.token_cache.items():
+            if not token.is_encrypted:
+                continue
+            if timelocked_only and not token.is_timelocked:
+                continue
+            results.append(self._token_to_dict(token))
+
+        # Fall back to DB scan for tokens not in cache
+        prefix = GlyphDBKeys.TOKEN
+        try:
+            for key, value in self.db.utxo_db.iterator(prefix=prefix):
+                ref_bytes = key[len(prefix):]
+                if ref_bytes in self.token_cache:
+                    continue  # Already included from cache
+                try:
+                    token = GlyphTokenInfo.from_bytes(value)
+                    if not token.is_encrypted:
+                        continue
+                    if timelocked_only and not token.is_timelocked:
+                        continue
+                    results.append(self._token_to_dict(token))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        results.sort(key=lambda t: t.get('deploy_height', 0), reverse=True)
+        return results[offset:offset + limit]
+
     def update_balance(self, height: int, scripthash: bytes, ref: bytes, delta: int):
         """Update a token balance."""
         if not self.enabled:
@@ -1631,7 +1792,27 @@ class GlyphIndex:
         # Include NFT attributes
         if token.attrs:
             result['attrs'] = token.attrs
-        
+
+        # Encrypted content fields (Phase 6 / REP-3008)
+        if token.is_encrypted:
+            result['is_encrypted'] = True
+            if token.cipher_hash is not None:
+                result['cipher_hash'] = token.cipher_hash
+            if token.enc_scheme is not None:
+                result['enc_scheme'] = token.enc_scheme
+
+        # Timelock fields (Phase 6 / REP-3009)
+        if token.is_timelocked:
+            result['is_timelocked'] = True
+            if token.timelock_mode is not None:
+                result['timelock_mode'] = token.timelock_mode
+            if token.timelock_unlock_at is not None:
+                result['timelock_unlock_at'] = token.timelock_unlock_at
+            if token.timelock_cek_hash is not None:
+                result['timelock_cek_hash'] = token.timelock_cek_hash
+            if token.timelock_hint is not None:
+                result['timelock_hint'] = token.timelock_hint
+
         return result
     
     @staticmethod
