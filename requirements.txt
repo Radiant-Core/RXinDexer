@@ -6,7 +6,7 @@ aiohttp>=3.3,<4.0
 websockets>=9.0,<10.0
 psutil
 python-rocksdb<=0.7.0
-cbor2>=5.4.0
+cbor2>=5.9.0
 
 # REST API dependencies
 fastapi>=0.109.0
