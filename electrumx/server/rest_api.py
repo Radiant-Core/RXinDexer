@@ -686,6 +686,99 @@ async def get_token_metadata(ref: str = Path(..., min_length=72, max_length=72))
 
 
 # =============================================================================
+# ENCRYPTED TOKENS (Phase 6 / REP-3008 + REP-3009)
+# =============================================================================
+
+@app.get("/glyphs/encrypted", tags=["Encrypted"])
+async def list_encrypted_tokens(
+    limit: int = Query(default=100, le=500),
+    offset: int = Query(default=0, ge=0),
+    timelocked_only: bool = Query(default=False, description="Only return timelocked tokens"),
+):
+    """
+    List encrypted Glyph tokens.
+
+    Privacy-preserving: only returns ciphertext hashes and metadata
+    commitments — never plaintext content or CEKs.
+    """
+    _ensure_glyph_index()
+    try:
+        tokens = _glyph_index.list_encrypted_tokens(
+            limit=limit, offset=offset, timelocked_only=timelocked_only
+        )
+        return {"tokens": tokens, "total": len(tokens), "timelocked_only": timelocked_only}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/glyphs/{ref}/key-reveal", tags=["Encrypted"])
+async def get_key_reveal(ref: str = Path(..., min_length=72, max_length=72)):
+    """
+    Get the CEK reveal record for a timelocked token.
+
+    Returns the revealed CEK hex once a reveal transaction has been
+    confirmed. Returns ``{"revealed": false}`` if no reveal is indexed yet.
+    """
+    _ensure_glyph_index()
+    try:
+        ref_bytes = bytes.fromhex(ref)
+        result = _glyph_index.get_key_reveal(ref_bytes)
+        if result is None:
+            return {"revealed": False}
+        return {"revealed": True, **result}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref format (expected 72 hex chars)")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/glyphs/{ref}/key-reveal", tags=["Encrypted"])
+async def record_key_reveal(
+    ref: str = Path(..., min_length=72, max_length=72),
+    reveal_tx: str = Query(..., min_length=64, max_length=64, description="Reveal tx txid (64 hex)"),
+    revealed_key: str = Query(..., min_length=64, max_length=64, description="CEK hex (64 hex = 32 bytes)"),
+    reveal_height: int = Query(..., ge=0, description="Block height of reveal confirmation"),
+):
+    """
+    Record a CEK reveal for a timelocked token.
+
+    The indexer verifies the SHA256 of the submitted CEK against the
+    on-chain commitment before accepting the reveal.
+    """
+    _ensure_glyph_index()
+    try:
+        import hashlib
+        import time as _time
+
+        ref_bytes = bytes.fromhex(ref)
+        cek_bytes = bytes.fromhex(revealed_key)
+
+        # Verify CEK hash matches on-chain commitment
+        token = _glyph_index.get_token(ref_bytes)
+        if token and token.timelock_cek_hash:
+            expected = token.timelock_cek_hash
+            if expected.startswith("sha256:"):
+                expected = expected[len("sha256:"):]
+            if hashlib.sha256(cek_bytes).hexdigest() != expected:
+                raise HTTPException(status_code=422, detail="CEK hash mismatch")
+
+        _glyph_index.record_key_reveal(
+            ref_bytes,
+            bytes.fromhex(reveal_tx),
+            revealed_key,
+            reveal_height,
+            int(_time.time()),
+        )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid hex parameter")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
 # DMINT v2 CONTRACTS
 # =============================================================================
 

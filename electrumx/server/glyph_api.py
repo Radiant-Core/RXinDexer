@@ -730,6 +730,135 @@ class GlyphAPIMixin:
         except Exception as e:
             return {'error': str(e)}
 
+    async def glyph_list_encrypted_tokens(self, limit: int = 100, offset: int = 0,
+                                          timelocked_only: bool = False):
+        """
+        List encrypted (and optionally timelocked) Glyph tokens.
+
+        Privacy-preserving: only returns commitment hashes, never plaintext
+        content or CEKs.
+
+        Args:
+            limit: Maximum results (default 100, max 500)
+            offset: Pagination offset (default 0)
+            timelocked_only: If True, only return tokens with GLYPH_TIMELOCK (9)
+
+        Returns:
+            Dict with:
+              - tokens: list of token summary dicts
+              - total: count returned
+              - timelocked_only: the requested filter flag
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        try:
+            tokens = self.glyph_index.list_encrypted_tokens(
+                limit=min(limit, 500),
+                offset=offset,
+                timelocked_only=bool(timelocked_only),
+            )
+            return {
+                'tokens': tokens,
+                'total': len(tokens),
+                'timelocked_only': bool(timelocked_only),
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def glyph_get_key_reveal(self, ref: str):
+        """
+        Get the CEK reveal record for a timelocked token.
+
+        Returns the revealed CEK and metadata once the minter has
+        broadcast the reveal transaction. Returns null if no reveal
+        has been indexed yet.
+
+        Args:
+            ref: Token ref in format "txid:vout"
+
+        Returns:
+            Dict with:
+              - reveal_tx: txid of the reveal transaction
+              - revealed_key: hex-encoded CEK (32 bytes = 64 hex chars)
+              - reveal_height: block height of confirmation
+              - created_at: UNIX timestamp
+            or {'revealed': False} if not yet revealed.
+        """
+        self.bump_cost(1.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        try:
+            ref_bytes = self._parse_ref(ref)
+            result = self.glyph_index.get_key_reveal(ref_bytes)
+            if result is None:
+                return {'revealed': False}
+            return {'revealed': True, **result}
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def glyph_record_key_reveal(self, ref: str, reveal_tx: str,
+                                      revealed_key: str, reveal_height: int):
+        """
+        Record a CEK reveal for a timelocked token.
+
+        Called by wallets or relay nodes when a reveal transaction is
+        confirmed. The indexer verifies the CEK hash against the on-chain
+        commitment before storing.
+
+        Args:
+            ref: Token ref in format "txid:vout"
+            reveal_tx: 64-char hex txid of the reveal transaction
+            revealed_key: 64-char hex CEK (32 bytes)
+            reveal_height: Block height at which the reveal was confirmed
+
+        Returns:
+            {'ok': True} on success, {'error': ...} on failure.
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        try:
+            import hashlib
+            import time
+
+            ref_bytes = self._parse_ref(ref)
+
+            # Verify revealed_key is valid hex and 32 bytes
+            if len(revealed_key) != 64:
+                return {'error': 'revealed_key must be 64 hex characters (32 bytes)'}
+            cek_bytes = bytes.fromhex(revealed_key)
+
+            # Load the token and verify the CEK hash matches the on-chain commitment
+            token = self.glyph_index.get_token_by_ref(ref_bytes)
+            if token and token.timelock_cek_hash:
+                expected_hash_str = token.timelock_cek_hash
+                if expected_hash_str.startswith('sha256:'):
+                    expected_hash_str = expected_hash_str[len('sha256:'):]
+                computed = hashlib.sha256(cek_bytes).hexdigest()
+                if computed != expected_hash_str:
+                    return {'error': 'CEK hash mismatch — reveal key does not match on-chain commitment'}
+
+            reveal_tx_bytes = bytes.fromhex(reveal_tx)
+            self.glyph_index.record_key_reveal(
+                ref_bytes,
+                reveal_tx_bytes,
+                revealed_key,
+                int(reveal_height),
+                int(time.time()),
+            )
+            return {'ok': True}
+        except ValueError as e:
+            return {'error': f'Invalid parameter: {e}'}
+        except Exception as e:
+            return {'error': str(e)}
+
     async def glyph_get_token_unconfirmed(self, ref: str):
         """
         Get unconfirmed transactions for a specific token.
