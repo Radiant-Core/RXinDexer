@@ -2,7 +2,7 @@ aiorpcx[ws]>=0.22,<0.26
 attrs
 plyvel
 pylru
-aiohttp>=3.3,<4.0
+aiohttp>=3.13.5,<4.0
 websockets>=9.0,<10.0
 psutil
 python-rocksdb<=0.7.0
