@@ -110,11 +110,15 @@ class WaveZoneRecords:
         """Parse zone records from Glyph metadata."""
         records = cls()
         
-        # Get zone data from app.data.zone
+        # Get zone data from app.data.zone (original format)
         app_data = metadata.get('app', {}).get('data', {})
         zone = app_data.get('zone', {})
         
-        records.address = zone.get('address')
+        # Support Photonic wallet format: attrs.target holds the address
+        attrs = metadata.get('attrs', {})
+        attrs_address = attrs.get('target') if attrs.get('target_type', 'address') == 'address' else None
+        
+        records.address = zone.get('address') or attrs_address
         records.avatar = zone.get('avatar')
         records.display = zone.get('display')
         records.description = zone.get('desc')
@@ -319,16 +323,18 @@ class WaveIndex:
         if GlyphProtocol.GLYPH_WAVE not in protocols:
             return
         
-        # Check for valid WAVE structure (38 outputs)
-        if len(tx.outputs) < WAVE_OUTPUT_COUNT:
-            self.logger.debug(f'WAVE tx {hash_to_hex_str(tx_hash)} has insufficient outputs')
-            return
-        
         # Extract name and zone from metadata
         metadata = glyph_envelope.get('metadata', {})
+        
+        # Support both Photonic wallet format (attrs.name) and
+        # the original app.data.name format
+        attrs = metadata.get('attrs', {})
         app_data = metadata.get('app', {}).get('data', {})
-        name = app_data.get('name', '')
-        parent_name = app_data.get('parent')
+        name = attrs.get('name', '') or app_data.get('name', '')
+        parent_name = attrs.get('domain') if not app_data.get('parent') else app_data.get('parent')
+        # A domain value of 'rxd' is the root — no parent lookup needed
+        if parent_name == 'rxd':
+            parent_name = None
         
         if not name:
             self.logger.debug(f'WAVE tx {hash_to_hex_str(tx_hash)} has no name')
@@ -373,6 +379,8 @@ class WaveIndex:
             self.zone_cache[claim_ref] = cbor2.dumps(zone.to_dict())
             self.zone_height[claim_ref] = height
         
+        self.logger.info(f'Indexed WAVE name "{name}" target={zone.address!r} at height {height}')
+        
         # Store owner (scripthash of claim output)
         from electrumx.lib.script import Script
         claim_script = tx.outputs[0].pk_script
@@ -383,7 +391,6 @@ class WaveIndex:
         # Track height for flush/undo
         self._pending_heights[claim_ref.hex()] = height
         
-        self.logger.debug(f'Indexed WAVE name "{name}" at height {height}')
     
     def _index_name_in_tree(self, name: str, parent_ref: bytes, claim_ref: bytes,
                              height: int, tx_hash: bytes = None):
@@ -579,10 +586,14 @@ class WaveIndex:
         # Get owner
         owner = self._get_owner(ref)
         
+        zone_dict = zone.to_dict() if zone else {}
+        # Expose the payment address as top-level 'target' for wallet compatibility
+        target = zone_dict.get('address')
         return {
             'name': normalized,
             'ref': self._format_ref(ref),
-            'zone': zone.to_dict() if zone else {},
+            'target': target,
+            'zone': zone_dict,
             'owner': owner.hex() if owner else None,
             'available': False,
         }
