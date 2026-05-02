@@ -1,4 +1,4 @@
-version = 'ElectrumX 1.4.0'
+version = 'ElectrumX 1.4.1'
 version_short = version.split()[-1]
 
 
