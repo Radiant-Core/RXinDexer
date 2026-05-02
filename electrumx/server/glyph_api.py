@@ -7,6 +7,8 @@ These methods can be added to the ElectrumX session handler.
 Reference: https://github.com/Radiant-Core/Glyph-Token-Standards
 """
 
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 from electrumx.lib.glyph import (
     GLYPH_MAGIC,
     GlyphProtocol,
