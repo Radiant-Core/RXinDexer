@@ -441,6 +441,7 @@ async def get_dmint_contract_icon_debug(ref: str = Path(..., min_length=72, max_
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/tx/{txid}", tags=["Transactions"])
 @app.get("/transaction/{txid}", tags=["Transactions"])
 async def get_transaction(txid: str = Path(..., min_length=64, max_length=64)):
     """Get transaction by txid."""
