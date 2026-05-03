@@ -460,7 +460,7 @@ class DMintContractsManager:
             'burned': bool(contract.get('burned', False)),
             'icon': {
                 'type': contract.get('icon_type') or None,
-                'url': contract.get('icon_url') or contract.get('icon_ref') or None,
+                'url': contract.get('icon_url') or (contract.get('icon_ref') if contract.get('icon_ref') not in (None, 'embedded') else None),
                 'data_hex': contract.get('icon_data') or None,
             },
             'updated_at': datetime.now(timezone.utc).isoformat(),
