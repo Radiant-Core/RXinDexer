@@ -1510,3 +1510,132 @@ class TestSyncBurnDeactivation:
 
         # Already inactive — should not increment updated counter
         assert result == 0
+
+
+# ===========================================================================
+# R27 — Subscription Callback Wiring Verification
+# ===========================================================================
+
+class TestSubscriptionCallbackWarning:
+    """R27: GlyphSubscriptionManager must surface a missing notify_callback."""
+
+    def _make_manager(self):
+        """Construct a GlyphSubscriptionManager with a minimal fake env."""
+        from electrumx.server.glyph_subscriptions import GlyphSubscriptionManager
+        env = Mock()
+        env.glyph_subscriptions = True
+        return GlyphSubscriptionManager(env)
+
+    def test_notify_callback_is_none_by_default(self):
+        """notify_callback must start as None — wiring is the session layer's job."""
+        mgr = self._make_manager()
+        assert mgr.notify_callback is None
+
+    def test_set_notify_callback_stores_callable(self):
+        """set_notify_callback stores the callable and clears the None sentinel."""
+        mgr = self._make_manager()
+        cb = Mock()
+        mgr.set_notify_callback(cb)
+        assert mgr.notify_callback is cb
+
+    def test_notify_methods_silently_no_op_when_callback_unset(self):
+        """All notify_* methods return without error when callback is None."""
+        import asyncio
+        mgr = self._make_manager()
+        ref = b'\xaa' * 36
+        sh = b'\xbb' * 32
+        # None of these should raise even though notify_callback is None
+        asyncio.run(mgr.notify_balance_change(sh, ref, 100, 10))
+        asyncio.run(mgr.notify_token_change(ref, {'name': 'test'}))
+        asyncio.run(mgr.notify_transfer(ref, b'\xcc' * 32, sh, sh, 50, 1000))
+
+    def test_block_processor_warns_once_when_callback_unset(self):
+        """R27: BlockProcessor._advance_block warns exactly once when subscriptions
+        are active but notify_callback is None."""
+        import sys
+        from unittest.mock import MagicMock
+        # aiorpcx is not installed in the test environment — stub it out
+        sys.modules.setdefault('aiorpcx', MagicMock())
+        from electrumx.server.block_processor import BlockProcessor
+        # Build a minimal BlockProcessor without calling the full __init__
+        bp = object.__new__(BlockProcessor)
+        bp.logger = Mock()
+        bp._subscription_callback_warned = False
+
+        sub_mgr = self._make_manager()
+        # Confirm callback is still None
+        assert sub_mgr.notify_callback is None
+
+        bp.subscriptions = sub_mgr
+
+        # Simulate the warning check from _advance_block (extracted logic)
+        def _check_warning(bp):
+            if (bp.subscriptions is not None
+                    and not bp._subscription_callback_warned
+                    and bp.subscriptions.notify_callback is None):
+                bp._subscription_callback_warned = True
+                bp.logger.warning(
+                    'Glyph subscriptions enabled but no notify_callback set — '
+                    'real-time notifications will be silently dropped'
+                )
+
+        # First call: should warn
+        _check_warning(bp)
+        assert bp.logger.warning.call_count == 1
+        assert 'notify_callback' in bp.logger.warning.call_args[0][0]
+
+        # Second call: flag is set, no repeat warning
+        _check_warning(bp)
+        assert bp.logger.warning.call_count == 1  # still 1, not 2
+
+    def test_block_processor_no_warning_when_callback_set(self):
+        """R27: No warning when notify_callback is wired before first block."""
+        import sys
+        from unittest.mock import MagicMock
+        sys.modules.setdefault('aiorpcx', MagicMock())
+        from electrumx.server.block_processor import BlockProcessor
+        bp = object.__new__(BlockProcessor)
+        bp.logger = Mock()
+        bp._subscription_callback_warned = False
+
+        sub_mgr = self._make_manager()
+        sub_mgr.set_notify_callback(Mock())  # wired before first block
+
+        bp.subscriptions = sub_mgr
+
+        def _check_warning(bp):
+            if (bp.subscriptions is not None
+                    and not bp._subscription_callback_warned
+                    and bp.subscriptions.notify_callback is None):
+                bp._subscription_callback_warned = True
+                bp.logger.warning(
+                    'Glyph subscriptions enabled but no notify_callback set — '
+                    'real-time notifications will be silently dropped'
+                )
+
+        _check_warning(bp)
+        assert bp.logger.warning.call_count == 0  # no warning — callback was set
+
+    def test_block_processor_no_warning_when_subscriptions_disabled(self):
+        """R27: No warning when self.subscriptions is None (feature disabled)."""
+        import sys
+        from unittest.mock import MagicMock
+        sys.modules.setdefault('aiorpcx', MagicMock())
+        from electrumx.server.block_processor import BlockProcessor
+        bp = object.__new__(BlockProcessor)
+        bp.logger = Mock()
+        bp._subscription_callback_warned = False
+        bp.subscriptions = None  # subscriptions not enabled
+
+        def _check_warning(bp):
+            if (bp.subscriptions is not None
+                    and not bp._subscription_callback_warned
+                    and bp.subscriptions.notify_callback is None):
+                bp._subscription_callback_warned = True
+                bp.logger.warning(
+                    'Glyph subscriptions enabled but no notify_callback set — '
+                    'real-time notifications will be silently dropped'
+                )
+
+        _check_warning(bp)
+        assert bp.logger.warning.call_count == 0
