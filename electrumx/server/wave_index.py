@@ -714,10 +714,12 @@ class WaveIndex:
     
     def _name_info_to_dict(self, info: WaveNameInfo) -> Dict[str, Any]:
         """Convert WaveNameInfo to API dict."""
+        zone_dict = info.zone.to_dict() if info.zone else {}
         return {
             'name': info.name,
             'ref': self._format_ref(info.ref),
-            'zone': info.zone.to_dict() if info.zone else {},
+            'target': zone_dict.get('address'),
+            'zone': zone_dict,
             'owner': info.owner_scripthash.hex() if info.owner_scripthash else None,
             'registration_height': info.registration_height,
             'available': False,

@@ -395,6 +395,32 @@ class TestWaveIndex:
         # Should return None or dict without data
         assert result is None or (isinstance(result, dict) and not result.get('address'))
 
+    def test_name_info_to_dict_includes_target(self, wave_index):
+        """_name_info_to_dict must include top-level 'target' matching cold-cache resolve().
+        Photonic Wallet reads result.target || result.zone?.address — both paths must work."""
+        from electrumx.server.wave_index import WaveNameInfo, WaveZoneRecords
+        info = WaveNameInfo()
+        info.ref = bytes(36)
+        info.name = 'alice'
+        zone = WaveZoneRecords()
+        zone.address = 'RXDAliceAddressHere123'
+        info.zone = zone
+        result = wave_index._name_info_to_dict(info)
+        assert 'target' in result
+        assert result['target'] == 'RXDAliceAddressHere123'
+        assert result['zone'].get('address') == 'RXDAliceAddressHere123'
+
+    def test_name_info_to_dict_target_none_when_no_address(self, wave_index):
+        """target should be None when zone has no address set."""
+        from electrumx.server.wave_index import WaveNameInfo, WaveZoneRecords
+        info = WaveNameInfo()
+        info.ref = bytes(36)
+        info.name = 'bob'
+        info.zone = WaveZoneRecords()
+        result = wave_index._name_info_to_dict(info)
+        assert 'target' in result
+        assert result['target'] is None
+
 
 class TestWaveNameInfo:
     """Tests for WaveNameInfo class."""
