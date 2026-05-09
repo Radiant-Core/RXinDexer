@@ -345,9 +345,10 @@ class GlyphAPIMixin:
         
         try:
             scripthash_bytes = bytes.fromhex(scripthash)
-            return self.glyph_index.get_balances_for_scripthash(
+            result = self.glyph_index.get_balances_for_scripthash(
                 scripthash_bytes, limit=limit
             )
+            return result.get('balances', result)
         except Exception as e:
             return {'error': str(e)}
 
@@ -402,25 +403,25 @@ class GlyphAPIMixin:
         )
 
     async def glyph_get_tokens_by_type(self, token_type: int, limit: int = 100,
-                                        offset: int = 0):
+                                        cursor: str = None):
         """
         Get tokens by type.
-        
+
         Args:
             token_type: GlyphTokenType ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, etc.)
             limit: Maximum results
-            offset: Pagination offset
-            
+            cursor: Opaque pagination cursor from previous response next_cursor
+
         Returns:
-            List of tokens of the specified type
+            Dict with tokens list and next_cursor
         """
         self.bump_cost(2.0)
-        
+
         if not hasattr(self, 'glyph_index') or not self.glyph_index:
             return {'error': 'Glyph indexing not enabled'}
-        
+
         return self.glyph_index.get_tokens_by_type(
-            token_type, limit=limit, offset=offset
+            token_type, limit=limit, cursor=cursor
         )
 
     async def glyph_get_metadata(self, ref: str):
@@ -654,18 +655,17 @@ class GlyphAPIMixin:
         except Exception as e:
             return {'error': str(e)}
 
-    async def dmint_get_tokens(self, limit: int = 100, offset: int = 0,
+    async def dmint_get_tokens(self, limit: int = 100,
                                active_only: bool = True):
         """
         Get all dMint tokens with full mining details.
-        
+
         Args:
             limit: Maximum results (default 100)
-            offset: Pagination offset (default 0)
             active_only: If True, exclude fully-mined tokens
-            
+
         Returns:
-            Dict with dMint token list and pagination info
+            Dict with dMint token list, next_cursor, and pagination info
         """
         self.bump_cost(2.0)
         
@@ -673,7 +673,7 @@ class GlyphAPIMixin:
             return {'error': 'Glyph indexing not enabled'}
         
         return self.glyph_index.get_dmint_tokens(
-            limit=min(limit, 500), offset=offset, active_only=active_only
+            limit=min(limit, 500), active_only=active_only
         )
 
     # ========================================================================
@@ -732,7 +732,8 @@ class GlyphAPIMixin:
         except Exception as e:
             return {'error': str(e)}
 
-    async def glyph_list_encrypted_tokens(self, limit: int = 100, offset: int = 0,
+    async def glyph_list_encrypted_tokens(self, limit: int = 100,
+                                          cursor: str = None,
                                           timelocked_only: bool = False):
         """
         List encrypted (and optionally timelocked) Glyph tokens.
@@ -742,14 +743,11 @@ class GlyphAPIMixin:
 
         Args:
             limit: Maximum results (default 100, max 500)
-            offset: Pagination offset (default 0)
+            cursor: Opaque pagination cursor from previous response next_cursor
             timelocked_only: If True, only return tokens with GLYPH_TIMELOCK (9)
 
         Returns:
-            Dict with:
-              - tokens: list of token summary dicts
-              - total: count returned
-              - timelocked_only: the requested filter flag
+            Dict with tokens list, next_cursor, and timelocked_only flag
         """
         self.bump_cost(2.0)
 
@@ -757,16 +755,12 @@ class GlyphAPIMixin:
             return {'error': 'Glyph indexing not enabled'}
 
         try:
-            tokens = self.glyph_index.list_encrypted_tokens(
+            result = self.glyph_index.list_encrypted_tokens(
                 limit=min(limit, 500),
-                offset=offset,
+                cursor=cursor,
                 timelocked_only=bool(timelocked_only),
             )
-            return {
-                'tokens': tokens,
-                'total': len(tokens),
-                'timelocked_only': bool(timelocked_only),
-            }
+            return {**result, 'timelocked_only': bool(timelocked_only)}
         except Exception as e:
             return {'error': str(e)}
 

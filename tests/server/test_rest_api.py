@@ -256,9 +256,10 @@ class TestGlyphEndpoints:
         assert resp.json()['total_tokens'] == 42
 
     def test_get_glyphs_by_type(self, client, mock_glyph_index):
+        mock_glyph_index.get_tokens_by_type.return_value = {'tokens': [], 'next_cursor': None}
         resp = client.get('/glyphs/by-type/1')
         assert resp.status_code == 200
-        mock_glyph_index.get_tokens_by_type.assert_called_with(1, limit=100, offset=0)
+        mock_glyph_index.get_tokens_by_type.assert_called_with(1, limit=100, cursor=None)
 
     def test_get_glyph_by_ref(self, client, mock_glyph_index):
         ref = _make_ref()

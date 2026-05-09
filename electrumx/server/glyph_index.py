@@ -1167,7 +1167,7 @@ class GlyphIndex:
             return None
 
         db_key = GlyphDBKeys.KEY_REVEALS + ref
-        raw = self.db.utxo_db.get(db_key)
+        raw = self.key_reveal_cache.get(ref) or self.db.utxo_db.get(db_key)
         if not raw:
             return None
         try:
