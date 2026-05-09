@@ -11,5 +11,5 @@ cbor2>=5.4.0
 # REST API dependencies
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
-pydantic>=2.5.0
+pydantic>=2.13.4
 prometheus-client>=0.20.0
