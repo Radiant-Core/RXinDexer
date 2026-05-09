@@ -928,31 +928,20 @@ class GlyphIndex:
         Finds the dMint token that owns this contract ref and marks it as
         burned (is_spent=True), records a BURN event in history.
         """
-        # Search token cache and DB for a dMint token whose contract_ref
-        # matches the destroyed singleton.  contract_ref is stored as hex.
-        singleton_hex = singleton_ref.hex()
-        
         token_ref = None
         token = None
-        
-        # Check in-memory cache first
-        for ref, t in self.token_cache.items():
-            if (getattr(t, 'contract_ref', None) == singleton_hex
-                    and GlyphProtocol.GLYPH_DMINT in (t.protocols or [])):
-                token_ref = ref
-                token = t
-                break
-        
-        # Fall back to DB scan if not found in cache
-        if token is None:
-            prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', GlyphTokenType.DMINT)
-            for key, _ in self.db.utxo_db.iterator(prefix=prefix):
-                ref = key[len(prefix):]
-                t = self.get_token(ref)
-                if t and getattr(t, 'contract_ref', None) == singleton_hex:
-                    token_ref = ref
-                    token = t
-                    break
+
+        # R6: O(1) lookup via GC reverse index (contract_ref -> token_ref)
+        gc_key = GlyphDBKeys.CONTRACT_TO_TOKEN + singleton_ref
+        token_ref_bytes = self.db.utxo_db.get(gc_key)
+        if token_ref_bytes and len(token_ref_bytes) == 36:
+            token_ref = token_ref_bytes
+            token = self.token_cache.get(token_ref) or self.get_token(token_ref)
+        else:
+            # Fallback: check pending contract_to_token_cache (not yet flushed)
+            token_ref = self.contract_to_token_cache.get(singleton_ref)
+            if token_ref:
+                token = self.token_cache.get(token_ref) or self.get_token(token_ref)
         
         if token is None or token_ref is None:
             return  # Singleton doesn't belong to a known dMint token
@@ -971,7 +960,7 @@ class GlyphIndex:
         
         self.logger.info(
             f'dMint CONTRACT BURNED: token={hash_to_hex_str(token_ref[:32])} '
-            f'contract={singleton_hex[:32]}... height={height}'
+            f'contract={singleton_ref.hex()[:32]}... height={height}'
         )
     
     def _index_token_reveal(self, ref: bytes, tx_hash: bytes, vout_or_vin,

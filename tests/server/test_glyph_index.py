@@ -1230,6 +1230,7 @@ class TestBurnDetection:
         index.history_cache = []
         index._known_refs = set()
         index._undo_seen = {}
+        index.contract_to_token_cache = {}
 
         # Create a dMint token with a known contract_ref
         token_ref = b'\xaa' * 36
@@ -1242,6 +1243,7 @@ class TestBurnDetection:
         token.is_spent = False
         token.deploy_txid = b'\x00' * 32
         index.token_cache[token_ref] = token
+        index.contract_to_token_cache[singleton_ref] = token_ref
 
         tx_hash = b'\xcc' * 32
         index._process_contract_burn(tx_hash, 500, 0, singleton_ref)
@@ -1276,6 +1278,7 @@ class TestBurnDetection:
         index.token_height = {}
         index.history_cache = []
         index._known_refs = set()
+        index.contract_to_token_cache = {}
 
         # Create a dMint token with a DIFFERENT contract ref
         token_ref = b'\xaa' * 36
@@ -1314,6 +1317,7 @@ class TestBurnDetection:
         index.token_height = {}
         index.history_cache = []
         index._known_refs = set()
+        index.contract_to_token_cache = {}
 
         token_ref = b'\xaa' * 36
         singleton_ref = b'\xbb' * 36
@@ -1355,6 +1359,7 @@ class TestBurnDetection:
         index.history_cache = []
         index._known_refs = set()
         index._undo_seen = {}
+        index.contract_to_token_cache = {}
 
         # Create a dMint token with a known contract_ref
         token_ref = b'\xaa' * 36
