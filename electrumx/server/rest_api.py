@@ -567,14 +567,14 @@ def get_glyph_stats():
 async def get_glyphs_by_type(
     type_id: int = Path(..., ge=0, le=7, description="Token type ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, 5=WAVE, 6=Container, 7=Authority)"),
     limit: int = Query(default=100, le=500),
-    offset: int = Query(default=0, ge=0),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
 ):
     """Get tokens filtered by type."""
     _ensure_glyph_index()
 
     try:
-        result = _glyph_index.get_tokens_by_type(type_id, limit=limit, offset=offset)
-        return {"type_id": type_id, "tokens": result, "count": len(result)}
+        result = _glyph_index.get_tokens_by_type(type_id, limit=limit, cursor=cursor)
+        return {"type_id": type_id, **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -603,14 +603,14 @@ async def get_glyph(ref: str = Path(..., min_length=72, max_length=72)):
 async def get_token_holders(
     ref: str = Path(..., min_length=72, max_length=72),
     limit: int = Query(default=100, le=500),
-    offset: int = Query(default=0, ge=0)
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
 ):
     """Get token holders with their balances."""
     _ensure_glyph_index()
 
     try:
         ref_bytes = bytes.fromhex(ref)
-        return _glyph_index.get_token_holders(ref_bytes, limit=limit, offset=offset)
+        return _glyph_index.get_token_holders(ref_bytes, limit=limit, cursor=cursor)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
@@ -756,7 +756,7 @@ async def get_token_metadata(ref: str = Path(..., min_length=72, max_length=72))
 @app.get("/glyphs/encrypted", tags=["Encrypted"])
 async def list_encrypted_tokens(
     limit: int = Query(default=100, le=500),
-    offset: int = Query(default=0, ge=0),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
     timelocked_only: bool = Query(default=False, description="Only return timelocked tokens"),
 ):
     """
@@ -767,10 +767,10 @@ async def list_encrypted_tokens(
     """
     _ensure_glyph_index()
     try:
-        tokens = _glyph_index.list_encrypted_tokens(
-            limit=limit, offset=offset, timelocked_only=timelocked_only
+        result = _glyph_index.list_encrypted_tokens(
+            limit=limit, cursor=cursor, timelocked_only=timelocked_only
         )
-        return {"tokens": tokens, "total": len(tokens), "timelocked_only": timelocked_only}
+        return {**result, "timelocked_only": timelocked_only}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1089,14 +1089,14 @@ async def get_dmint_mint_history(
 @app.get("/dmint/tokens", tags=["dMint"])
 async def get_dmint_tokens(
     limit: int = Query(default=100, le=500),
-    offset: int = Query(default=0, ge=0),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
     active_only: bool = Query(default=True),
 ):
     """Get all dMint tokens with full mining details (algorithm, difficulty, reward, supply)."""
     _ensure_glyph_index()
 
     try:
-        return _glyph_index.get_dmint_tokens(limit=limit, offset=offset, active_only=active_only)
+        return _glyph_index.get_dmint_tokens(limit=limit, cursor=cursor, active_only=active_only)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
