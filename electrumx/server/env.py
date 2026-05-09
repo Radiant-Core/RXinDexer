@@ -8,8 +8,11 @@
 '''Class for handling environment configuration and defaults.'''
 
 
+import logging
 import re
 from ipaddress import IPv4Address, IPv6Address
+
+_logger = logging.getLogger('electrumx.server.env')
 
 from aiorpcx import Service, ServicePart
 from electrumx.lib.coins import Coin
@@ -70,16 +73,29 @@ class Env(EnvBase):
         self.donation_address = self.default('DONATION_ADDRESS', '')
         self.drop_client = self.custom("DROP_CLIENT", None, re.compile)
         self.cache_MB = self.integer('CACHE_MB', 1200)
-        self.reorg_limit = self.integer('REORG_LIMIT', self.coin.REORG_LIMIT)
+
+        # R26: default 100; coin default may be far larger (e.g. 1000) which wastes DB space
+        self.reorg_limit = self.integer('REORG_LIMIT', 100)
+        if self.reorg_limit < 10:
+            _logger.warning(
+                f'REORG_LIMIT={self.reorg_limit} is dangerously low — reorgs deeper than '
+                f'{self.reorg_limit} blocks cannot be handled safely. Minimum recommended: 10'
+            )
+
+        # R25: MINIMAL_MODE=1 disables all optional indexers and REST API
+        minimal = self.boolean('MINIMAL_MODE', False)
 
         # RXinDexer: Glyph/WAVE/Swap indexing configuration
-        self.glyph_index = self.boolean('GLYPH_INDEX', True)
-        self.wave_index = self.boolean('WAVE_INDEX', True)
-        self.swap_index = self.boolean('SWAP_INDEX', True)
-        self.analytics_index = self.boolean('ANALYTICS_INDEX', True)
-        self.glyph_subscriptions = self.boolean('GLYPH_SUBSCRIPTIONS', True)
-        self.mempool_glyph_index = self.boolean('MEMPOOL_GLYPH_INDEX', True)
-        self.mempool_swap_index = self.boolean('MEMPOOL_SWAP_INDEX', True)
+        self.glyph_index = False if minimal else self.boolean('GLYPH_INDEX', True)
+        self.wave_index = False if minimal else self.boolean('WAVE_INDEX', True)
+        self.swap_index = False if minimal else self.boolean('SWAP_INDEX', True)
+        self.analytics_index = False if minimal else self.boolean('ANALYTICS_INDEX', True)
+        self.glyph_subscriptions = False if minimal else self.boolean('GLYPH_SUBSCRIPTIONS', True)
+        self.mempool_glyph_index = False if minimal else self.boolean('MEMPOOL_GLYPH_INDEX', True)
+        self.mempool_swap_index = False if minimal else self.boolean('MEMPOOL_SWAP_INDEX', True)
+        self.rest_api = False if minimal else self.boolean('REST_API', True)
+        if minimal:
+            _logger.info('MINIMAL_MODE enabled: all optional indexers and REST API disabled')
         
         # WAVE naming system configuration
         self.wave_genesis_ref = self.default('WAVE_GENESIS_REF', None)
