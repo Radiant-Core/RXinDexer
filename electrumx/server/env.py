@@ -74,12 +74,13 @@ class Env(EnvBase):
         self.drop_client = self.custom("DROP_CLIENT", None, re.compile)
         self.cache_MB = self.integer('CACHE_MB', 1200)
 
-        # R26: default 100; coin default may be far larger (e.g. 1000) which wastes DB space
-        self.reorg_limit = self.integer('REORG_LIMIT', 100)
-        if self.reorg_limit < 10:
+        # R26: use coin.REORG_LIMIT as default (Radiant coin sets 6 = node max reorg depth)
+        # Warn if set to an unreasonably low value
+        self.reorg_limit = self.integer('REORG_LIMIT', self.coin.REORG_LIMIT)
+        if self.reorg_limit < 2:
             _logger.warning(
                 f'REORG_LIMIT={self.reorg_limit} is dangerously low — reorgs deeper than '
-                f'{self.reorg_limit} blocks cannot be handled safely. Minimum recommended: 10'
+                f'{self.reorg_limit} blocks cannot be handled safely'
             )
 
         # R25: MINIMAL_MODE=1 disables all optional indexers and REST API
