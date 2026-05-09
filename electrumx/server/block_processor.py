@@ -272,6 +272,7 @@ class BlockProcessor:
 
         # Subscription manager for real-time notifications
         self.subscriptions = None
+        self._subscription_callback_warned = False  # R27: warn once if callback never wired
         if HAS_SUBSCRIPTIONS and getattr(env, 'glyph_subscriptions', True):
             self.subscriptions = GlyphSubscriptionManager(env)
             self.logger.info('Glyph/Swap subscriptions initialized')
@@ -496,6 +497,15 @@ class BlockProcessor:
 
     async def _advance_block(self, block):
         '''Advance once block.  It is already verified they correctly connect onto our tip.'''
+        # R27: warn once if subscriptions are enabled but the session layer never wired a callback
+        if (self.subscriptions is not None
+                and not self._subscription_callback_warned
+                and self.subscriptions.notify_callback is None):
+            self._subscription_callback_warned = True
+            self.logger.warning(
+                'Glyph subscriptions enabled but no notify_callback set — '
+                'real-time notifications will be silently dropped'
+            )
         min_height = self.db.min_undo_height(self.daemon.cached_height())
         height = self.height + 1
 
