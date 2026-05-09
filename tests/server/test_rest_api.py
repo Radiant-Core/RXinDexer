@@ -365,8 +365,17 @@ class TestDMintEndpoints:
         mock_dmint_contracts.get_contracts_extended.return_value = {
             'contracts': [{'ref': 'a'*72, 'algorithm': 1}],
         }
+        resp = client.get('/dmint/contracts?format=extended')
+        assert resp.status_code == 200
+
+    def test_get_contracts_v2_default(self, client, mock_dmint_contracts):
+        mock_dmint_contracts.get_contracts_v2.return_value = {
+            'items': [{'ref': 'a'*72, 'algo_id': 1}],
+            'next_cursor': None,
+        }
         resp = client.get('/dmint/contracts')
         assert resp.status_code == 200
+        mock_dmint_contracts.get_contracts_v2.assert_called_once()
 
     def test_get_contracts_simple(self, client, mock_dmint_contracts):
         resp = client.get('/dmint/contracts?format=simple')
