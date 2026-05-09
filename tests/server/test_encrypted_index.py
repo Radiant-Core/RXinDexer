@@ -365,7 +365,9 @@ class TestListEncryptedTokens:
         idx = self._make_index()
         plain = make_token([GlyphProtocol.GLYPH_NFT], name="Plain")
         idx.token_cache[plain.ref] = plain
-        assert idx.list_encrypted_tokens() == []
+        result = idx.list_encrypted_tokens()
+        assert result['tokens'] == []
+        assert result['next_cursor'] is None
 
     def test_returns_encrypted_tokens(self):
         idx = self._make_index()
@@ -376,7 +378,8 @@ class TestListEncryptedTokens:
         enc.deploy_txid = bytes(32)
         enc.metadata_hash = None
         idx.token_cache[enc.ref] = enc
-        results = idx.list_encrypted_tokens()
+        result = idx.list_encrypted_tokens()
+        results = result['tokens']
         assert len(results) == 1
         assert results[0].get("is_encrypted") is True
 
@@ -404,11 +407,11 @@ class TestListEncryptedTokens:
         idx.token_cache[tl.ref] = tl
 
         all_enc = idx.list_encrypted_tokens()
-        assert len(all_enc) == 2
+        assert len(all_enc['tokens']) == 2
 
         tl_only = idx.list_encrypted_tokens(timelocked_only=True)
-        assert len(tl_only) == 1
-        names = [t.get("name") for t in tl_only]
+        assert len(tl_only['tokens']) == 1
+        names = [t.get("name") for t in tl_only['tokens']]
         assert "TimeLocked" in names
 
     def test_pagination(self):
@@ -424,13 +427,15 @@ class TestListEncryptedTokens:
             t.metadata_hash = None
             idx.token_cache[t.ref] = t
 
-        page1 = idx.list_encrypted_tokens(limit=2, offset=0)
-        page2 = idx.list_encrypted_tokens(limit=2, offset=2)
-        assert len(page1) == 2
-        assert len(page2) == 2
+        page1 = idx.list_encrypted_tokens(limit=2)
+        assert len(page1['tokens']) == 2
+        next_cursor = page1['next_cursor']
+        assert next_cursor is not None
+        page2 = idx.list_encrypted_tokens(limit=2, cursor=next_cursor)
+        assert len(page2['tokens']) == 2
         # Pages should not overlap
-        refs1 = {r["ref"] for r in page1}
-        refs2 = {r["ref"] for r in page2}
+        refs1 = {r["ref"] for r in page1['tokens']}
+        refs2 = {r["ref"] for r in page2['tokens']}
         assert refs1.isdisjoint(refs2)
 
     def test_returns_empty_when_disabled(self):
