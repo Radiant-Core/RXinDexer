@@ -76,6 +76,7 @@ services:
       - REST_API_PORT=8000
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - REST_API_KEY=${REST_API_KEY}
+      - REST_REQUIRE_API_KEY_IN_PROD=0
       # Performance tuning
       - CACHE_MB=${CACHE_MB:-2000}
       - MAX_SESSIONS=${MAX_SESSIONS:-10000}

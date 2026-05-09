@@ -1000,6 +1000,8 @@ class BlockProcessor:
         self.height = self.db.db_height
         self.tip = self.db.db_tip
         self.tx_count = self.db.db_tx_count
+        if self.glyph_index:
+            self.glyph_index.post_open_init()
         if self.analytics_index and self.height >= 0:
             self.analytics_index.backfill(self.height)
 

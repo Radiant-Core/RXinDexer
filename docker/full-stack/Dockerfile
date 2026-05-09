@@ -47,14 +47,12 @@ RUN groupadd -r electrumx && useradd -r -g electrumx -u 1000 electrumx
 # Create directories
 RUN mkdir -p /data/electrumdb /data/contracts && chown -R electrumx:electrumx /data
 
-WORKDIR /opt
-
-# Clone RXinDexer from GitHub
-ARG RXINDEXER_BRANCH=main
-RUN git clone --depth 1 --branch ${RXINDEXER_BRANCH} \
-    https://github.com/Radiant-Core/RXinDexer.git electrumx
+RUN mkdir -p /opt/electrumx
 
 WORKDIR /opt/electrumx
+
+# Copy source from build context (../../ relative to docker/full-stack/)
+COPY . .
 
 # Install Python dependencies
 # Fix: Pin Cython<3 BEFORE installing python-rocksdb to avoid Cython 3 incompatibility
