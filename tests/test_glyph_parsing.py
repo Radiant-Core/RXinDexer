@@ -632,3 +632,251 @@ class TestCrossFormatConsistency:
             assert meta.get('name') == sample.get('name'), (
                 f"{label} name mismatch: {meta.get('name')} != {sample.get('name')}"
             )
+
+
+# ============================================================================
+# dMint contract state parsing (R28/R29)
+# ============================================================================
+
+from electrumx.lib.glyph import parse_dmint_contract_state
+
+
+def _scriptnum(value: int) -> bytes:
+    """Encode *value* as a minimal CScriptNum (little-endian with sign bit)."""
+    if value == 0:
+        return b''
+    negative = value < 0
+    absval = abs(value)
+    result = []
+    while absval:
+        result.append(absval & 0xFF)
+        absval >>= 8
+    if result[-1] & 0x80:
+        result.append(0x80 if negative else 0x00)
+    elif negative:
+        result[-1] |= 0x80
+    return bytes(result)
+
+
+def _push_scriptnum(value: int) -> bytes:
+    """Return a minimal data-push encoding a CScriptNum value."""
+    data = _scriptnum(value)
+    return _push(data)
+
+
+def _make_dmint_v1_state(
+    height: int,
+    max_height: int,
+    reward: int,
+    target: int,
+    contract_ref: bytes = None,
+    token_ref: bytes = None,
+) -> bytes:
+    """Build a synthetic V1 dMint contract state output script."""
+    if contract_ref is None:
+        contract_ref = bytes(36)
+    if token_ref is None:
+        token_ref = bytes(36)
+    state_prefix = (
+        _push_scriptnum(height)
+        + bytes([0xd8]) + contract_ref
+        + bytes([0xd0]) + token_ref
+        + _push_scriptnum(max_height)
+        + _push_scriptnum(reward)
+        + _push_scriptnum(target)
+    )
+    # Append OP_CHECKTEMPLATEVERIFY (0xbd) as contract bytecode marker
+    return state_prefix + bytes([0xbd]) + bytes(10)
+
+
+def _make_dmint_v2_state(
+    height: int,
+    max_height: int,
+    reward: int,
+    algo_id: int,
+    daa_mode: int,
+    target_time: int,
+    last_time: int,
+    target: int,
+    contract_ref: bytes = None,
+    token_ref: bytes = None,
+) -> bytes:
+    """Build a synthetic V2 dMint contract state output script."""
+    if contract_ref is None:
+        contract_ref = bytes(36)
+    if token_ref is None:
+        token_ref = bytes(36)
+    state_prefix = (
+        _push_scriptnum(height)
+        + bytes([0xd8]) + contract_ref
+        + bytes([0xd0]) + token_ref
+        + _push_scriptnum(max_height)
+        + _push_scriptnum(reward)
+        + _push_scriptnum(algo_id)
+        + _push_scriptnum(daa_mode)
+        + _push_scriptnum(target_time)
+        + _push_scriptnum(last_time)
+        + _push_scriptnum(target)
+    )
+    return state_prefix + bytes([0xbd]) + bytes(10)
+
+
+class TestDmintContractStateParsing:
+    """R28/R29 — parse_dmint_contract_state: V1 + V2 algo IDs and DAA modes."""
+
+    # ------------------------------------------------------------------ V1
+    def test_v1_basic(self):
+        """V1 contract parses height/max_height/reward/target without algo fields."""
+        script = _make_dmint_v1_state(
+            height=500_000, max_height=1_000_000, reward=5_000, target=0x1FFFFFFF,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['height'] == 500_000
+        assert result['max_height'] == 1_000_000
+        assert result['reward'] == 5_000
+        assert result['target'] == 0x1FFFFFFF
+        assert 'algo_id' not in result
+        assert 'daa_mode' not in result
+
+    def test_v1_with_real_refs(self):
+        """V1 contract_ref and token_ref are correctly extracted."""
+        cref = bytes(range(36))
+        tref = bytes(range(36, 72))
+        script = _make_dmint_v1_state(
+            height=1, max_height=10, reward=1000, target=0xFFFF,
+            contract_ref=cref, token_ref=tref,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result['contract_ref'] == cref.hex()
+        assert result['token_ref'] == tref.hex()
+
+    # ------------------------------------------------------------------ V2 algo IDs
+    def test_v2_sha256d_algo0(self):
+        """V2 SHA256d: algo_id=0, daa_mode=0 (fixed)."""
+        script = _make_dmint_v2_state(
+            height=410_001, max_height=2_000_000, reward=10_000,
+            algo_id=0, daa_mode=0,
+            target_time=600, last_time=1_700_000_000,
+            target=0x00000000FFFF0000,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['algo_id'] == 0
+        assert result['daa_mode'] == 0
+        assert result['height'] == 410_001
+        assert result['target'] == 0x00000000FFFF0000
+
+    def test_v2_blake3_algo1(self):
+        """V2 BLAKE3: algo_id=1 — primary V2 proof-of-work algorithm."""
+        script = _make_dmint_v2_state(
+            height=410_100, max_height=500_000, reward=5_000,
+            algo_id=1, daa_mode=2,          # ASERT DAA
+            target_time=120, last_time=1_700_001_000,
+            target=0x00000000AABBCCDD,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['algo_id'] == 1       # BLAKE3
+        assert result['daa_mode'] == 2      # ASERT
+
+    def test_v2_k12_algo2(self):
+        """V2 K12: algo_id=2 — alternative V2 proof-of-work algorithm."""
+        script = _make_dmint_v2_state(
+            height=410_200, max_height=600_000, reward=2_500,
+            algo_id=2, daa_mode=3,          # LWMA DAA
+            target_time=300, last_time=1_700_002_000,
+            target=0x0000000011223344,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['algo_id'] == 2       # K12
+        assert result['daa_mode'] == 3      # LWMA
+
+    # ------------------------------------------------------------------ DAA modes
+    def test_v2_daa_asert_mode2(self):
+        """ASERT DAA (mode=2): target_time and last_time are present and correct."""
+        script = _make_dmint_v2_state(
+            height=411_000, max_height=999_999, reward=1_000,
+            algo_id=1, daa_mode=2,
+            target_time=600, last_time=1_700_010_000,
+            target=0x00000000DEADBEEF,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result['daa_mode'] == 2
+        assert result['target_time'] == 600
+        assert result['last_time'] == 1_700_010_000
+
+    def test_v2_daa_lwma_mode3(self):
+        """LWMA DAA (mode=3): all V2 fields parsed correctly."""
+        script = _make_dmint_v2_state(
+            height=412_000, max_height=800_000, reward=3_000,
+            algo_id=2, daa_mode=3,
+            target_time=240, last_time=1_700_020_000,
+            target=0x0000000055AAFF00,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result['daa_mode'] == 3
+        assert result['target_time'] == 240
+
+    def test_v2_daa_fixed_mode0(self):
+        """Fixed DAA (mode=0): no adjustment, target_time stored but constant."""
+        script = _make_dmint_v2_state(
+            height=410_500, max_height=2_000_000, reward=50_000,
+            algo_id=0, daa_mode=0,
+            target_time=600, last_time=1_700_005_000,
+            target=0x000000001FFFFFFF,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result['daa_mode'] == 0
+        assert result['algo_id'] == 0
+
+    # ------------------------------------------------------------------ V2 boundary: algo_id exactly at boundary values
+    def test_v2_algo_id_boundary_4(self):
+        """algo_id=4 is accepted (highest valid value per spec)."""
+        script = _make_dmint_v2_state(
+            height=420_000, max_height=1_000_000, reward=1_000,
+            algo_id=4, daa_mode=4,
+            target_time=60, last_time=1_700_100_000,
+            target=0xFFFF,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['algo_id'] == 4
+
+    def test_v2_algo_id_5_falls_back_to_v1(self):
+        """algo_id=5 exceeds V2 range — parser treats script as V1 (no algo_id key)."""
+        script = _make_dmint_v2_state(
+            height=420_000, max_height=1_000_000, reward=1_000,
+            algo_id=5, daa_mode=0,
+            target_time=60, last_time=1_700_100_000,
+            target=0xFFFF,
+        )
+        result = parse_dmint_contract_state(script)
+        # Not detected as V2 — algo_id not present or parsed as V1
+        assert result is None or 'algo_id' not in result
+
+    # ------------------------------------------------------------------ Edge cases
+    def test_returns_none_for_empty(self):
+        assert parse_dmint_contract_state(b'') is None
+
+    def test_returns_none_for_short_script(self):
+        assert parse_dmint_contract_state(bytes(79)) is None
+
+    def test_returns_none_without_d8_opcode(self):
+        """Script without OP_PUSHINPUTREFSINGLETON (0xd8) is not a dMint contract."""
+        script = bytes(100)   # no 0xd8 byte
+        assert parse_dmint_contract_state(script) is None
+
+    def test_v2_large_target_value(self):
+        """target can be an 8-byte value (full 64-bit range)."""
+        big_target = 0x00000000FFFFFFFF
+        script = _make_dmint_v2_state(
+            height=450_000, max_height=1_000_000, reward=10_000,
+            algo_id=1, daa_mode=2,
+            target_time=600, last_time=1_750_000_000,
+            target=big_target,
+        )
+        result = parse_dmint_contract_state(script)
+        assert result is not None
+        assert result['target'] == big_target

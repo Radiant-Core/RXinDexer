@@ -349,6 +349,19 @@ WAVE_INDEX=1
 SWAP_INDEX=1
 ```
 
+### Startup fails with "Glyph DB schema version X < 2. A full reindex is required."
+
+RXinDexer v2.0+ uses Glyph DB schema version 2. Existing nodes running an older version must perform a full reindex — there is no automatic migration. To reindex:
+
+```bash
+# Stop the server, delete the DB, and restart
+docker compose down
+docker volume rm rxindexer_data   # or manually remove the DB directory
+docker compose up
+```
+
+> **Note:** The schema version check is enforced at startup. The server will not start with a stale v1 schema.
+
 ## Architecture
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed information on:
