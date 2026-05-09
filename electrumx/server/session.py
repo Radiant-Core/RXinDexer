@@ -295,10 +295,11 @@ class SessionManager:
         '''Clear caches on chain reorgs.'''
         while True:
             await self.bp.backed_up_event.wait()
-            self.logger.info('reorg signalled; clearing tx_hashes and merkle caches')
+            self.logger.info('reorg signalled; clearing tx_hashes, merkle and ref_get caches')
             self._reorg_count += 1
             self._tx_hashes_cache.clear()
             self._merkle_cache.clear()
+            self._ref_get_cache.clear()
 
     async def _recalc_concurrency(self):
         '''Periodically recalculate session concurrency.'''
