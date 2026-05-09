@@ -183,8 +183,8 @@ class RocksDB(Storage):
     def write_batch(self):
         return RocksDBWriteBatch(self.db)
 
-    def iterator(self, prefix=b'', reverse=False):
-        return RocksDBIterator(self.db, prefix, reverse)
+    def iterator(self, prefix=b'', reverse=False, seek=None):
+        return RocksDBIterator(self.db, prefix, reverse, seek=seek)
 
 
 class RocksDBWriteBatch(object):
@@ -205,7 +205,7 @@ class RocksDBWriteBatch(object):
 class RocksDBIterator(object):
     '''An iterator for RocksDB.'''
 
-    def __init__(self, db, prefix, reverse):
+    def __init__(self, db, prefix, reverse, seek=None):
         self.prefix = prefix
         if reverse:
             self.iterator = reversed(db.iteritems())
@@ -220,7 +220,9 @@ class RocksDBIterator(object):
                 self.iterator.seek_to_last()
         else:
             self.iterator = db.iteritems()
-            self.iterator.seek(prefix)
+            # R16: if a cursor seek key is provided, use it (must be >= prefix)
+            start = seek if (seek and seek >= prefix) else prefix
+            self.iterator.seek(start)
 
     def __iter__(self):
         return self

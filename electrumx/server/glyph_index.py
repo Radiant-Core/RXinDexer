@@ -1180,8 +1180,9 @@ class GlyphIndex:
         except Exception:
             return None
 
-    def list_encrypted_tokens(self, limit: int = 100, offset: int = 0,
-                              timelocked_only: bool = False) -> List[Dict]:
+    def list_encrypted_tokens(self, limit: int = 100,
+                              timelocked_only: bool = False,
+                              cursor: Optional[str] = None) -> Dict[str, Any]:
         """
         Return a list of encrypted (and optionally timelocked) tokens.
 
@@ -1225,7 +1226,18 @@ class GlyphIndex:
             pass
 
         results.sort(key=lambda t: t.get('deploy_height', 0), reverse=True)
-        return results[offset:offset + limit]
+        # R16: list_encrypted_tokens does a full filter scan (no RocksDB prefix seek possible)
+        # so we use offset/limit on the post-filter sorted list; next_cursor is index-based.
+        import base64
+        start = 0
+        if cursor:
+            try:
+                start = int(base64.b64decode(cursor).decode())
+            except Exception:
+                start = 0
+        page = results[start:start + limit]
+        next_cursor = base64.b64encode(str(start + limit).encode()).decode() if len(results) > start + limit else None
+        return {'tokens': page, 'next_cursor': next_cursor}
 
     def update_balance(self, height: int, scripthash: bytes, ref: bytes, delta: int):
         """Update a token balance."""
@@ -1556,20 +1568,40 @@ class GlyphIndex:
             return struct.unpack('<Q', data)[0]
         return 0
     
-    def get_balances_for_scripthash(self, scripthash: bytes, 
-                                     limit: int = 100) -> List[Dict]:
+    @staticmethod
+    def _decode_cursor(cursor: Optional[str]) -> Optional[bytes]:
+        """R16: Decode opaque base64 cursor to raw RocksDB seek key."""
+        if not cursor:
+            return None
+        try:
+            import base64
+            return base64.b64decode(cursor)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _encode_cursor(raw_key: bytes) -> str:
+        """R16: Encode raw RocksDB key to opaque base64 cursor."""
+        import base64
+        return base64.b64encode(raw_key).decode()
+
+    def get_balances_for_scripthash(self, scripthash: bytes,
+                                     limit: int = 100,
+                                     cursor: Optional[str] = None) -> Dict[str, Any]:
         """Get all token balances for a scripthash."""
         results = []
         prefix = GlyphDBKeys.BALANCE + scripthash
-        
-        for key, value in self.db.utxo_db.iterator(prefix=prefix):
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, value in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
             if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
                 break
-            
+
             ref = key[len(prefix):]
             amount = struct.unpack('<Q', value)[0]
-            
-            # Get token info
+
             token = self.get_token(ref)
             if token:
                 results.append({
@@ -1580,8 +1612,8 @@ class GlyphIndex:
                     'decimals': token.decimals,
                     'type': token.token_type,
                 })
-        
-        return results
+
+        return {'balances': results, 'next_cursor': next_cursor}
     
     def get_token_history(self, ref: bytes, limit: int = 100, 
                           offset: int = 0) -> List[Dict]:
@@ -1667,36 +1699,36 @@ class GlyphIndex:
             'offset': offset,
         }
     
-    def get_dmint_tokens(self, limit: int = 100, offset: int = 0,
-                         active_only: bool = True) -> Dict[str, Any]:
+    def get_dmint_tokens(self, limit: int = 100, active_only: bool = True,
+                         cursor: Optional[str] = None) -> Dict[str, Any]:
         """
         Get all dMint tokens with full mining details.
-        
+
         Optionally filter to active-only (not fully mined).
+        Supports cursor-based pagination via opaque `cursor` / `next_cursor`.
         """
         tokens = []
-        total = 0
-        
         prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', GlyphTokenType.DMINT)
-        for key, _ in self.db.utxo_db.iterator(prefix=prefix):
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
             ref = key[len(prefix):]
             token = self.get_token(ref)
             if not token:
                 continue
-            
             if active_only and token.is_spent:
                 continue
-            
-            total += 1
-            if total > offset and len(tokens) < limit:
-                tokens.append(self._token_to_dict(token))
-        
+            if len(tokens) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            tokens.append(self._token_to_dict(token))
+
         return {
-            'total': total,
             'tokens': tokens,
             'limit': limit,
-            'offset': offset,
             'active_only': active_only,
+            'next_cursor': next_cursor,
         }
     
     def search_tokens(self, query: str, protocols: List[int] = None,
@@ -1725,26 +1757,23 @@ class GlyphIndex:
         return results
     
     def get_tokens_by_type(self, token_type: int, limit: int = 100,
-                           offset: int = 0) -> List[Dict]:
-        """Get tokens by type."""
+                           cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Get tokens by type with cursor-based pagination."""
         results = []
         prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', token_type)
-        count = 0
-        
-        for key, _ in self.db.utxo_db.iterator(prefix=prefix):
-            if count < offset:
-                count += 1
-                continue
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
             if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
                 break
-            
             ref = key[len(prefix):]
             token = self.get_token(ref)
             if token:
                 results.append(self._token_to_dict(token))
-            count += 1
-        
-        return results
+
+        return {'tokens': results, 'next_cursor': next_cursor}
     
     def get_metadata(self, metadata_hash: bytes) -> Optional[Dict]:
         """Get parsed metadata by hash."""
@@ -1942,39 +1971,38 @@ class GlyphIndex:
     # TOKEN ANALYTICS API
     # =========================================================================
     
-    def get_token_holders(self, ref: bytes, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    def get_token_holders(self, ref: bytes, limit: int = 100,
+                          cursor: Optional[str] = None) -> Dict[str, Any]:
         """
         Get token holders for a specific token.
-        
+
         Uses the HOLDER_BY_REF secondary index for efficient lookup:
         GR + ref + scripthash -> amount
+        Supports cursor-based pagination.
         """
         holders = []
-        total_holders = 0
         prefix = GlyphDBKeys.HOLDER_BY_REF + ref
-        
-        for key, value in self.db.utxo_db.iterator(prefix=prefix):
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, value in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
             balance = struct.unpack('<Q', value)[0] if len(value) == 8 else 0
             if balance <= 0:
                 continue
-            
-            total_holders += 1
-            if total_holders > offset and len(holders) < limit:
-                scripthash = key[len(prefix):len(prefix)+32]
-                holders.append({
-                    'scripthash': scripthash.hex(),
-                    'balance': balance,
-                })
-            elif len(holders) >= limit and total_holders > offset + limit:
-                # We have enough results; keep counting total but stop collecting
-                pass
-        
+            if len(holders) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            scripthash = key[len(prefix):len(prefix) + 32]
+            holders.append({
+                'scripthash': scripthash.hex(),
+                'balance': balance,
+            })
+
         return {
             'ref': ref.hex(),
-            'total_holders': total_holders,
             'holders': holders,
             'limit': limit,
-            'offset': offset,
+            'next_cursor': next_cursor,
         }
     
     def get_token_supply(self, ref: bytes) -> Optional[Dict[str, Any]]:
