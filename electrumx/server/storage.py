@@ -107,20 +107,77 @@ class RocksDB(Storage):
         cls.module = rocksdb
 
     def open(self, name, create):
-        mof = 512 if self.for_sync else 128
-        # Use snappy compression (the default)
-        options = self.module.Options(create_if_missing=create,
-                                      use_fsync=True,
-                                      target_file_size_base=33554432,
-                                      max_open_files=mof)
+        env_name = os.environ.get('ELECTRUMX_ENV', 'dev').strip().lower()
+        is_sync = self.for_sync
+
+        # R23: read tuning env vars with per-env defaults
+        def _int(var, default):
+            try:
+                return int(os.environ.get(var, default))
+            except (ValueError, TypeError):
+                return int(default)
+
+        def _bool(var, default):
+            v = os.environ.get(var, '').strip().lower()
+            if not v:
+                return default
+            return v not in ('0', 'false', 'no')
+
+        # max_open_files: more during sync, fewer while serving
+        default_mof = 512 if is_sync else 256
+        mof = _int('ROCKSDB_MAX_OPEN_FILES', default_mof)
+
+        use_fsync = _bool('ROCKSDB_USE_FSYNC', env_name == 'prod')
+
+        options = self.module.Options(
+            create_if_missing=create,
+            use_fsync=use_fsync,
+            max_open_files=mof,
+            target_file_size_base=_int('ROCKSDB_TARGET_FILE_SIZE_BASE', 33554432),
+            write_buffer_size=_int('ROCKSDB_WRITE_BUFFER_SIZE', 67108864),
+            max_write_buffer_number=_int('ROCKSDB_MAX_WRITE_BUFFER_NUMBER', 3),
+            min_write_buffer_number_to_merge=_int('ROCKSDB_MIN_WRITE_BUFFER_NUMBER_TO_MERGE', 1),
+            max_background_compactions=_int('ROCKSDB_MAX_BACKGROUND_COMPACTIONS', 4),
+            max_background_flushes=_int('ROCKSDB_MAX_BACKGROUND_FLUSHES', 2),
+        )
+
+        # Block-based table options: bloom filter + block cache
+        bloom_bits = _int('ROCKSDB_BLOOM_BITS_PER_KEY', 10)
+        block_size = _int('ROCKSDB_BLOCK_SIZE', 4096)
+        cache_mb = _int('ROCKSDB_BLOCK_CACHE_MB', 128)
+        table_opts = self.module.BlockBasedTableFactory(
+            filter_policy=self.module.BloomFilterPolicy(bloom_bits),
+            block_cache=self.module.LRUCache(cache_mb * 1024 * 1024),
+            block_size=block_size,
+        )
+        options.table_factory = table_opts
+
+        # Compression (R23)
+        compression_name = os.environ.get('ROCKSDB_COMPRESSION', 'lz4').strip().lower()
+        _compression_map = {
+            'none': self.module.CompressionType.no_compression,
+            'snappy': self.module.CompressionType.snappy_compression,
+            'lz4': self.module.CompressionType.lz4_compression,
+            'zstd': self.module.CompressionType.zstd_compression,
+            'zlib': self.module.CompressionType.zlib_compression,
+        }
+        options.compression = _compression_map.get(
+            compression_name, self.module.CompressionType.lz4_compression
+        )
+
         self.db = self.module.DB(name, options)
         self.get = self.db.get
         self.put = self.db.put
 
     def close(self):
-        # PyRocksDB doesn't provide a close method; hopefully this is enough
-        self.db = self.get = self.put = None
+        # R24: del self.db first so python-rocksdb destructor fires and closes
+        # the underlying RocksDB handle before gc.collect() sweeps references.
         import gc
+        db = self.db
+        self.db = None
+        self.get = None
+        self.put = None
+        del db
         gc.collect()
 
     def write_batch(self):

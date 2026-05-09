@@ -15,14 +15,13 @@ Database Schema:
 - wave_zones: ref -> zone records (cached metadata)
 """
 
-import ast
 import struct
 from typing import Optional, Dict, Any, List, Tuple, Set
 from collections import defaultdict
 
 from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256
-from electrumx.lib.util import pack_be_uint32
+from electrumx.lib.util import pack_be_uint32, encode_undo, decode_undo
 from electrumx.lib.glyph import GlyphProtocol
 
 try:
@@ -465,7 +464,7 @@ class WaveIndex:
         raw = self.db.utxo_db.get(self._undo_key(height))
         if not raw:
             return
-        entries = ast.literal_eval(raw.decode())
+        entries = decode_undo(raw)  # R22
         for key, prev in entries:
             if prev is None:
                 batch.delete(key)
@@ -536,7 +535,7 @@ class WaveIndex:
 
         # Persist undo information last so it includes keys written above.
         for height, entries in sorted(self._undo_cache.items()):
-            batch.put(self._undo_key(height), repr(entries).encode())
+            batch.put(self._undo_key(height), encode_undo(entries))  # R22
         self._undo_cache.clear()
         self._undo_seen.clear()
         
