@@ -5,14 +5,13 @@ This module provides database storage and indexing for Glyph v1/v2 tokens.
 Handles token registration, balance tracking, and history.
 """
 
-import ast
 import struct
 from typing import Optional, Dict, Any, List, Tuple, Set
 from collections import defaultdict
 
 from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256, HASHX_LEN
-from electrumx.lib.util import pack_be_uint32
+from electrumx.lib.util import pack_be_uint32, encode_undo, decode_undo
 from electrumx.lib.glyph import (
     GLYPH_MAGIC,
     GlyphProtocol,
@@ -39,17 +38,23 @@ except ImportError:
 # Database key prefixes for Glyph data
 class GlyphDBKeys:
     """Database key prefixes for Glyph index."""
-    TOKEN = b'GT'          # GT + ref -> token info
-    METADATA = b'GM'       # GM + metadata_hash -> CBOR metadata
-    BALANCE = b'GB'        # GB + scripthash + ref -> amount
-    HISTORY = b'GH'        # GH + ref + height + tx_idx -> event
-    BY_TYPE = b'GY'        # GY + type + ref -> (for type queries)
-    BY_NAME = b'GN'        # GN + name_hash -> ref (for search)
-    BY_TICKER = b'GK'      # GK + ticker -> ref (for FT lookup)
-    SUPPLY = b'GS'         # GS + ref -> current supply (FT only)
-    HOLDER_BY_REF = b'GR'  # GR + ref + scripthash -> amount (reverse of BALANCE)
-    UNDO = b'GXU'          # GXU + height(be) -> repr([(key, prev_value_or_None), ...])
-    KEY_REVEALS = b'GKR'   # GKR + ref -> CBOR key reveal record (Phase 6 / REP-3009)
+    TOKEN = b'GT'              # GT + ref -> token info
+    METADATA = b'GM'           # GM + metadata_hash -> CBOR metadata
+    BALANCE = b'GB'            # GB + scripthash + ref -> amount
+    HISTORY = b'GH'            # GH + ref + height + tx_idx -> event
+    BY_TYPE = b'GY'            # GY + type + ref -> (for type queries)
+    BY_NAME = b'GN'            # GN + name_hash -> ref (for search)
+    BY_TICKER = b'GK'          # GK + ticker -> ref (for FT lookup)
+    SUPPLY = b'GS'             # GS + ref -> current supply (FT only)
+    HOLDER_BY_REF = b'GR'      # GR + ref + scripthash -> amount (reverse of BALANCE)
+    UNDO = b'GXU'              # GXU + height(be) -> binary undo entries
+    KEY_REVEALS = b'GKR'       # GKR + ref -> CBOR key reveal record (Phase 6 / REP-3009)
+    CONTRACT_TO_TOKEN = b'GC'  # GC + contract_ref(36) -> token_ref(36) (R6 reverse index)
+    STATS = b'GSTAT'           # GSTAT -> CBOR {total, ft, nft, dat, dmint, v1, v2} (R11)
+    SCHEMA_VERSION = b'GVER'   # GVER -> uint8 schema version (R21)
+
+
+CURRENT_SCHEMA_VERSION = 2
 
 
 # History event types
@@ -335,8 +340,20 @@ class GlyphIndex:
         self.metadata_height: Dict[bytes, int] = {}
         self.token_height: Dict[bytes, int] = {}
 
-        # Persistent set of refs known to exist as tokens (survives flush cycles).
-        # Prevents redundant DB lookups for refs already confirmed as known.
+        # Cache for key reveals pending flush (R2 — atomic batch write)
+        self.key_reveal_cache: Dict[bytes, bytes] = {}  # ref -> cbor bytes
+        self.key_reveal_height: Dict[bytes, int] = {}   # ref -> height
+
+        # Pending contract→token reverse index entries for flush (R6)
+        self.contract_to_token_cache: Dict[bytes, bytes] = {}  # contract_ref -> token_ref
+        self.contract_to_token_height: Dict[bytes, int] = {}   # contract_ref -> height
+
+        # In-memory stats delta accumulator (R11)
+        # Tracks net change in counts since last flush
+        self._stats_delta: Dict[str, int] = {'total': 0, 'ft': 0, 'nft': 0, 'dat': 0, 'dmint': 0, 'v1': 0, 'v2': 0}
+
+        # Transient set of refs known to exist as tokens (cleared on flush, R14).
+        # Prevents redundant DB lookups within a flush window.
         self._known_refs: Set[bytes] = set()
 
         # Per-height undo information for reorg safety.
@@ -355,7 +372,33 @@ class GlyphIndex:
         
         if self.enabled:
             self.logger.info('Glyph token indexing enabled')
+            self._check_schema_version()
     
+    def _check_schema_version(self):
+        """R21 — Verify DB schema version. Hard fail on mismatch."""
+        raw = self.db.utxo_db.get(GlyphDBKeys.SCHEMA_VERSION)
+        if raw is None:
+            self.db.utxo_db.put(GlyphDBKeys.SCHEMA_VERSION,
+                                bytes([CURRENT_SCHEMA_VERSION]))
+            self.logger.info(f'Glyph DB schema version initialised to {CURRENT_SCHEMA_VERSION}')
+        else:
+            v = raw[0]
+            if v < CURRENT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f'FATAL: Glyph DB schema version {v} < {CURRENT_SCHEMA_VERSION}. '
+                    f'A full reindex is required. '
+                    f'Delete the DB directory and restart.'
+                )
+            self.logger.info(f'Glyph DB schema version {v} OK')
+
+    @staticmethod
+    def _sanitize_str(s, max_len: int) -> Optional[str]:
+        """R9 — Strip control chars and cap length on untrusted token strings."""
+        if not isinstance(s, str):
+            return None
+        cleaned = ''.join(c for c in s if ord(c) >= 32)
+        return cleaned[:max_len] if cleaned else None
+
     def process_tx(self, tx_hash: bytes, tx: 'Tx', height: int, tx_idx: int,
                     output_refs_by_vout: Dict[int, List[Tuple[bytes, int]]] = None,
                     spent_singleton_refs: set = None):
@@ -680,25 +723,22 @@ class GlyphIndex:
         """
         protocols = metadata.get('p', [])
         
-        # For NFTs, look for singleton pattern (d8 + 36 byte ref)
+        # For NFTs, use _extract_refs_from_script to find singleton ref (R4 fix)
         if GlyphProtocol.GLYPH_NFT in protocols:
             for vout, output in enumerate(tx.outputs):
-                script = output.pk_script
-                if len(script) >= 37 and script[0] == 0xd8:
-                    return script[1:37]
-                # Also check if d8 appears further into the script
-                idx = script.find(b'\xd8')
-                while idx >= 0 and idx + 37 <= len(script):
-                    return script[idx+1:idx+37]
-        
-        # For FTs, look for normal ref pattern (d0 + 36 byte ref)
+                refs = self._extract_refs_from_script(output.pk_script)
+                for ref_bytes, ref_type in refs:
+                    if ref_type == 1:  # singleton
+                        return ref_bytes
+
+        # For FTs, use _extract_refs_from_script to find normal ref (R4 fix)
         if GlyphProtocol.GLYPH_FT in protocols:
             for vout, output in enumerate(tx.outputs):
-                script = output.pk_script
-                idx = script.find(b'\xd0')
-                while idx >= 0 and idx + 37 <= len(script):
-                    return script[idx+1:idx+37]
-        
+                refs = self._extract_refs_from_script(output.pk_script)
+                for ref_bytes, ref_type in refs:
+                    if ref_type == 0:  # normal
+                        return ref_bytes
+
         return None
     
     def _find_contract_ref(self, tx: 'Tx', token_ref: bytes) -> Optional[bytes]:
@@ -962,8 +1002,8 @@ class GlyphIndex:
         token.protocols = token_info['protocols']
         token.token_type = get_token_type_id(token_info['protocols'])
         token.glyph_version = token_info.get('version', 1)
-        token.name = token_info.get('name')
-        token.ticker = token_info.get('ticker')
+        token.name = self._sanitize_str(token_info.get('name'), 200)       # R9
+        token.ticker = self._sanitize_str(token_info.get('ticker'), 16)     # R9
         token.decimals = token_info.get('decimals', 0)
         token.deploy_height = height
         token.deploy_txid = tx_hash
@@ -996,15 +1036,25 @@ class GlyphIndex:
                 # Find the contract ref from the deploy tx outputs.
                 # The contract UTXO uses OP_PUSHINPUTREFSINGLETON (0xd8) with a
                 # ref that is different from the token ref (which uses 0xd0).
-                token.contract_ref = self._find_contract_ref(tx, ref)
+                contract_ref_hex = self._find_contract_ref(tx, ref)
+                token.contract_ref = contract_ref_hex
+                # R6: write GC reverse index (contract_ref -> token_ref)
+                if contract_ref_hex:
+                    try:
+                        contract_ref_bytes = bytes.fromhex(contract_ref_hex)
+                        self.contract_to_token_cache[contract_ref_bytes] = ref
+                        self.contract_to_token_height[contract_ref_bytes] = height
+                    except ValueError:
+                        pass
                 # Also try to parse initial state from the contract output
                 self._parse_deploy_contract_state(token, tx)
             else:
                 # For non-dMint FTs, get initial supply from output value
-                # Find the FT output to get its value
+                # Use _extract_refs_from_script to avoid false positives (R15)
                 initial_supply = 0
                 for out in tx.outputs:
-                    if b'\xd0' in out.pk_script:  # OP_PUSHINPUTREF
+                    refs = self._extract_refs_from_script(out.pk_script)
+                    if any(ref_type == 0 for _, ref_type in refs):
                         initial_supply = out.value
                         break
                 token.total_supply = initial_supply
@@ -1065,6 +1115,7 @@ class GlyphIndex:
         # Store in cache
         self.token_cache[ref] = token
         self.token_height[ref] = height
+        self._update_stats_delta(token, +1)  # R11: increment GSTAT counter
         
         # Add deploy event to history
         history_key = pack_history_key(ref, height, tx_idx)
@@ -1112,7 +1163,8 @@ class GlyphIndex:
             't': created_at,
         }
         db_key = GlyphDBKeys.KEY_REVEALS + ref
-        self.db.utxo_db.put(db_key, cbor2.dumps(record))
+        self.key_reveal_cache[ref] = cbor2.dumps(record)  # R2: defer to flush
+        self.key_reveal_height[ref] = reveal_height
 
     def get_key_reveal(self, ref: bytes) -> Optional[Dict]:
         """
@@ -1271,7 +1323,7 @@ class GlyphIndex:
         raw = self.db.utxo_db.get(self._undo_key(height))
         if not raw:
             return
-        entries = ast.literal_eval(raw.decode())
+        entries = decode_undo(raw)  # R22
 
         for key, prev in entries:
             if prev is None:
@@ -1348,11 +1400,15 @@ class GlyphIndex:
             batch.put(holder_key, packed)
 
         # Delete zero-balance entries from DB (primary + secondary)
+        # R1: record undo BEFORE deleting so reorgs can restore zero-balanced entries
         for key in self.balance_deletes:
-            batch.delete(key)
+            height = self.balance_height.get(key, self.db.db_height)
+            self._record_undo(height, key)
             scripthash = key[2:hx_off]
             ref = key[hx_off:hx_off + 36]
             holder_key = pack_holder_key(ref, scripthash)
+            self._record_undo(height, holder_key)
+            batch.delete(key)
             batch.delete(holder_key)
         
         # Flush history
@@ -1368,9 +1424,26 @@ class GlyphIndex:
                 self._record_undo(height, key)
             batch.put(key, cbor_data)
 
+        # R2: Flush key reveals (atomic write inside batch with undo)
+        for ref, cbor_data in self.key_reveal_cache.items():
+            key = GlyphDBKeys.KEY_REVEALS + ref
+            height = self.key_reveal_height.get(ref, self.db.db_height)
+            self._record_undo(height, key)
+            batch.put(key, cbor_data)
+
+        # R6: Flush contract→token reverse index
+        for contract_ref_bytes, token_ref in self.contract_to_token_cache.items():
+            key = GlyphDBKeys.CONTRACT_TO_TOKEN + contract_ref_bytes
+            height = self.contract_to_token_height.get(contract_ref_bytes, self.db.db_height)
+            self._record_undo(height, key)
+            batch.put(key, token_ref)
+
+        # R11: Flush incremental stats counter
+        self._flush_stats_counter(batch)
+
         # Persist undo information last so it includes keys written above.
         for height, entries in sorted(self._undo_cache.items()):
-            batch.put(self._undo_key(height), repr(entries).encode())
+            batch.put(self._undo_key(height), encode_undo(entries))  # R22
         self._undo_cache.clear()
         self._undo_seen.clear()
         
@@ -1383,6 +1456,12 @@ class GlyphIndex:
         self.metadata_cache.clear()
         self.metadata_height.clear()
         self.token_height.clear()
+        self.key_reveal_cache.clear()          # R2
+        self.key_reveal_height.clear()         # R2
+        self.contract_to_token_cache.clear()   # R6
+        self.contract_to_token_height.clear()  # R6
+        self._stats_delta = {'total': 0, 'ft': 0, 'nft': 0, 'dat': 0, 'dmint': 0, 'v1': 0, 'v2': 0}  # R11
+        self._known_refs.clear()               # R14: clear on every flush
     
     # ========================================================================
     # Query Methods (used by API)
@@ -1401,63 +1480,66 @@ class GlyphIndex:
             return GlyphTokenInfo.from_bytes(data)
         return None
     
+    def _flush_stats_counter(self, batch):
+        """R11 — Merge stats delta into persisted GSTAT counter."""
+        if not any(self._stats_delta.values()):
+            return
+        raw = self.db.utxo_db.get(GlyphDBKeys.STATS)
+        if raw:
+            try:
+                current = cbor2.loads(raw)
+            except Exception:
+                current = {'total': 0, 'ft': 0, 'nft': 0, 'dat': 0, 'dmint': 0, 'v1': 0, 'v2': 0}
+        else:
+            current = {'total': 0, 'ft': 0, 'nft': 0, 'dat': 0, 'dmint': 0, 'v1': 0, 'v2': 0}
+        for k, delta in self._stats_delta.items():
+            current[k] = max(0, current.get(k, 0) + delta)
+        batch.put(GlyphDBKeys.STATS, cbor2.dumps(current))
+
+    def _update_stats_delta(self, token: 'GlyphTokenInfo', sign: int):
+        """R11 — Accumulate a +1 or -1 delta for a token's type/version buckets."""
+        self._stats_delta['total'] += sign
+        if token.token_type == GlyphTokenType.FT:
+            self._stats_delta['ft'] += sign
+        elif token.token_type == GlyphTokenType.NFT:
+            self._stats_delta['nft'] += sign
+        elif token.token_type == GlyphTokenType.DAT:
+            self._stats_delta['dat'] += sign
+        elif token.token_type == GlyphTokenType.DMINT:
+            self._stats_delta['dmint'] += sign
+        if getattr(token, 'glyph_version', 1) == 2:
+            self._stats_delta['v2'] += sign
+        else:
+            self._stats_delta['v1'] += sign
+
     def get_stats(self) -> Dict[str, Any]:
         """
         Get statistics about indexed Glyph tokens.
-        
-        Returns:
-            Dict with token counts by type and other stats
+        Reads from the incremental GSTAT counter — O(1). (R11)
         """
-        stats = {
+        base = {
             'enabled': self.enabled,
             'total_tokens': 0,
-            'by_type': {
-                'FT': 0,       # Fungible tokens
-                'NFT': 0,      # Non-fungible tokens
-                'DAT': 0,      # Data tokens
-                'dMint': 0,    # Distributed mint tokens
-                'unknown': 0,
-            },
-            'by_version': {
-                'v1': 0,
-                'v2': 0,
-            },
+            'by_type': {'FT': 0, 'NFT': 0, 'DAT': 0, 'dMint': 0, 'unknown': 0},
+            'by_version': {'v1': 0, 'v2': 0},
             'cache_size': len(self.token_cache),
         }
-        
         if not self.enabled:
-            return stats
-        
-        # Iterate over all tokens in database
-        prefix = GlyphDBKeys.TOKEN
-        for key, value in self.db.utxo_db.iterator(prefix=prefix):
-            stats['total_tokens'] += 1
-            
+            return base
+        raw = self.db.utxo_db.get(GlyphDBKeys.STATS)
+        if raw:
             try:
-                token = GlyphTokenInfo.from_bytes(value)
-                
-                # Count by version
-                if token.glyph_version == 2:
-                    stats['by_version']['v2'] += 1
-                else:
-                    stats['by_version']['v1'] += 1
-                
-                # Count by type
-                token_type = token.token_type
-                if token_type == GlyphTokenType.FT:
-                    stats['by_type']['FT'] += 1
-                elif token_type == GlyphTokenType.NFT:
-                    stats['by_type']['NFT'] += 1
-                elif token_type == GlyphTokenType.DAT:
-                    stats['by_type']['DAT'] += 1
-                elif token_type == GlyphTokenType.DMINT:
-                    stats['by_type']['dMint'] += 1
-                else:
-                    stats['by_type']['unknown'] += 1
+                c = cbor2.loads(raw)
+                base['total_tokens'] = c.get('total', 0)
+                base['by_type']['FT'] = c.get('ft', 0)
+                base['by_type']['NFT'] = c.get('nft', 0)
+                base['by_type']['DAT'] = c.get('dat', 0)
+                base['by_type']['dMint'] = c.get('dmint', 0)
+                base['by_version']['v1'] = c.get('v1', 0)
+                base['by_version']['v2'] = c.get('v2', 0)
             except Exception:
-                stats['by_type']['unknown'] += 1
-        
-        return stats
+                pass
+        return base
     
     def get_token_by_ref_str(self, ref_str: str) -> Optional[Dict[str, Any]]:
         """Get token info by ref string (txid_vout)."""
@@ -1564,8 +1646,9 @@ class GlyphIndex:
             
             total_mints += 1
             if total_mints > offset and len(mints) < limit:
-                height = struct.unpack('>I', key[-6:-2])[0]
-                tx_idx = struct.unpack('>H', key[-2:])[0]
+                prefix_len = len(GlyphDBKeys.HISTORY) + 36  # R5: absolute offsets
+                height = struct.unpack('>I', key[prefix_len:prefix_len + 4])[0]
+                tx_idx = struct.unpack('>H', key[prefix_len + 4:prefix_len + 6])[0]
                 tx_hash = value[1:33] if len(value) >= 33 else b''
                 # MINT events store minted_amount as uint64 after txid
                 minted_amount = 0

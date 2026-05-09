@@ -572,6 +572,13 @@ class BlockProcessor:
                         if i + 37 <= len(spent_refs) and spent_refs[i + 36] == 1:
                             spent_singleton_refs.add(spent_refs[i:i + 36])
 
+            # R13: build spent outpoints set once per tx for O(1) ref-mint detection
+            spent_outpoints = {
+                txin.prev_hash + to_le_uint32(txin.prev_idx)
+                for txin in tx.inputs
+                if not txin.is_generation()
+            }
+
             # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
                 # Ignore unspendable outputs
@@ -613,9 +620,9 @@ class BlockProcessor:
                 # Save the refs for the outpoint
                 if len(refs_value):
                     put_refs(cache_key, refs_value)
-                 
+
                 for ref in singleton_refs_dedup.keys():
-                    if any(txin.prev_hash == ref[:32] and to_le_uint32(txin.prev_idx) == ref[32:] for txin in tx.inputs):
+                    if ref in spent_outpoints:  # R13: O(1) lookup
                         # Track singleton ref mints
                         mints.add(ref)
                         put_ref_mint(ref, tx_hash)
@@ -634,7 +641,7 @@ class BlockProcessor:
                 # Track normal ref mints
                 # Location for normal refs are not tracked
                 for ref in normal_refs_dedup.keys():
-                    if any(txin.prev_hash == ref[:32] and to_le_uint32(txin.prev_idx) == ref[32:] for txin in tx.inputs):
+                    if ref in spent_outpoints:  # R13: O(1) lookup
                         put_ref_mint(ref, tx_hash)
                         append_ref(ref)
 
@@ -657,8 +664,8 @@ class BlockProcessor:
                 if self.wave_index and glyph_envelope:
                     self.wave_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope)
                 
-                # Process for Swap orders if this is a Glyph tx
-                if self.swap_index and glyph_envelope:
+                # Process for Swap orders unconditionally (R3: RSWP may have no Glyph envelope)
+                if self.swap_index:
                     self.swap_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope)
 
                 # Update token holder balances (debits from spent inputs, credits from new outputs)

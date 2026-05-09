@@ -45,6 +45,7 @@ Swap Endpoints:
 
 from typing import Optional, Dict, Any, List, Set
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -56,9 +57,10 @@ from pydantic import BaseModel
 import time as _time
 
 class _TTLCache:
-    """Simple TTL cache for expensive endpoint responses."""
-    def __init__(self):
-        self._store = {}
+    """TTL cache with bounded max_size (R12: prevents unbounded memory growth)."""
+    def __init__(self, max_size: int = None):
+        self._store: Dict[str, tuple] = {}
+        self._max_size = max_size or int(os.getenv('REST_CACHE_MAX_ENTRIES', '500'))
 
     def get(self, key, ttl=30):
         entry = self._store.get(key)
@@ -67,6 +69,10 @@ class _TTLCache:
         return None
 
     def put(self, key, value):
+        if key not in self._store and len(self._store) >= self._max_size:
+            # Evict oldest entry (insertion-order guaranteed in Python 3.7+)
+            oldest_key = next(iter(self._store))
+            del self._store[oldest_key]
         self._store[key] = (value, _time.monotonic())
 
 _cache = _TTLCache()
@@ -92,21 +98,23 @@ _require_rest_api_key_prod = os.getenv('REST_REQUIRE_API_KEY_IN_PROD', '1').stri
 if _is_prod and _require_rest_api_key_prod and not os.getenv('REST_API_KEY', '').strip():
     raise RuntimeError('REST_API_KEY must be set in production (or set REST_REQUIRE_API_KEY_IN_PROD=0)')
 
-# CORS middleware - DISABLED: nginx handles CORS to avoid duplicate headers
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=_allowed_origins if _allowed_origins else [],
-#     allow_credentials=False,
-#     allow_methods=["GET", "POST"],
-#     allow_headers=["*"],
-# )
+# CORS middleware — enabled with explicit origins (R10: fail-closed)
+_cors_origins = _allowed_origins if _allowed_origins else (['*'] if not _is_prod else [])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=['GET', 'POST'],
+    allow_headers=['*'],
+)
 
 
 def _require_api_key(x_api_key: Optional[str] = Header(default=None, alias='X-API-Key')):
     required_key = os.getenv('REST_API_KEY', '').strip()
     if not required_key:
         return
-    if not x_api_key or x_api_key != required_key:
+    # R7: timing-safe comparison to prevent timing oracle attacks
+    if not x_api_key or not hmac.compare_digest(x_api_key, required_key):
         raise HTTPException(status_code=401, detail='Unauthorized')
 
 
@@ -118,23 +126,42 @@ class _TokenBucket:
 
 _rate_buckets: Dict[str, _TokenBucket] = {}
 _rate_request_count: int = 0
+_rate_last_cleanup_ts: float = 0.0
 _RATE_CLEANUP_INTERVAL: int = 1000
+_TRUST_PROXY: bool = os.getenv('TRUST_PROXY', '0').strip() not in ('0', 'false', 'no', '')
+_TRUST_PROXY_HOPS: int = max(1, int(os.getenv('TRUST_PROXY_HOPS', '1')))
+
+
+def _get_client_ip(request: Request) -> str:
+    """R8: resolve real client IP honouring X-Forwarded-For when behind a proxy."""
+    if _TRUST_PROXY:
+        forwarded = request.headers.get('x-forwarded-for', '').strip()
+        if forwarded:
+            parts = [p.strip() for p in forwarded.split(',')]
+            # Take the Nth-from-right entry where N = TRUST_PROXY_HOPS
+            idx = max(0, len(parts) - _TRUST_PROXY_HOPS)
+            return parts[idx]
+        real_ip = request.headers.get('x-real-ip', '').strip()
+        if real_ip:
+            return real_ip
+    return request.client.host if request.client else 'unknown'
 
 
 def _rate_limit(request: Request):
-    global _rate_request_count
+    global _rate_request_count, _rate_last_cleanup_ts
     limit_per_minute = int(os.getenv('REST_RATE_LIMIT_PER_MIN', '600'))
     burst = int(os.getenv('REST_RATE_LIMIT_BURST', str(limit_per_minute)))
     if limit_per_minute <= 0:
         return
 
-    client_host = request.client.host if request.client else 'unknown'
+    client_host = _get_client_ip(request)  # R8
     now = time.time()
 
-    # Periodically purge stale buckets to prevent unbounded memory growth
+    # Purge stale buckets: every 1000 requests OR every 60 seconds (R17)
     _rate_request_count += 1
-    if _rate_request_count >= _RATE_CLEANUP_INTERVAL:
+    if _rate_request_count >= _RATE_CLEANUP_INTERVAL or now - _rate_last_cleanup_ts > 60.0:
         _rate_request_count = 0
+        _rate_last_cleanup_ts = now
         stale_cutoff = now - 120.0  # 2 minutes
         stale_keys = [k for k, b in _rate_buckets.items() if b.last_ts < stale_cutoff]
         for k in stale_keys:

@@ -347,4 +347,56 @@ def pack_varint(n):
 def pack_varbytes(data):
     return pack_varint(len(data)) + data
 
-    
+
+import struct as _struct
+
+_UNDO_NONE_SENTINEL = 0xFFFFFFFF
+
+
+def encode_undo(entries):
+    """R22: Encode undo entries to a compact binary format.
+
+    entries: iterable of (key: bytes, prev_value: bytes | None)
+
+    Format per entry:
+        uint16 key_len  + key_bytes
+        uint32 val_len  + val_bytes   (val_len = 0xFFFFFFFF means None)
+    """
+    parts = []
+    for key, prev in entries:
+        parts.append(_struct.pack('>H', len(key)))
+        parts.append(key)
+        if prev is None:
+            parts.append(_struct.pack('>I', _UNDO_NONE_SENTINEL))
+        else:
+            parts.append(_struct.pack('>I', len(prev)))
+            parts.append(prev)
+    return b''.join(parts)
+
+
+def decode_undo(raw):
+    """R22: Decode binary undo entries produced by encode_undo.
+
+    Returns list of (key: bytes, prev_value: bytes | None).
+    """
+    entries = []
+    pos = 0
+    n = len(raw)
+    while pos < n:
+        if pos + 2 > n:
+            break
+        key_len, = _struct.unpack_from('>H', raw, pos)
+        pos += 2
+        key = raw[pos:pos + key_len]
+        pos += key_len
+        if pos + 4 > n:
+            break
+        val_len, = _struct.unpack_from('>I', raw, pos)
+        pos += 4
+        if val_len == _UNDO_NONE_SENTINEL:
+            entries.append((key, None))
+        else:
+            val = raw[pos:pos + val_len]
+            pos += val_len
+            entries.append((key, val))
+    return entries

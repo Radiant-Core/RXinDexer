@@ -1,4 +1,4 @@
-import ast
+import json
 import struct
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from electrumx.lib import util
 from electrumx.lib.hash import Base58
 from electrumx.lib.hash import HASHX_LEN
-from electrumx.lib.util import pack_be_uint32
+from electrumx.lib.util import pack_be_uint32, encode_undo, decode_undo
 
 
 class AnalyticsDBKeys:
@@ -104,7 +104,7 @@ class AnalyticsIndex:
         raw = self.db.utxo_db.get(self._undo_key(height))
         if not raw:
             return
-        entries = ast.literal_eval(raw.decode())
+        entries = decode_undo(raw)  # R22
         for key, prev in entries:
             if prev is None:
                 batch.delete(key)
@@ -152,7 +152,7 @@ class AnalyticsIndex:
                 self._record_undo(height, key)
             batch.put(key, value)
         for height, entries in sorted(self._undo_cache.items()):
-            batch.put(self._undo_key(height), repr(entries).encode())
+            batch.put(self._undo_key(height), encode_undo(entries))  # R22
         self.summary_cache.clear()
         self.summary_height.clear()
         self.balance_cache.clear()
@@ -203,11 +203,11 @@ class AnalyticsIndex:
             raw = self.db.utxo_db.get(key)
         if raw is None:
             return default
-        return ast.literal_eval(raw.decode())
+        return json.loads(raw.decode())
 
     def _set_summary(self, height: int, suffix: bytes, value: Any):
         key = AnalyticsDBKeys.SUMMARY + suffix
-        self.summary_cache[key] = repr(value).encode()
+        self.summary_cache[key] = json.dumps(value).encode()
         self.summary_height[key] = height
 
     def _get_daily(self, day: int) -> Dict[str, int]:
@@ -217,11 +217,11 @@ class AnalyticsIndex:
             raw = self.db.utxo_db.get(key)
         if raw is None:
             return {'coins_moved': 0, 'active_addresses': 0, 'new_addresses': 0}
-        return ast.literal_eval(raw.decode())
+        return json.loads(raw.decode())
 
     def _set_daily(self, height: int, day: int, value: Dict[str, int]):
         key = self._daily_key(day)
-        self.daily_cache[key] = repr(value).encode()
+        self.daily_cache[key] = json.dumps(value).encode()
         self.daily_height[key] = height
 
     def _bucket_name(self, value_sats: int) -> str:
@@ -459,7 +459,7 @@ class AnalyticsIndex:
         for k, v in self.db.utxo_db.iterator(prefix=pfx):
             d = struct.unpack('>I', k[plen:plen+4])[0]
             if start <= d <= current_day:
-                dd[d] = ast.literal_eval(v.decode())
+                dd[d] = json.loads(v.decode())
         empty = {'coins_moved': 0, 'active_addresses': 0, 'new_addresses': 0}
         items = [{'day': d, **dd.get(d, empty)} for d in range(start, current_day + 1)]
         return {'days': days, 'series': items}
