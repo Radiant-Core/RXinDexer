@@ -51,8 +51,11 @@ import os
 import time
 from dataclasses import dataclass, field
 
+from electrumx.server import metrics as _metrics
+
 from fastapi import FastAPI, HTTPException, Query, Path, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response as _Response
 from pydantic import BaseModel
 import time as _time
 
@@ -183,6 +186,20 @@ def _rate_limit(request: Request):
 
 
 @app.middleware("http")
+async def _observability_middleware(request: Request, call_next):
+    """R18/R19: record per-request latency and count in Prometheus metrics."""
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    elapsed = time.perf_counter() - t0
+    endpoint = request.url.path
+    _metrics.rest_requests_total.labels(
+        method=request.method, endpoint=endpoint, status=str(response.status_code)
+    ).inc()
+    _metrics.rest_request_seconds.labels(endpoint=endpoint).observe(elapsed)
+    return response
+
+
+@app.middleware("http")
 async def _security_middleware(request: Request, call_next):
     path = request.url.path
     # Public read-only endpoints — no API key required
@@ -216,6 +233,13 @@ async def _security_middleware(request: Request, call_next):
     _require_api_key(request.headers.get('x-api-key'))
     _rate_limit(request)
     return await call_next(request)
+
+@app.get('/metrics', include_in_schema=False)
+async def prometheus_metrics():
+    """R18: Prometheus /metrics endpoint."""
+    content = _metrics.generate_metrics_text()
+    return _Response(content=content, media_type=_metrics.METRICS_CONTENT_TYPE)
+
 
 # Global references to indexes (set by the server on startup)
 _glyph_index = None

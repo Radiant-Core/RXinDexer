@@ -21,6 +21,9 @@ class FakeUtxoDB:
     def get(self, key: bytes):
         return self._store.get(key)
 
+    def put(self, key: bytes, value: bytes):
+        self._store[key] = value
+
     def iterator(self, prefix=b"", reverse=False, include_value=True):
         items = [(k, v) for k, v in self._store.items() if k.startswith(prefix)]
         items.sort(key=lambda kv: kv[0], reverse=reverse)

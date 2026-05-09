@@ -13,6 +13,8 @@ import asyncio
 import time
 from asyncio import sleep
 
+from electrumx.server import metrics as _metrics
+
 from aiorpcx import TaskGroup, CancelledError
 
 import electrumx
@@ -406,12 +408,18 @@ class BlockProcessor:
                          self.db_deletes, self.tip)
 
     async def flush(self, flush_utxos):
+        t0 = time.perf_counter()
         self.db.flush_dbs(self.flush_data(), flush_utxos, self.estimate_txs_remaining,
                          glyph_index=self.glyph_index,
                          wave_index=self.wave_index,
                          swap_index=self.swap_index,
                          analytics_index=self.analytics_index,
                          dmint_contracts=self.dmint_contracts)
+        elapsed = time.perf_counter() - t0
+        _metrics.flush_seconds.observe(elapsed)  # R19
+        _metrics.flush_total.inc()                # R18
+        _metrics.block_height.set(self.height)    # R18
+        self.logger.debug(f'flush complete in {elapsed*1000:.1f}ms height={self.height}')  # R19
         self.next_cache_check = time.monotonic() + 30
 
     def check_cache_size(self):
@@ -456,9 +464,13 @@ class BlockProcessor:
         for raw_block in raw_blocks:
             block = self.coin.block(raw_block)
             if self.coin.header_prevhash(block.header) != self.tip:
+                _metrics.reorg_total.inc()  # R18
                 self.schedule_reorg(-1)
                 return
+            t_block = time.perf_counter()
             await self._advance_block(block)
+            _metrics.block_processing_seconds.observe(time.perf_counter() - t_block)  # R19
+            _metrics.blocks_processed.inc()  # R18
         end = time.monotonic()
 
         if not self.db.first_sync:

@@ -17,6 +17,7 @@ from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256
 from electrumx.lib.util import pack_be_uint32, encode_undo, decode_undo
 from electrumx.lib.script import OpCodes
+from electrumx.server.metrics import swap_parse_errors_total as _swap_parse_errors
 
 try:
     import cbor2
@@ -367,6 +368,7 @@ class SwapIndex:
                 
         except Exception as e:
             self.logger.debug(f'RSWP parse error: {e}')
+            _swap_parse_errors.inc()  # R20
             return None
     
     def _parse_rswp_v2(self, chunks: List[bytes], order: SwapOrderInfo) -> Optional[SwapOrderInfo]:

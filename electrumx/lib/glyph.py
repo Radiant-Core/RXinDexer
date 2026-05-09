@@ -16,6 +16,13 @@ try:
 except ImportError:
     HAS_CBOR = False
 
+try:
+    from electrumx.server.metrics import glyph_parse_errors_total as _glyph_parse_errors
+except Exception:
+    class _glyph_parse_errors:  # type: ignore
+        @staticmethod
+        def inc(*a, **kw): pass
+
 # Glyph magic bytes
 GLYPH_MAGIC = b'gly'
 GLYPH_MAGIC_HEX = '676c79'
@@ -201,6 +208,7 @@ def parse_glyph_envelope(data: bytes) -> Optional[Dict[str, Any]]:
                     return _parse_v2_commit_inline(version, flags, inner[2:])
 
     except Exception:
+        _glyph_parse_errors.inc()  # R20
         return None
 
     return None
@@ -392,6 +400,7 @@ def parse_glyph_metadata(envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         return cbor2.loads(metadata_bytes)
     except Exception:
+        _glyph_parse_errors.inc()  # R20: CBOR decode failure
         return None
 
 
