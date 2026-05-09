@@ -373,6 +373,10 @@ class GlyphIndex:
         
         if self.enabled:
             self.logger.info('Glyph token indexing enabled')
+
+    def post_open_init(self):
+        """Called after DB is opened (utxo_db is available). Deferred from __init__."""
+        if self.enabled:
             self._check_schema_version()
     
     def _check_schema_version(self):
