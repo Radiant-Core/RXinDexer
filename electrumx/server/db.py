@@ -866,6 +866,18 @@ class DB(object):
         key = b'rl' + ref
         return self.utxo_db.get(key)
 
+    def get_height_for_tx(self, tx_hash: bytes):
+        '''Return the block height for a confirmed tx_hash (32 bytes), or None
+        if not found (mempool or unknown).  Uses the b'h' UTXO index to locate
+        the tx_num then bisects tx_counts for the height.'''
+        prefix = b'h' + tx_hash[:4]
+        for db_key, _value in self.utxo_db.iterator(prefix=prefix):
+            tx_num, = unpack_le_uint64(db_key[-5:] + bytes(3))
+            fs_hash, height = self.fs_tx_hash(tx_num)
+            if fs_hash == tx_hash:
+                return height
+        return None
+
     def get_refs_by_outpoint(self, outpoint): 
         refs = []
         key = b'ri' + outpoint

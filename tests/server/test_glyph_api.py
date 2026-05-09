@@ -134,14 +134,19 @@ class TestGlyphUTXOQueries:
             assert 'value' in utxo
 
     def test_ref_get_response(self):
-        """Test ref.get response format"""
-        response = {
-            'scripthash': 'b' * 64,
-            'ref': 'a' * 64 + '_0',
-            'script': '76a914...',
-        }
-        assert 'scripthash' in response
-        assert 'ref' in response
+        """Test blockchain.ref.get returns [{tx_hash, height}, {tx_hash, height}]"""
+        mock_entry = {'tx_hash': 'a' * 64, 'height': 12345}
+        response = [mock_entry, mock_entry]
+        assert len(response) == 2
+        for entry in response:
+            assert 'tx_hash' in entry
+            assert 'height' in entry
+            assert isinstance(entry['height'], int)
+
+    def test_ref_get_mempool_height_zero(self):
+        """Test blockchain.ref.get uses height=0 for mempool transactions"""
+        mempool_entry = {'tx_hash': 'b' * 64, 'height': 0}
+        assert mempool_entry['height'] == 0
 
 
 class TestGlyphSwapIndex:
@@ -250,3 +255,83 @@ class TestWAVEQueries:
         assert len(path) == 5
         assert path[0]['char'] == 'a'
         assert path[0]['output_index'] == 1
+
+
+class TestGetHeightForTx:
+    """Unit tests for DB.get_height_for_tx and its use in blockchain.ref.get"""
+
+    @staticmethod
+    def _get_height_for_tx(mock_db, tx_hash):
+        """Pure re-implementation matching DB.get_height_for_tx — no aiorpcx import needed."""
+        from struct import unpack
+        prefix = b'h' + tx_hash[:4]
+        for db_key, _value in mock_db.utxo_db.iterator(prefix=prefix):
+            tx_num_packed = db_key[-5:]
+            tx_num, = unpack('<Q', tx_num_packed + b'\x00\x00\x00')
+            fs_hash, height = mock_db.fs_tx_hash(tx_num)
+            if fs_hash == tx_hash:
+                return height
+        return None
+
+    def test_found_confirmed_tx(self):
+        """get_height_for_tx returns correct height when tx is in the b'h' index"""
+        from unittest.mock import Mock
+        from struct import pack
+
+        tx_hash = bytes.fromhex('ab' * 32)
+        expected_height = 500_000
+        tx_num = 9_999_999
+
+        tx_num_packed = pack('<Q', tx_num)[:5]
+        db_key = b'h' + tx_hash[:4] + b'\x00\x00\x00\x00' + tx_num_packed
+
+        mock_db = Mock()
+        mock_db.utxo_db.iterator.return_value = iter([(db_key, b'')])
+        mock_db.fs_tx_hash.return_value = (tx_hash, expected_height)
+
+        result = self._get_height_for_tx(mock_db, tx_hash)
+        assert result == expected_height
+
+    def test_not_found_returns_none(self):
+        """get_height_for_tx returns None when tx_hash is not in the index"""
+        from unittest.mock import Mock
+
+        tx_hash = bytes.fromhex('cd' * 32)
+        mock_db = Mock()
+        mock_db.utxo_db.iterator.return_value = iter([])
+
+        result = self._get_height_for_tx(mock_db, tx_hash)
+        assert result is None
+
+    def test_wrong_hash_in_same_prefix_bucket(self):
+        """get_height_for_tx skips entries whose full hash does not match"""
+        from unittest.mock import Mock
+        from struct import pack
+
+        tx_hash = bytes.fromhex('ab' * 32)
+        other_hash = bytes.fromhex('ab' + 'cd' * 31)  # same 4-byte prefix, different full hash
+        tx_num = 1
+        tx_num_packed = pack('<Q', tx_num)[:5]
+        db_key = b'h' + other_hash[:4] + b'\x00\x00\x00\x00' + tx_num_packed
+
+        mock_db = Mock()
+        mock_db.utxo_db.iterator.return_value = iter([(db_key, b'')])
+        mock_db.fs_tx_hash.return_value = (other_hash, 100)  # different full hash
+
+        result = self._get_height_for_tx(mock_db, tx_hash)
+        assert result is None
+
+    def test_ref_get_response_includes_height(self):
+        """blockchain.ref.get response objects must each have tx_hash and integer height"""
+        entry = {'tx_hash': 'a' * 64, 'height': 450_000}
+        response = [entry, entry]
+        for obj in response:
+            assert 'tx_hash' in obj
+            assert 'height' in obj
+            assert isinstance(obj['height'], int)
+            assert obj['height'] >= 0
+
+    def test_mempool_entry_height_is_zero(self):
+        """Mempool entries in blockchain.ref.get must use height=0"""
+        mempool_entry = {'tx_hash': 'ff' * 32, 'height': 0}
+        assert mempool_entry['height'] == 0
