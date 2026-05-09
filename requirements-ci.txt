@@ -9,7 +9,7 @@ python-rocksdb<=0.7.0
 cbor2>=5.4.0
 
 # REST API dependencies
-fastapi>=0.109.0
+fastapi>=0.128.8
 uvicorn[standard]>=0.27.0
 pydantic>=2.5.0
 
