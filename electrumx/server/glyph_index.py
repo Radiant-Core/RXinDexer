@@ -5,6 +5,7 @@ This module provides database storage and indexing for Glyph v1/v2 tokens.
 Handles token registration, balance tracking, and history.
 """
 
+import base64
 import struct
 from typing import Optional, Dict, Any, List, Tuple, Set
 from collections import defaultdict
@@ -1228,7 +1229,6 @@ class GlyphIndex:
         results.sort(key=lambda t: t.get('deploy_height', 0), reverse=True)
         # R16: list_encrypted_tokens does a full filter scan (no RocksDB prefix seek possible)
         # so we use offset/limit on the post-filter sorted list; next_cursor is index-based.
-        import base64
         start = 0
         if cursor:
             try:
@@ -1574,7 +1574,6 @@ class GlyphIndex:
         if not cursor:
             return None
         try:
-            import base64
             return base64.b64decode(cursor)
         except Exception:
             return None
@@ -1582,7 +1581,6 @@ class GlyphIndex:
     @staticmethod
     def _encode_cursor(raw_key: bytes) -> str:
         """R16: Encode raw RocksDB key to opaque base64 cursor."""
-        import base64
         return base64.b64encode(raw_key).decode()
 
     def get_balances_for_scripthash(self, scripthash: bytes,
