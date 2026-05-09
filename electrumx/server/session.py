@@ -1551,25 +1551,32 @@ class ElectrumX(SessionBase):
         db_values, cost = await self.session_mgr.ref_get_db(ref)
         mempool_values = await self.mempool.first_last_summaries(ref_hash)
 
+        # confirmed entries: (tx_hash_bytes, is_mempool=False)
+        # mempool entries:   (tx_hash_bytes, is_mempool=True)
         all_values = []
         for value in db_values:
             if value is not None:
-                all_values.append(value)
+                all_values.append((value, False))
 
         for value in mempool_values:
-            all_values.append(value.hash)
+            all_values.append((value.hash, True))
 
         if len(all_values) == 0:
             return []
-        
+
         if len(all_values) == 1:
             all_values.append(all_values[0])
-        
+
         mint_loc = [all_values[0], all_values[-1]]
 
         self.bump_cost(cost)
-        objects = [{'tx_hash': hash_to_hex_str(tx_hash)}
-                for tx_hash in mint_loc]
+        objects = []
+        for tx_hash, is_mempool in mint_loc:
+            if is_mempool:
+                height = 0
+            else:
+                height = self.db.get_height_for_tx(tx_hash) or 0
+            objects.append({'tx_hash': hash_to_hex_str(tx_hash), 'height': height})
         self.bump_cost(0.25 + len(mempool_values) / 50)
 
         return objects
