@@ -752,6 +752,13 @@ class BlockProcessor:
         script_hashX = self.coin.hashX_from_script
         mints = set() # Missing mints
         for tx, tx_hash in reversed(txs):
+            # R13: build spent outpoints set once per tx for O(1) ref-mint detection
+            spent_outpoints_backup = {
+                txin.prev_hash + to_le_uint32(txin.prev_idx)
+                for txin in tx.inputs
+                if not txin.is_generation()
+            }
+
             for idx, txout in enumerate(tx.outputs):
                 # Spend the TX outputs.  Be careful with unspendable
                 # outputs - we didn't save those in the first place.
@@ -769,7 +776,7 @@ class BlockProcessor:
 
                 for ref in all_refs_dedup.keys():
                     touched.add(script_hashX(ref))
-                    if any(txin.prev_hash == ref[:32] and to_le_uint32(txin.prev_idx) == ref[32:] for txin in tx.inputs):
+                    if ref in spent_outpoints_backup:  # R13: O(1) lookup
                         mints.add(ref)
                         # Delete mint
                         cached_value = self.ref_mint_cache.pop(ref, None)

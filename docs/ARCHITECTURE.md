@@ -523,13 +523,18 @@ This section documents architectural decisions for a fully-featured yet scalable
 
 | Setting | Value | Rationale |
 |---------|-------|-----------|
-| **Max Reorg Depth** | 6 blocks | Radiant's roll-back protection ensures finality after 6 confirmations |
-| **Undo Buffer** | 6 blocks of Glyph/Swap state changes | Enables clean revert on reorg |
+| **Max Reorg Depth** | 100 blocks (default) | Conservative default; Radiant finality is ~6 blocks but 100 provides a safe margin for edge cases |
+| **Undo Buffer** | `REORG_LIMIT` blocks of Glyph/Swap/WAVE/Analytics state changes | Enables clean revert on reorg |
 | **Confirmation Threshold** | 1 block (display), 6 blocks (final) | Balance UX vs. safety |
+| **Minimum safe value** | 10 blocks | Startup emits a WARNING if `REORG_LIMIT < 10` |
 
 ```bash
-REORG_LIMIT=6  # Maximum blocks to undo on chain reorganization
+REORG_LIMIT=100  # Maximum blocks to undo on chain reorganization (default: 100, warn if < 10)
 ```
+
+> **Note:** The default was raised from 6 to 100 in the May 2026 production hardening pass (R26).
+> Values below 10 trigger a startup warning. Full reindex is required when changing this value
+> on an existing DB (undo data from the old limit is not retroactively extended).
 
 ### 9.2 Mempool Indexing
 
@@ -716,13 +721,66 @@ MEMPOOL_GLYPH_INDEX=1          # Index Glyph in mempool
 MEMPOOL_SWAP_INDEX=1           # Index swaps in mempool
 
 # === Reorg Handling ===
-REORG_LIMIT=6                  # Maximum reorg depth (blocks)
+REORG_LIMIT=100                # Maximum reorg depth (default 100; warn if < 10)
 
 # === Database ===
 DB_ENGINE=rocksdb              # Database backend
 ROCKSDB_COMPRESSION=lz4        # Compression algorithm
 ROCKSDB_BLOCK_CACHE_MB=256     # Block cache size
 ```
+
+## 11. Prometheus Monitoring
+
+RXinDexer exposes a `/metrics` endpoint (Prometheus text format) on the REST API port (default 8000).
+
+### Available Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `rxindexer_sync_height` | Gauge | — | Current chain tip height |
+| `rxindexer_tokens_total` | Gauge | `type=ft\|nft\|dat\|dmint` | Indexed token count by type |
+| `rxindexer_block_processing_seconds` | Histogram | — | Per-block processing time |
+| `rxindexer_cache_size` | Gauge | `cache=utxo\|ref_loc\|glyph_token\|balance` | In-memory cache entry count |
+| `rxindexer_glyph_parse_errors_total` | Counter | — | Glyph envelope / CBOR parse failures |
+| `rxindexer_swap_parse_errors_total` | Counter | — | RSWP parse failures |
+| `rxindexer_swap_orders_total` | Gauge | `status=open\|filled\|cancelled` | Swap order counts |
+| `rxindexer_reorg_total` | Counter | — | Chain reorganizations handled |
+| `rxindexer_flush_total` | Counter | — | DB flush operations |
+| `rxindexer_rest_requests_total` | Counter | `endpoint, status` | REST API request counts |
+
+### Prometheus Scrape Configuration
+
+Add to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: rxindexer
+    static_configs:
+      - targets: ['<RXINDEXER_HOST>:8000']
+    metrics_path: /metrics
+    scrape_interval: 15s
+    # If REST_API_KEY is required in production:
+    # params:
+    #   x-api-key: ['<YOUR_API_KEY>']
+```
+
+### Example Grafana Alert Rules
+
+```yaml
+# Alert if indexer falls more than 10 blocks behind the network tip
+- alert: RXinDexerBehindChainTip
+  expr: (radiant_chain_height - rxindexer_sync_height) > 10
+  for: 5m
+  labels: { severity: warning }
+
+# Alert on persistent parse errors
+- alert: RXinDexerGlyphParseErrors
+  expr: rate(rxindexer_glyph_parse_errors_total[5m]) > 1
+  for: 10m
+  labels: { severity: warning }
+```
+
+---
 
 ## References
 

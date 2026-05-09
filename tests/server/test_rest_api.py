@@ -515,6 +515,142 @@ class TestSwapEndpoints:
 
 
 # ===========================================================================
+# R8 — Proxy-Aware Rate Limiting (unit tests for _get_client_ip)
+# ===========================================================================
+
+class TestProxyAwareClientIP:
+    """R8: _get_client_ip() must honour X-Forwarded-For when TRUST_PROXY=1."""
+
+    def _make_request(self, headers: dict, client_host: str = '127.0.0.1'):
+        """Build a minimal Mock Request with the given headers and client."""
+        req = Mock()
+        req.headers = headers
+        client = Mock()
+        client.host = client_host
+        req.client = client
+        return req
+
+    def test_no_proxy_returns_client_host(self):
+        """Without TRUST_PROXY, always return request.client.host."""
+        from electrumx.server import rest_api
+        original = rest_api._TRUST_PROXY
+        try:
+            rest_api._TRUST_PROXY = False
+            req = self._make_request({}, client_host='203.0.113.5')
+            assert rest_api._get_client_ip(req) == '203.0.113.5'
+        finally:
+            rest_api._TRUST_PROXY = original
+
+    def test_trust_proxy_reads_x_forwarded_for(self):
+        """With TRUST_PROXY=True, take the Nth-from-right entry (skip N innermost proxies).
+
+        idx = max(0, len(parts) - TRUST_PROXY_HOPS)
+        With 2 entries and hops=1: idx = max(0, 2-1) = 1 → second entry is the
+        last trusted hop (the entry just beyond our own proxy layer).
+        """
+        from electrumx.server import rest_api
+        original_tp = rest_api._TRUST_PROXY
+        original_hops = rest_api._TRUST_PROXY_HOPS
+        try:
+            rest_api._TRUST_PROXY = True
+            rest_api._TRUST_PROXY_HOPS = 1
+            req = self._make_request(
+                {'x-forwarded-for': '203.0.113.10, 10.0.0.1'},
+                client_host='127.0.0.1',
+            )
+            # 2 parts, hops=1 → idx = max(0, 2-1) = 1 → '10.0.0.1'
+            ip = rest_api._get_client_ip(req)
+            assert ip == '10.0.0.1'
+        finally:
+            rest_api._TRUST_PROXY = original_tp
+            rest_api._TRUST_PROXY_HOPS = original_hops
+
+    def test_trust_proxy_two_hops(self):
+        """TRUST_PROXY_HOPS=2 skips two innermost proxy entries."""
+        from electrumx.server import rest_api
+        original_tp = rest_api._TRUST_PROXY
+        original_hops = rest_api._TRUST_PROXY_HOPS
+        try:
+            rest_api._TRUST_PROXY = True
+            rest_api._TRUST_PROXY_HOPS = 2
+            req = self._make_request(
+                {'x-forwarded-for': '198.51.100.7, 10.0.0.2, 10.0.0.1'},
+                client_host='127.0.0.1',
+            )
+            # 3 entries, hops=2 → idx = max(0, 3-2) = 1 → '10.0.0.2'
+            ip = rest_api._get_client_ip(req)
+            assert ip == '10.0.0.2'
+        finally:
+            rest_api._TRUST_PROXY = original_tp
+            rest_api._TRUST_PROXY_HOPS = original_hops
+
+    def test_trust_proxy_falls_back_to_x_real_ip(self):
+        """When X-Forwarded-For is absent, fall back to X-Real-IP."""
+        from electrumx.server import rest_api
+        original_tp = rest_api._TRUST_PROXY
+        try:
+            rest_api._TRUST_PROXY = True
+            req = self._make_request(
+                {'x-real-ip': '203.0.113.99'},
+                client_host='127.0.0.1',
+            )
+            ip = rest_api._get_client_ip(req)
+            assert ip == '203.0.113.99'
+        finally:
+            rest_api._TRUST_PROXY = original_tp
+
+    def test_trust_proxy_falls_back_to_client_host_when_no_headers(self):
+        """When proxy headers are absent, fall back to request.client.host."""
+        from electrumx.server import rest_api
+        original_tp = rest_api._TRUST_PROXY
+        try:
+            rest_api._TRUST_PROXY = True
+            req = self._make_request({}, client_host='10.0.0.5')
+            ip = rest_api._get_client_ip(req)
+            assert ip == '10.0.0.5'
+        finally:
+            rest_api._TRUST_PROXY = original_tp
+
+    def test_trust_proxy_single_entry_forwarded_for(self):
+        """Single-entry X-Forwarded-For with TRUST_PROXY_HOPS=1."""
+        from electrumx.server import rest_api
+        original_tp = rest_api._TRUST_PROXY
+        original_hops = rest_api._TRUST_PROXY_HOPS
+        try:
+            rest_api._TRUST_PROXY = True
+            rest_api._TRUST_PROXY_HOPS = 1
+            req = self._make_request(
+                {'x-forwarded-for': '192.0.2.42'},
+                client_host='127.0.0.1',
+            )
+            ip = rest_api._get_client_ip(req)
+            assert ip == '192.0.2.42'
+        finally:
+            rest_api._TRUST_PROXY = original_tp
+            rest_api._TRUST_PROXY_HOPS = original_hops
+
+    def test_rate_limit_uses_forwarded_ip_not_localhost(self, monkeypatch):
+        """_rate_limit uses the real client IP (not 127.0.0.1) when TRUST_PROXY active."""
+        from electrumx.server import rest_api
+        # Patch module-level state so this test is isolated
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY', True)
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY_HOPS', 1)
+        monkeypatch.setattr(rest_api, '_rate_buckets', {})
+
+        req = Mock()
+        req.headers = {'x-forwarded-for': '203.0.113.77'}
+        client = Mock()
+        client.host = '127.0.0.1'
+        req.client = client
+
+        # Call _get_client_ip directly — the forwarded IP must be returned
+        ip = rest_api._get_client_ip(req)
+        assert ip == '203.0.113.77'
+        # Also confirm 127.0.0.1 is not the result (the key point of R8)
+        assert ip != '127.0.0.1'
+
+
+# ===========================================================================
 # Edge Cases
 # ===========================================================================
 
