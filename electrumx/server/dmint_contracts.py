@@ -246,10 +246,11 @@ class DMintContractsManager:
         index_refs = set()
         
         # Get all dMint tokens from index
-        dmint_tokens = self.glyph_index.get_tokens_by_type(
+        dmint_result = self.glyph_index.get_tokens_by_type(
             token_type=4,  # GlyphTokenType.DMINT
             limit=10000
         )
+        dmint_tokens = dmint_result.get('tokens', []) if isinstance(dmint_result, dict) else dmint_result
         
         for token in dmint_tokens:
             ref = token.get('ref', '').replace('_', '')
