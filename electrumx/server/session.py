@@ -1082,6 +1082,7 @@ class ElectrumX(SessionBase):
             'hosts': hosts_dict,
             'pruning': None,
             'server_version': electrumx.version,
+            'rxindexer_version': electrumx.rxindexer_version,
             'protocol_min': min_str,
             'protocol_max': max_str,
             'genesis_hash': env.coin.GENESIS_HASH,
