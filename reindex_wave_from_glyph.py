@@ -37,7 +37,8 @@ def main():
     from electrumx.lib.glyph import GlyphProtocol
 
     # Open the database directly
-    db_dir = os.environ.get('DB_DIRECTORY', '/data/electrumdb')
+    db_base = os.environ.get('DB_DIRECTORY', '/data/electrumdb')
+    db_dir = os.path.join(db_base, 'utxo')
     db_engine = os.environ.get('DB_ENGINE', 'rocksdb')
 
     logger.info(f'Opening {db_engine} database at {db_dir}')
