@@ -352,8 +352,29 @@ class AnalyticsIndex:
         if not self.enabled:
             return
         current = self._get_summary(AnalyticsDBKeys.SUMMARY + b'last_processed_height', None)
-        if current is not None:
+
+        # Check if age_distribution exists but only has <1d populated (indicating
+        # the indexer synced without proper backfill - all UTXOs got birth_height=current)
+        needs_backfill = current is None
+        if not needs_backfill:
+            age_dist = self._get_summary(AnalyticsDBKeys.SUMMARY + b'age_distribution', {})
+            # If only <1d has data and all other buckets are 0, we need to backfill
+            has_only_new_utxos = age_dist.get('<1d', 0) > 0 and all(
+                age_dist.get(label, 0) == 0
+                for threshold, label in AGE_BUCKETS
+                if label != '<1d'
+            )
+            if has_only_new_utxos:
+                self.logger.warning(
+                    'Age distribution shows only <1d UTXOs (%d) - '
+                    're-running backfill to fix birth heights',
+                    age_dist.get('<1d', 0)
+                )
+                needs_backfill = True
+
+        if not needs_backfill:
             return
+
         balance_distribution = {label: 0 for _, label in BALANCE_BUCKETS}
         age_distribution = {label: 0 for _, label in AGE_BUCKETS}
         balance_by_hashX: Dict[bytes, int] = defaultdict(int)
