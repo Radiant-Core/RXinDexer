@@ -60,7 +60,7 @@ RUN python3 -m pip install 'Cython<3'
 
 # Install core dependencies first (except python-rocksdb)
 RUN python3 -m pip install plyvel 'aiorpcX[ws]>=0.22,<0.23' attrs pylru 'aiohttp>=3.3,<4.0' \
-    'websockets>=10.0,<11.0' psutil 'cbor2>=5.4.0' 'fastapi>=0.109.0' \
+    'websockets>=10.0,<14.0' psutil 'cbor2>=5.4.0' 'fastapi>=0.109.0' \
     'uvicorn[standard]>=0.27.0' 'pydantic>=2.5.0'
 
 # Install python-rocksdb with build isolation disabled to use Cython<3
