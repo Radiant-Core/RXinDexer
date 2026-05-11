@@ -182,13 +182,15 @@ class SessionManager:
 
     async def _serve_ws_compat(self, session_factory, host, port, ssl=None, reuse_address=False):
         '''Serve WebSocket connections using HTTPTransport.http_server as the handler.
-        Compatible with websockets 10+ which changed handler signature.
+        Compatible with both websockets 9.x (handler(ws, path)) and 10+ (handler(ws)).
         '''
         import websockets
-        from functools import partial
         from electrumx.server.httpserver import HTTPTransport
 
-        handler = partial(HTTPTransport.http_server, session_factory)
+        async def handler(websocket, *args):
+            # websockets 9.x passes (websocket, path), 10+ passes (websocket,)
+            await HTTPTransport.http_server(session_factory, websocket)
+
         return await websockets.serve(handler, host, port, ssl=ssl, reuse_address=reuse_address)
 
     async def _start_servers(self, services):
