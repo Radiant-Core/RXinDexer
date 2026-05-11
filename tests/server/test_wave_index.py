@@ -460,6 +460,139 @@ class TestWaveNameInfo:
         assert deserialized.registration_height == info.registration_height
 
 
+class TestWaveStats:
+    """Tests for WaveIndex.stats() with DB counts."""
+
+    @pytest.fixture
+    def mock_db(self):
+        db = Mock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(return_value=None)
+        db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
+        return db
+
+    @pytest.fixture
+    def mock_env(self):
+        env = Mock()
+        env.wave_index = True
+        env.wave_genesis_ref = 'a' * 64 + '_0'
+        env.wave_hot_names = 1000
+        env.reorg_limit = 10
+        return env
+
+    @pytest.fixture
+    def wave_index(self, mock_db, mock_env):
+        from electrumx.server.wave_index import WaveIndex
+        return WaveIndex(mock_db, mock_env)
+
+    def test_stats_includes_total_names(self, wave_index):
+        """stats() must include total_names (DB + cache)."""
+        result = wave_index.stats()
+        assert 'total_names' in result
+        assert result['total_names'] == 0  # empty DB + empty cache
+
+    def test_stats_includes_genesis_configured(self, wave_index):
+        """stats() must report genesis_configured."""
+        result = wave_index.stats()
+        assert result['genesis_configured'] is True
+
+    def test_stats_cache_counts_add_to_totals(self, wave_index):
+        """In-memory cache entries should be reflected in totals."""
+        from electrumx.server.wave_index import name_to_hash
+        name_hash = name_to_hash('alice')
+        wave_index.name_cache[name_hash] = bytes(36)
+        wave_index.zone_cache[bytes(36)] = b'\xa0'
+        result = wave_index.stats()
+        assert result['total_names'] == 1
+        assert result['total_zones'] == 1
+        assert result['cache_names'] == 1
+
+    def test_stats_db_entries_counted(self, wave_index, mock_db):
+        """DB entries should be counted via prefix scan."""
+        from electrumx.server.wave_index import WaveDBKeys
+        # Simulate 2 WN entries and 1 WZ entry in DB
+        def fake_iterator(prefix=None):
+            if prefix == WaveDBKeys.NAME:
+                return iter([(b'WNfakekey1', b'ref1'), (b'WNfakekey2', b'ref2')])
+            elif prefix == WaveDBKeys.ZONE:
+                return iter([(b'WZfakekey1', b'zone1')])
+            elif prefix == WaveDBKeys.OWNER:
+                return iter([])
+            return iter([])
+        mock_db.utxo_db.iterator = Mock(side_effect=fake_iterator)
+        result = wave_index.stats()
+        assert result['total_names'] == 2
+        assert result['total_zones'] == 1
+        assert result['total_owners'] == 0
+
+
+class TestWaveHotNames:
+    """Tests for hot_names cache population on resolve()."""
+
+    @pytest.fixture
+    def mock_db(self):
+        db = Mock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(return_value=None)
+        db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
+        return db
+
+    @pytest.fixture
+    def mock_env(self):
+        env = Mock()
+        env.wave_index = True
+        env.wave_genesis_ref = 'a' * 64 + '_0'
+        env.wave_hot_names = 1000
+        env.reorg_limit = 10
+        return env
+
+    @pytest.fixture
+    def wave_index(self, mock_db, mock_env):
+        from electrumx.server.wave_index import WaveIndex
+        return WaveIndex(mock_db, mock_env)
+
+    def test_hot_names_empty_initially(self, wave_index):
+        """hot_names cache starts empty."""
+        assert len(wave_index.hot_names) == 0
+
+    def test_resolve_populates_hot_names(self, wave_index, mock_db):
+        """Successful resolve() should populate hot_names cache."""
+        try:
+            import cbor2
+        except ImportError:
+            pytest.skip('cbor2 not available')
+        from electrumx.server.wave_index import WaveDBKeys, name_to_hash
+        ref = bytes(36)
+        name_hash = name_to_hash('alice')
+        zone_dict = {'address': 'RXDAliceAddress'}
+        zone_cbor = cbor2.dumps(zone_dict)
+        owner = bytes.fromhex('aa' * 11)
+
+        def fake_get(key):
+            if key == WaveDBKeys.NAME + name_hash:
+                return ref
+            if key == WaveDBKeys.ZONE + ref:
+                return zone_cbor
+            if key == WaveDBKeys.OWNER + ref:
+                return owner
+            return None
+        mock_db.utxo_db.get = Mock(side_effect=fake_get)
+
+        result = wave_index.resolve('alice')
+        assert result is not None
+        assert result['target'] == 'RXDAliceAddress'
+        assert 'alice' in wave_index.hot_names
+        assert wave_index.hot_names['alice'].zone.address == 'RXDAliceAddress'
+
+    def test_resolve_unknown_does_not_populate_hot(self, wave_index):
+        """resolve() for unknown name should not populate hot_names."""
+        result = wave_index.resolve('unknown')
+        assert result is None
+        assert len(wave_index.hot_names) == 0
+
+
 class TestWaveOutputStructure:
     """Tests for WAVE output structure constants."""
 

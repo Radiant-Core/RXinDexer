@@ -320,7 +320,16 @@ class WaveIndex:
         
         protocols = glyph_envelope.get('protocols', [])
         if GlyphProtocol.GLYPH_WAVE not in protocols:
+            self.logger.debug(
+                f'WAVE skip tx {hash_to_hex_str(tx_hash)}: '
+                f'protocols={protocols} (no GLYPH_WAVE={GlyphProtocol.GLYPH_WAVE})'
+            )
             return
+        
+        self.logger.info(
+            f'WAVE candidate tx {hash_to_hex_str(tx_hash)} at height {height}, '
+            f'protocols={protocols}'
+        )
         
         # Extract name and zone from metadata
         metadata = glyph_envelope.get('metadata', {})
@@ -588,6 +597,16 @@ class WaveIndex:
         zone_dict = zone.to_dict() if zone else {}
         # Expose the payment address as top-level 'target' for wallet compatibility
         target = zone_dict.get('address')
+
+        # Populate hot cache on successful resolve
+        if len(self.hot_names) < self.hot_name_limit:
+            info = WaveNameInfo()
+            info.ref = ref
+            info.name = normalized
+            info.owner_scripthash = owner or b''
+            info.zone = zone
+            self.hot_names[normalized] = info
+
         return {
             'name': normalized,
             'ref': self._format_ref(ref),
@@ -734,13 +753,37 @@ class WaveIndex:
         vout = struct.unpack('<I', ref[32:36])[0]
         return hash_to_hex_str(txid) + '_' + str(vout)
     
+    def _count_db_prefix(self, prefix: bytes, limit: int = 0) -> int:
+        """Count entries in the DB with a given key prefix.
+        
+        Args:
+            prefix: Key prefix to count.
+            limit: If > 0, stop counting after this many (for perf).
+                   0 means count all.
+        """
+        count = 0
+        for _key, _value in self.db.utxo_db.iterator(prefix=prefix):
+            count += 1
+            if limit and count >= limit:
+                break
+        return count
+
     def stats(self) -> Dict[str, Any]:
-        """Get WAVE index statistics."""
+        """Get WAVE index statistics including DB counts."""
+        # DB counts (authoritative — survives flush)
+        db_names = self._count_db_prefix(WaveDBKeys.NAME)
+        db_zones = self._count_db_prefix(WaveDBKeys.ZONE)
+        db_owners = self._count_db_prefix(WaveDBKeys.OWNER)
+
         return {
             'enabled': self.enabled,
             'genesis_configured': self.genesis_ref is not None,
-            'tree_cache_size': len(self.tree_cache),
-            'name_cache_size': len(self.name_cache),
+            'total_names': db_names + len(self.name_cache),
+            'total_zones': db_zones + len(self.zone_cache),
+            'total_owners': db_owners + len(self.owner_cache),
+            'cache_tree': len(self.tree_cache),
+            'cache_names': len(self.name_cache),
+            'cache_zones': len(self.zone_cache),
             'hot_names': len(self.hot_names),
         }
 
