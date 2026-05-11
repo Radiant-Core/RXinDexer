@@ -316,7 +316,7 @@ class BlockProcessor:
                 block = self.db.read_raw_block(height)
                 self.logger.info(f'read block {hex_hash} at height {height:,d} from disk')
             except FileNotFoundError:
-                block = await self.daemon.raw_blocks([hex_hash])[0]
+                block = (await self.daemon.raw_blocks([hex_hash]))[0]
                 self.logger.info(f'obtained block {hex_hash} at height {height:,d} from daemon')
             return block
 

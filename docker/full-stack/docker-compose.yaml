@@ -93,6 +93,7 @@ services:
       # RXinDexer: WAVE naming system indexing
       - WAVE_INDEX=${WAVE_INDEX:-1}
       - WAVE_HOT_NAMES=${WAVE_HOT_NAMES:-10000}
+      - WAVE_GENESIS_REF=${WAVE_GENESIS_REF:-}
       # RXinDexer: Swap DEX order indexing
       - SWAP_INDEX=${SWAP_INDEX:-1}
       # RXinDexer: Real-time WebSocket subscriptions
