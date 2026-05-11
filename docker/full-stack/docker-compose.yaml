@@ -68,7 +68,7 @@ services:
       - NET=mainnet
       - DB_ENGINE=rocksdb
       - DB_DIRECTORY=/data/electrumdb
-      - SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,rpc://127.0.0.1:8001
+      - SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,ws://0.0.0.0:50013,rpc://127.0.0.1:8001
       - SSL_CERTFILE=/data/electrumdb/server.crt
       - SSL_KEYFILE=/data/electrumdb/server.key
       - REST_API_ENABLED=1
