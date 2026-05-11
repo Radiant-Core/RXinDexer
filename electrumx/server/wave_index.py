@@ -564,6 +564,108 @@ class WaveIndex:
             self.logger.info(f'Flushed {count} WAVE entries')
     
     # ========================================================================
+    # Backfill (run once when WAVE DB is empty but Glyph DB has WAVE tokens)
+    # ========================================================================
+
+    def backfill_from_glyph_db(self, glyph_index):
+        """
+        Backfill WAVE index from existing Glyph token database.
+        
+        Scans all tokens with GLYPH_WAVE protocol and indexes their names.
+        Called at startup when the WAVE DB is empty but Glyph tokens exist.
+        Returns the number of names indexed.
+        """
+        if not self.enabled or not self.genesis_ref:
+            return 0
+
+        # Check if WAVE DB already has data (avoid re-running)
+        existing = self._count_db_prefix(WaveDBKeys.NAME, limit=1)
+        if existing > 0 or len(self.name_cache) > 0:
+            self.logger.info(f'WAVE backfill skipped: already have {existing} names in DB')
+            return 0
+
+        self.logger.info('Starting WAVE backfill from Glyph token database...')
+        count = 0
+
+        try:
+            from electrumx.server.glyph_index import GlyphDBKeys, GlyphTokenInfo
+        except ImportError:
+            self.logger.warning('Cannot import GlyphIndex — backfill aborted')
+            return 0
+
+        # Scan all GT (token) entries
+        for key, value in self.db.utxo_db.iterator(prefix=GlyphDBKeys.TOKEN):
+            try:
+                token = GlyphTokenInfo.from_bytes(value)
+            except Exception:
+                continue
+
+            if GlyphProtocol.GLYPH_WAVE not in token.protocols:
+                continue
+
+            # Extract name — stored in token.name as "name.rxd"
+            raw_name = token.name or ''
+            # Strip .rxd suffix if present
+            if raw_name.endswith('.rxd'):
+                name = raw_name[:-4]
+            else:
+                name = raw_name
+
+            if not name:
+                continue
+
+            valid, _ = validate_wave_name(name)
+            if not valid:
+                continue
+
+            # Build ref from the GT key: GT + ref(36 bytes)
+            ref = key[len(GlyphDBKeys.TOKEN):]
+            if len(ref) < 36:
+                continue
+            claim_ref = ref[:36]
+            tx_hash = ref[:32]
+            height = token.deploy_height or 0
+
+            # Determine parent — all top-level names use genesis
+            parent_ref = self.genesis_ref
+
+            # Index in tree
+            self._index_name_in_tree(name, parent_ref, claim_ref, height, tx_hash=tx_hash)
+
+            # Store name -> ref
+            name_hash = name_to_hash(name)
+            self.name_cache[name_hash] = claim_ref
+            self.name_height[name_hash] = height
+
+            # Store zone records from token metadata if available
+            metadata_hash = token.metadata_hash
+            zone = WaveZoneRecords()
+            # Try to fetch full metadata from Glyph DB
+            if metadata_hash and HAS_CBOR:
+                meta_raw = self.db.utxo_db.get(GlyphDBKeys.METADATA + metadata_hash)
+                if meta_raw:
+                    try:
+                        full_metadata = cbor2.loads(meta_raw)
+                        zone = WaveZoneRecords.from_metadata(full_metadata)
+                    except Exception:
+                        pass
+
+            if HAS_CBOR:
+                self.zone_cache[claim_ref] = cbor2.dumps(zone.to_dict())
+                self.zone_height[claim_ref] = height
+
+            count += 1
+            if count % 50 == 0:
+                self.logger.info(f'WAVE backfill: indexed {count} names so far...')
+
+        if count > 0:
+            self.logger.info(f'WAVE backfill complete: indexed {count} names')
+        else:
+            self.logger.info('WAVE backfill: no WAVE tokens found in Glyph DB')
+
+        return count
+
+    # ========================================================================
     # Query Methods (API)
     # ========================================================================
     
