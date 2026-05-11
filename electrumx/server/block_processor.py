@@ -1012,7 +1012,8 @@ class BlockProcessor:
         if self.wave_index and self.glyph_index:
             count = self.wave_index.backfill_from_glyph_db(self.glyph_index)
             if count > 0:
-                await self.flush(True)
+                async with self.state_lock:
+                    await self.flush(True)
         if self.analytics_index and self.height >= 0:
             self.analytics_index.backfill(self.height)
 
