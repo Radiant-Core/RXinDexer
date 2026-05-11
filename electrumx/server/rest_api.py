@@ -33,6 +33,7 @@ V2 Hard Fork Endpoints:
 WAVE Endpoints:
   /wave/resolve/{name}         — Resolve WAVE name
   /wave/available/{name}       — Check availability
+  /wave/names                  — List all registered WAVE names
   /wave/{name}/subdomains      — List subdomains
   /wave/reverse/{scripthash}   — Reverse lookup by owner
   /wave/stats                  — WAVE indexing stats
@@ -1230,6 +1231,51 @@ async def wave_stats():
 
     try:
         return _wave_index.stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/wave/names", tags=["WAVE"])
+async def wave_list_names(
+    limit: int = Query(default=500, le=2000),
+    cursor: Optional[str] = Query(default=None, description="Pagination cursor"),
+):
+    """List all registered WAVE names with their targets.
+    
+    Returns a compact list sourced from the Glyph token index (type 5 = WAVE).
+    Supports cursor-based pagination for large result sets.
+    """
+    _ensure_wave()
+    if not _glyph_index:
+        raise HTTPException(status_code=503, detail="Glyph index not available")
+
+    try:
+        result = _glyph_index.get_tokens_by_type(5, limit=limit, cursor=cursor)
+        tokens = result.get('tokens', [])
+        
+        names = []
+        for token in tokens:
+            attrs = token.get('attrs') or {}
+            name = attrs.get('name', '')
+            domain = attrs.get('domain', 'rxd')
+            target = attrs.get('target', '')
+            if not name:
+                continue
+            names.append({
+                'name': name,
+                'domain': domain,
+                'full_name': f"{name}.{domain}",
+                'target': target,
+                'ref': token.get('ref', ''),
+                'height': token.get('deploy_height', 0),
+                'spent': token.get('is_spent', False),
+            })
+        
+        return {
+            'names': names,
+            'total': len(names),
+            'next_cursor': result.get('next_cursor'),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
