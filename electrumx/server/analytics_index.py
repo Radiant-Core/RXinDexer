@@ -294,6 +294,7 @@ class AnalyticsIndex:
         if not self.enabled:
             return
         balance_distribution = self._get_summary(AnalyticsDBKeys.SUMMARY + b'balance_distribution', {label: 0 for _, label in BALANCE_BUCKETS})
+        balance_amounts = self._get_summary(AnalyticsDBKeys.SUMMARY + b'balance_distribution_amounts', {label: 0 for _, label in BALANCE_BUCKETS})
         age_distribution = self._get_summary(AnalyticsDBKeys.SUMMARY + b'age_distribution', {label: 0 for _, label in AGE_BUCKETS})
         day = self._estimate_block_day(height)
         daily = self._get_daily(day)
@@ -306,11 +307,13 @@ class AnalyticsIndex:
             if amount_before > 0:
                 bucket_before = self._bucket_name(amount_before)
                 balance_distribution[bucket_before] = max(0, balance_distribution.get(bucket_before, 0) - 1)
+                balance_amounts[bucket_before] = max(0, balance_amounts.get(bucket_before, 0) - amount_before)
             amount_after = max(0, amount_before - spent_value)
             self._put_balance(height, spent_hashX, amount_after)
             if amount_after > 0:
                 bucket_after = self._bucket_name(amount_after)
                 balance_distribution[bucket_after] = balance_distribution.get(bucket_after, 0) + 1
+                balance_amounts[bucket_after] = balance_amounts.get(bucket_after, 0) + amount_after
 
             meta = self._get_utxo_meta(prev_hash, prev_idx)
             if meta:
@@ -326,10 +329,12 @@ class AnalyticsIndex:
             if amount_before > 0:
                 bucket_before = self._bucket_name(amount_before)
                 balance_distribution[bucket_before] = max(0, balance_distribution.get(bucket_before, 0) - 1)
+                balance_amounts[bucket_before] = max(0, balance_amounts.get(bucket_before, 0) - amount_before)
             amount_after = amount_before + value
             self._put_balance(height, hashX, amount_after)
             bucket_after = self._bucket_name(amount_after)
             balance_distribution[bucket_after] = balance_distribution.get(bucket_after, 0) + 1
+            balance_amounts[bucket_after] = balance_amounts.get(bucket_after, 0) + amount_after
             if amount_before == 0:
                 new_addresses += 1
             active_addresses.add(hashX)
@@ -345,6 +350,7 @@ class AnalyticsIndex:
         daily['new_addresses'] += new_addresses
         self._set_daily(height, day, daily)
         self._set_summary(height, b'balance_distribution', balance_distribution)
+        self._set_summary(height, b'balance_distribution_amounts', balance_amounts)
         self._set_summary(height, b'age_distribution', age_distribution)
         self._set_summary(height, b'last_processed_height', height)
 
@@ -376,6 +382,7 @@ class AnalyticsIndex:
             return
 
         balance_distribution = {label: 0 for _, label in BALANCE_BUCKETS}
+        balance_amounts = {label: 0 for _, label in BALANCE_BUCKETS}
         age_distribution = {label: 0 for _, label in AGE_BUCKETS}
         balance_by_hashX: Dict[bytes, int] = defaultdict(int)
         prefix = b'u'
@@ -398,9 +405,12 @@ class AnalyticsIndex:
 
         for hashX, amount in balance_by_hashX.items():
             self._put_balance(height, hashX, amount)
-            balance_distribution[self._bucket_name(amount)] += 1
+            bucket = self._bucket_name(amount)
+            balance_distribution[bucket] += 1
+            balance_amounts[bucket] += amount
 
         self._set_summary(height, b'balance_distribution', balance_distribution)
+        self._set_summary(height, b'balance_distribution_amounts', balance_amounts)
         self._set_summary(height, b'age_distribution', age_distribution)
         self._set_summary(height, b'last_processed_height', height)
         self.logger.info('Chain analytics backfill prepared')
@@ -424,26 +434,34 @@ class AnalyticsIndex:
         return distribution
 
     def get_balance_distribution(self) -> Dict[str, Any]:
-        dist = self._get_summary(
+        counts = self._get_summary(
             AnalyticsDBKeys.SUMMARY + b'balance_distribution',
             {label: 0 for _, label in BALANCE_BUCKETS},
         )
-        # Detect legacy '1M+' bucket and auto-migrate
-        if dist.get('1M+', 0) > 0:
+        amounts = self._get_summary(
+            AnalyticsDBKeys.SUMMARY + b'balance_distribution_amounts',
+            {label: 0 for _, label in BALANCE_BUCKETS},
+        )
+        # Detect legacy '1M+' bucket and auto-migrate counts
+        if counts.get('1M+', 0) > 0:
             self.logger.info(
                 'Legacy 1M+ bucket detected (%d entries) — recomputing',
-                dist['1M+'],
+                counts['1M+'],
             )
-            dist = self._recompute_balance_distribution()
+            counts = self._recompute_balance_distribution()
             height = self._get_summary(
                 AnalyticsDBKeys.SUMMARY + b'last_processed_height', 0,
             )
-            self._set_summary(height, b'balance_distribution', dist)
+            self._set_summary(height, b'balance_distribution', counts)
             # Persist immediately so subsequent calls are fast
             key = AnalyticsDBKeys.SUMMARY + b'balance_distribution'
-            self.db.utxo_db.put(key, repr(dist).encode())
+            self.db.utxo_db.put(key, repr(counts).encode())
             self.summary_cache.pop(key, None)
-        return dist
+        # Return combined structure: {bucket: {count, amount}}
+        return {
+            label: {'count': counts.get(label, 0), 'amount': amounts.get(label, 0)}
+            for _, label in BALANCE_BUCKETS
+        }
 
     def get_supply_aging(self) -> Dict[str, Any]:
         return self._get_summary(AnalyticsDBKeys.SUMMARY + b'age_distribution', {label: 0 for _, label in AGE_BUCKETS})

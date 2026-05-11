@@ -20,6 +20,7 @@ from aiorpcx import TaskGroup, CancelledError
 import electrumx
 from electrumx.server.daemon import DaemonError
 from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
+from electrumx.lib.glyph import GlyphProtocol
 from electrumx.lib.script import is_unspendable_legacy, is_unspendable_genesis, Script
 from electrumx.lib.util import (
     class_logger, pack_le_uint32, pack_le_uint64, unpack_le_uint64, unpack_le_uint32_from
@@ -684,6 +685,12 @@ class BlockProcessor:
                 
                 # Process for WAVE naming if this is a Glyph tx
                 if self.wave_index and glyph_envelope:
+                    protocols = glyph_envelope.get('protocols', [])
+                    if GlyphProtocol.GLYPH_WAVE in protocols:
+                        self.logger.info(
+                            f'Passing WAVE envelope to wave_index: '
+                            f'tx={hash_to_hex_str(tx_hash)} protocols={protocols}'
+                        )
                     self.wave_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope)
                 
                 # Process for Swap orders unconditionally (R3: RSWP may have no Glyph envelope)
