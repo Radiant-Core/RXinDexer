@@ -25,6 +25,7 @@ services:
       -rpcallowip=0.0.0.0/0
       -rpcbind=0.0.0.0
       -txindex=1
+      -swapindex=1
       -zmqpubhashblock=tcp://0.0.0.0:28332
     healthcheck:
       test: ["CMD", "radiant-cli", "-rpcuser=${RPC_USER:-radiant}", "-rpcpassword=${RPC_PASS:-radiant}", "getblockchaininfo"]
