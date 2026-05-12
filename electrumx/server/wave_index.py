@@ -392,7 +392,7 @@ class WaveIndex:
         # Store owner (scripthash of claim output)
         from electrumx.lib.script import Script
         claim_script = tx.outputs[0].pk_script
-        owner_scripthash = Script.hashX_from_script(Script.zero_refs(claim_script))
+        owner_scripthash = self.env.coin.hashX_from_script(Script.zero_refs(claim_script))
         self.owner_cache[claim_ref] = owner_scripthash
         self.owner_height[claim_ref] = height
 
