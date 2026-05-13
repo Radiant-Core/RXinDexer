@@ -790,7 +790,7 @@ class WaveIndex:
                 return True
         
         # Check database
-        for _key, _value in self.db.utxo_db.iterator(prefix=prefix, limit=1):
+        for _key, _value in self.db.utxo_db.iterator(prefix=prefix):
             return True
         return False
     
