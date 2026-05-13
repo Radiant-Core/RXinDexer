@@ -31,8 +31,9 @@ V2 Hard Fork Endpoints:
   /v2/activation-status        — Fork activation height and opcode status
 
 WAVE Endpoints:
-  /wave/resolve/{name}         — Resolve WAVE name
+  /wave/resolve/{name}         — Resolve WAVE name (canonical/first registration)
   /wave/available/{name}       — Check availability
+  /wave/registrations/{name}   — Get all registrations including duplicates
   /wave/names                  — List all registered WAVE names
   /wave/{name}/subdomains      — List subdomains
   /wave/reverse/{scripthash}   — Reverse lookup by owner
@@ -1168,12 +1169,21 @@ def _ensure_wave():
 
 
 @app.get("/wave/resolve/{name}", tags=["WAVE"])
-async def wave_resolve(name: str = Path(..., min_length=1, max_length=63)):
-    """Resolve a WAVE name to its zone records and owner."""
+async def wave_resolve(
+    name: str = Path(..., min_length=1, max_length=63),
+    include_duplicates: bool = Query(default=False, description="Include duplicate registrations in response"),
+):
+    """Resolve a WAVE name to its zone records and owner.
+    
+    Always returns the CANONICAL (first) registration for the name.
+    Later registrations are tracked as duplicates but not used for resolution.
+    
+    Set include_duplicates=true to see all duplicate registrations.
+    """
     _ensure_wave()
 
     try:
-        result = _wave_index.resolve(name)
+        result = _wave_index.resolve(name, include_duplicates=include_duplicates)
         if not result:
             return {"name": name, "available": True, "resolved": False}
         return result
@@ -1188,6 +1198,24 @@ async def wave_check_available(name: str = Path(..., min_length=1, max_length=63
 
     try:
         return _wave_index.check_available(name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/wave/registrations/{name}", tags=["WAVE"])
+async def wave_get_all_registrations(name: str = Path(..., min_length=1, max_length=63)):
+    """Get all registrations for a WAVE name including duplicates.
+    
+    Returns the canonical (first) registration plus all duplicate registrations.
+    This is useful for auditing name ownership disputes.
+    """
+    _ensure_wave()
+
+    try:
+        result = _wave_index.get_all_registrations(name)
+        if not result or not result.get('registered', False):
+            return {"name": name, "registered": False, "available": True}
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1239,11 +1267,15 @@ async def wave_stats():
 async def wave_list_names(
     limit: int = Query(default=500, le=2000),
     cursor: Optional[str] = Query(default=None, description="Pagination cursor"),
+    include_duplicates: bool = Query(default=False, description="Include duplicate count for each name"),
 ):
     """List all registered WAVE names with their targets.
     
     Returns a compact list sourced from the Glyph token index (type 5 = WAVE).
     Supports cursor-based pagination for large result sets.
+    
+    Note: The canonical (first) registration is always returned for each name.
+    Later registrations of the same name are tracked as duplicates but not used for resolution.
     """
     _ensure_wave()
     if not _glyph_index:
@@ -1261,7 +1293,7 @@ async def wave_list_names(
             target = attrs.get('target', '')
             if not name:
                 continue
-            names.append({
+            name_entry = {
                 'name': name,
                 'domain': domain,
                 'full_name': f"{name}.{domain}",
@@ -1269,7 +1301,12 @@ async def wave_list_names(
                 'ref': token.get('ref', ''),
                 'height': token.get('deploy_height', 0),
                 'spent': token.get('is_spent', False),
-            })
+                'canonical': True,  # This is always the canonical (first) registration
+            }
+            # Check for duplicates if requested
+            if include_duplicates and _wave_index:
+                name_entry['has_duplicates'] = _wave_index._has_duplicates(f"{name}.{domain}")
+            names.append(name_entry)
         
         return {
             'names': names,
