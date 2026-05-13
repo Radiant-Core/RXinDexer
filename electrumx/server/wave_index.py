@@ -44,12 +44,13 @@ WAVE_MAX_SUBDOMAIN_DEPTH = 127
 # Database key prefixes
 class WaveDBKeys:
     TREE = b'WT'      # WT + parent_ref + output_index -> child_ref
-    NAME = b'WN'      # WN + name_hash -> ref
+    NAME = b'WN'      # WN + name_hash -> ref (CANONICAL - first registration only)
     ZONE = b'WZ'      # WZ + ref -> zone records (CBOR)
     OWNER = b'WO'     # WO + ref -> owner scripthash
     REVERSE_OWNER = b'WR'  # WR + scripthash + ref -> '' (reverse index)
     HEIGHT = b'WH'    # WH + ref -> registration height
     UNDO = b'WVU'      # WVU + height(be) -> repr([(key, prev_value_or_None), ...])
+    DUPLICATE = b'WD' # WD + name_hash + height + tx_idx -> ref (duplicate registrations)
 
 
 class WaveZoneRecords:
@@ -378,16 +379,48 @@ class WaveIndex:
         
         # Store name -> ref mapping
         name_hash = name_to_hash(name)
-        self.name_cache[name_hash] = claim_ref
-        self.name_height[name_hash] = height
         
-        # Store zone records
+        # Check if this name is already registered (first registration wins)
+        existing_ref = self._resolve_name_to_ref(name)
+        is_duplicate = existing_ref is not None
+        
+        if is_duplicate:
+            # Store as duplicate - do NOT overwrite canonical mapping
+            # Duplicate key: WD + name_hash + height(4B) + tx_idx(4B) -> claim_ref
+            dup_key = WaveDBKeys.DUPLICATE + name_hash + struct.pack('<II', height, tx_idx)
+            self.name_cache[dup_key] = claim_ref
+            self.name_height[dup_key] = height
+            self.logger.warning(
+                f'WAVE duplicate registration for "{name}" at height {height}, tx_idx {tx_idx}. '
+                f'Original: {existing_ref.hex()[:16]}..., Duplicate: {claim_ref.hex()[:16]}...'
+            )
+        else:
+            # First registration - store as canonical
+            self.name_cache[name_hash] = claim_ref
+            self.name_height[name_hash] = height
+        
+        # Store zone records (for both canonical and duplicates)
         zone = WaveZoneRecords.from_metadata(metadata)
         if HAS_CBOR:
             self.zone_cache[claim_ref] = cbor2.dumps(zone.to_dict())
             self.zone_height[claim_ref] = height
         
-        self.logger.info(f'Indexed WAVE name "{name}" target={zone.address!r} at height {height}')
+        status = "DUPLICATE" if is_duplicate else "canonical"
+        self.logger.info(f'Indexed WAVE name "{name}" ({status}) target={zone.address!r} at height {height}')
+        
+        # Mark duplicate in Glyph index if available
+        if is_duplicate and hasattr(self.env, 'glyph_index') and self.env.glyph_index:
+            try:
+                # Mark the token as a duplicate in the Glyph index
+                token = self.env.glyph_index.get_token(claim_ref)
+                if token:
+                    token.is_wave_duplicate = True
+                    # Re-serialize and store back
+                    self.env.glyph_index.token_cache[claim_ref] = token
+                    self.env.glyph_index.token_height[claim_ref] = height
+                    self.logger.info(f'Marked WAVE token {claim_ref.hex()[:16]}... as duplicate in Glyph index')
+            except Exception as e:
+                self.logger.warning(f'Failed to mark duplicate WAVE token in Glyph index: {e}')
         
         # Store owner (scripthash of claim output)
         from electrumx.lib.script import Script
@@ -513,10 +546,18 @@ class WaveIndex:
                 self._record_undo(height, key)
             batch.put(key, child_ref)
         
-        # Flush name -> ref mappings
-        for name_hash, ref in self.name_cache.items():
-            height = self.name_height.get(name_hash)
-            key = WaveDBKeys.NAME + name_hash
+        # Flush name -> ref mappings (both canonical and duplicates)
+        for name_key, ref in self.name_cache.items():
+            height = self.name_height.get(name_key)
+            # name_key could be either:
+            # 1. name_hash (16 bytes) - canonical registration -> prefix with NAME
+            # 2. duplicate key (WD + name_hash + height + tx_idx) - already prefixed
+            if len(name_key) == 16:
+                # Canonical registration
+                key = WaveDBKeys.NAME + name_key
+            else:
+                # Duplicate entry - key is already fully formed (starts with WD)
+                key = name_key
             if height is not None:
                 self._record_undo(height, key)
             batch.put(key, ref)
@@ -669,9 +710,16 @@ class WaveIndex:
     # Query Methods (API)
     # ========================================================================
     
-    def resolve(self, name: str) -> Optional[Dict[str, Any]]:
+    def resolve(self, name: str, include_duplicates: bool = False) -> Optional[Dict[str, Any]]:
         """
         Resolve a WAVE name to its zone records and owner.
+        
+        Always returns the CANONICAL (first) registration.
+        Duplicate registrations are tracked but not returned unless requested.
+        
+        Args:
+            name: The WAVE name to resolve
+            include_duplicates: If True, include list of duplicate registrations
         
         Returns None if name is not registered.
         """
@@ -683,9 +731,12 @@ class WaveIndex:
         normalized = normalize_name(name)
         if normalized in self.hot_names:
             info = self.hot_names[normalized]
-            return self._name_info_to_dict(info)
+            result = self._name_info_to_dict(info)
+            if include_duplicates:
+                result['duplicates'] = self._get_duplicate_registrations(name)
+            return result
         
-        # Look up ref
+        # Look up canonical ref (first registration)
         ref = self._resolve_name_to_ref(name)
         if not ref:
             return None  # Name not registered
@@ -699,6 +750,9 @@ class WaveIndex:
         zone_dict = zone.to_dict() if zone else {}
         # Expose the payment address as top-level 'target' for wallet compatibility
         target = zone_dict.get('address')
+        
+        # Check if there are duplicates
+        has_duplicates = self._has_duplicates(name)
 
         # Populate hot cache on successful resolve
         if len(self.hot_names) < self.hot_name_limit:
@@ -709,14 +763,88 @@ class WaveIndex:
             info.zone = zone
             self.hot_names[normalized] = info
 
-        return {
+        result = {
             'name': normalized,
             'ref': self._format_ref(ref),
             'target': target,
             'zone': zone_dict,
             'owner': owner.hex() if owner else None,
             'available': False,
+            'canonical': True,  # This is always the canonical (first) registration
+            'has_duplicates': has_duplicates,
         }
+        
+        if include_duplicates:
+            result['duplicates'] = self._get_duplicate_registrations(name)
+        
+        return result
+    
+    def _has_duplicates(self, name: str) -> bool:
+        """Check if a name has any duplicate registrations."""
+        name_hash = name_to_hash(name)
+        prefix = WaveDBKeys.DUPLICATE + name_hash
+        
+        # Check cache first
+        for key in self.name_cache:
+            if key.startswith(prefix):
+                return True
+        
+        # Check database
+        for _key, _value in self.db.utxo_db.iterator(prefix=prefix, limit=1):
+            return True
+        return False
+    
+    def _get_duplicate_registrations(self, name: str) -> List[Dict[str, Any]]:
+        """Get all duplicate registrations for a name."""
+        name_hash = name_to_hash(name)
+        prefix = WaveDBKeys.DUPLICATE + name_hash
+        duplicates = []
+        
+        # Check cache
+        for key, ref in self.name_cache.items():
+            if key.startswith(prefix):
+                # Parse height and tx_idx from key: WD + name_hash(16) + height(4) + tx_idx(4)
+                height = struct.unpack('<I', key[18:22])[0]
+                tx_idx = struct.unpack('<I', key[22:26])[0]
+                zone = self._get_zone_records(ref)
+                owner = self._get_owner(ref)
+                duplicates.append({
+                    'ref': self._format_ref(ref),
+                    'height': height,
+                    'tx_idx': tx_idx,
+                    'target': zone.address if zone else None,
+                    'owner': owner.hex() if owner else None,
+                    'is_duplicate': True,
+                })
+        
+        # Check database
+        for key, ref in self.db.utxo_db.iterator(prefix=prefix):
+            # Skip if already in cache
+            if key in self.name_cache:
+                continue
+            height = struct.unpack('<I', key[18:22])[0]
+            tx_idx = struct.unpack('<I', key[22:26])[0]
+            zone = self._get_zone_records(ref)
+            owner = self._get_owner(ref)
+            duplicates.append({
+                'ref': self._format_ref(ref),
+                'height': height,
+                'tx_idx': tx_idx,
+                'target': zone.address if zone else None,
+                'owner': owner.hex() if owner else None,
+                'is_duplicate': True,
+            })
+        
+        # Sort by height, then tx_idx
+        duplicates.sort(key=lambda x: (x['height'], x['tx_idx']))
+        return duplicates
+    
+    def get_all_registrations(self, name: str) -> Dict[str, Any]:
+        """Get canonical registration plus all duplicates for a name."""
+        result = self.resolve(name, include_duplicates=True)
+        if not result:
+            return {'name': name, 'registered': False}
+        return result
     
     def check_available(self, name: str) -> Dict[str, Any]:
         """Check if a WAVE name is available for registration."""

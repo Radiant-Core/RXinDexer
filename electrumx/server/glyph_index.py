@@ -127,6 +127,8 @@ class GlyphTokenInfo:
         'is_encrypted', 'cipher_hash', 'enc_scheme',
         # Timelock (Phase 6 / REP-3009)
         'is_timelocked', 'timelock_mode', 'timelock_unlock_at', 'timelock_cek_hash', 'timelock_hint',
+        # WAVE naming (REP-3011)
+        'is_wave_duplicate',  # True if this WAVE name token is a duplicate (not canonical)
     )
     
     def __init__(self):
@@ -182,6 +184,8 @@ class GlyphTokenInfo:
         self.timelock_unlock_at = None  # Block height or UNIX timestamp
         self.timelock_cek_hash = None   # sha256:hex CEK commitment
         self.timelock_hint = None       # Optional viewer hint
+        # WAVE naming (REP-3011)
+        self.is_wave_duplicate = False  # True if this WAVE name is a duplicate (not canonical)
     
     def to_bytes(self) -> bytes:
         """Serialize token info to CBOR bytes for flexible storage."""
@@ -241,6 +245,8 @@ class GlyphTokenInfo:
             'tu': self.timelock_unlock_at,
             'tc': self.timelock_cek_hash,
             'th': self.timelock_hint,
+            # WAVE naming
+            'wd': self.is_wave_duplicate or None,
         }
         # Remove None values to save space
         data = {k: v for k, v in data.items() if v is not None and v != 0 and v != b''}
@@ -307,6 +313,8 @@ class GlyphTokenInfo:
         info.timelock_unlock_at = d.get('tu')
         info.timelock_cek_hash = d.get('tc')
         info.timelock_hint = d.get('th')
+        # WAVE naming
+        info.is_wave_duplicate = bool(d.get('wd', False))
         
         return info
     
@@ -1915,6 +1923,13 @@ class GlyphIndex:
                 result['timelock_cek_hash'] = token.timelock_cek_hash
             if token.timelock_hint is not None:
                 result['timelock_hint'] = token.timelock_hint
+
+        # WAVE naming fields (REP-3011)
+        if GlyphProtocol.GLYPH_WAVE in token.protocols:
+            result['is_wave'] = True
+            result['is_wave_duplicate'] = token.is_wave_duplicate
+            if token.is_wave_duplicate:
+                result['wave_warning'] = 'This is a DUPLICATE WAVE name registration. It is NOT used for name resolution. Only the first (canonical) registration is authoritative.'
 
         return result
     
