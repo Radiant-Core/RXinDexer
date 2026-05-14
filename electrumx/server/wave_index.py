@@ -983,6 +983,37 @@ class WaveIndex:
         vout = struct.unpack('<I', ref[32:36])[0]
         return hash_to_hex_str(txid) + '_' + str(vout)
     
+    def list_names(self, limit: int = 500, cursor: Optional[bytes] = None) -> Dict[str, Any]:
+        """
+        List canonical WAVE names by iterating the WN (NAME) prefix directly.
+        Returns only canonical (first-registration-wins) entries.
+        Cursor is the raw DB key bytes for pagination.
+        """
+        results = []
+        next_cursor = None
+        count = 0
+
+        # Iterate DB entries with WN prefix
+        iter_kwargs: Dict[str, Any] = {'prefix': WaveDBKeys.NAME}
+        if cursor:
+            iter_kwargs['seek'] = cursor
+
+        for key, ref_bytes in self.db.utxo_db.iterator(**iter_kwargs):
+            if count >= limit:
+                next_cursor = key
+                break
+            if len(ref_bytes) < 36:
+                continue
+            zone = self._get_zone_records(ref_bytes)
+            zone_dict = zone.to_dict() if zone else {}
+            results.append({
+                'ref': ref_bytes,
+                'target': zone_dict.get('address', ''),
+            })
+            count += 1
+
+        return {'entries': results, 'next_cursor': next_cursor}
+
     def _count_db_prefix(self, prefix: bytes, limit: int = 0) -> int:
         """Count entries in the DB with a given key prefix.
         
