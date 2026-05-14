@@ -1183,6 +1183,11 @@ async def wave_resolve(
     """
     _ensure_wave()
 
+    # Strip domain suffix (e.g. "alice.rxd" → "alice") for user convenience
+    dot_idx = name.rfind('.')
+    if dot_idx > 0:
+        name = name[:dot_idx]
+
     try:
         result = _wave_index.resolve(name, include_duplicates=include_duplicates)
         if not result:
