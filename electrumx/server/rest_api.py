@@ -47,6 +47,7 @@ Swap Endpoints:
 
 from typing import Optional, Dict, Any, List, Set
 import asyncio
+import base64
 import hmac
 import json
 import os
@@ -1282,36 +1283,65 @@ async def wave_list_names(
         raise HTTPException(status_code=503, detail="Glyph index not available")
 
     try:
-        result = _glyph_index.get_tokens_by_type(5, limit=limit, cursor=cursor)
+        # Decode cursor for glyph BY_TYPE pagination
+        result = _glyph_index.get_tokens_by_type(5, limit=limit * 3, cursor=cursor)
         tokens = result.get('tokens', [])
-        
+
+        # Deduplicate: for each name, keep only the canonical (first-registration) token.
+        # The wave index stores the canonical ref per name; any token whose glyph ref
+        # does NOT match the wave canonical ref is a duplicate.
+        seen_names: set = set()
         names = []
         for token in tokens:
             attrs = token.get('attrs') or {}
             name = attrs.get('name', '')
             domain = attrs.get('domain', 'rxd')
-            target = attrs.get('target', '')
             if not name:
                 continue
+
+            full_name = f"{name}.{domain}"
+            token_ref_str = token.get('ref', '')
+
+            # Skip if we've already emitted this name
+            if full_name in seen_names:
+                continue
+
+            # Check wave index: is this token the canonical (first) registration?
+            # The wave index stores claim_ref = tx_hash+vout(0) for canonical entries.
+            # The glyph token's deploy_txid equals the claim_ref txid (same tx).
+            canonical_ref = _wave_index._resolve_name_to_ref(name)
+            if canonical_ref is None:
+                # Not in wave index — skip
+                continue
+
+            # canonical_ref[:32] is the tx_hash (little-endian), deploy_txid is hex (reversed)
+            canonical_txid_hex = canonical_ref[:32][::-1].hex()
+            token_deploy_txid = token.get('deploy_txid', '')
+            if canonical_txid_hex != token_deploy_txid:
+                # This is a duplicate registration — skip
+                continue
+
+            seen_names.add(full_name)
             name_entry = {
                 'name': name,
                 'domain': domain,
-                'full_name': f"{name}.{domain}",
-                'target': target,
-                'ref': token.get('ref', ''),
+                'full_name': full_name,
+                'target': attrs.get('target', ''),
+                'ref': token_ref_str,
                 'height': token.get('deploy_height', 0),
                 'spent': token.get('is_spent', False),
-                'canonical': True,  # This is always the canonical (first) registration
+                'canonical': True,
             }
-            # Check for duplicates if requested
-            if include_duplicates and _wave_index:
-                name_entry['has_duplicates'] = _wave_index._has_duplicates(f"{name}.{domain}")
+            if include_duplicates:
+                name_entry['has_duplicates'] = _wave_index._has_duplicates(name)
             names.append(name_entry)
-        
+            if len(names) >= limit:
+                break
+
         return {
             'names': names,
             'total': len(names),
-            'next_cursor': result.get('next_cursor'),
+            'next_cursor': result.get('next_cursor') if len(names) >= limit else None,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
