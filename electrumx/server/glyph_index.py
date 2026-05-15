@@ -736,8 +736,9 @@ class GlyphIndex:
         """
         protocols = metadata.get('p', [])
         
-        # For NFTs, use _extract_refs_from_script to find singleton ref (R4 fix)
-        if GlyphProtocol.GLYPH_NFT in protocols:
+        # For NFTs and WAVE names, use _extract_refs_from_script to find singleton ref (R4 fix)
+        # WAVE tokens use singleton refs but may not have GLYPH_NFT explicitly in protocols
+        if GlyphProtocol.GLYPH_NFT in protocols or GlyphProtocol.GLYPH_WAVE in protocols:
             for vout, output in enumerate(tx.outputs):
                 refs = self._extract_refs_from_script(output.pk_script)
                 for ref_bytes, ref_type in refs:
