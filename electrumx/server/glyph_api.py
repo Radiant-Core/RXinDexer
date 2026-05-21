@@ -907,6 +907,86 @@ class GlyphAPIMixin:
         except Exception as e:
             return {'error': str(e)}
 
+    async def swap_get_orders(self, base_ref: str = None, quote_ref: str = None,
+                              limit: int = 50, offset: int = 0):
+        """
+        Get active (confirmed) swap orders, optionally filtered by trading pair.
+
+        When both base_ref and quote_ref are provided, returns the full
+        orderbook for that pair (both sides). With only base_ref, returns
+        all open orders selling that token. With neither, returns all open
+        orders across the index.
+
+        Mirrors the REST endpoint at GET /swaps/orders.
+
+        Args:
+            base_ref: Optional base token ref (txid_vout or 72-hex)
+            quote_ref: Optional quote token ref (txid_vout or 72-hex)
+            limit: Maximum results (default 50, max 200)
+            offset: Pagination offset (default 0)
+
+        Returns:
+            List of swap orders (or orderbook dict when both refs given).
+        """
+        self.bump_cost(2.0)
+
+        if not self.swap_index:
+            return {'error': 'Swap indexing not enabled'}
+
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+
+        try:
+            base_bytes = self._parse_ref(base_ref) if base_ref else None
+            quote_bytes = self._parse_ref(quote_ref) if quote_ref else None
+            if base_bytes and quote_bytes:
+                return self.swap_index.get_orderbook(
+                    base_bytes, quote_bytes, limit=limit,
+                )
+            return self.swap_index.get_open_orders(
+                base_ref=base_bytes, limit=limit, offset=offset,
+            )
+        except (ValueError, TypeError) as e:
+            return {'error': f'Invalid ref format: {e}'}
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def swap_get_history(self, base_ref: str, limit: int = 50, offset: int = 0):
+        """
+        Get swap trade/fill history for a trading pair.
+
+        Mirrors the REST endpoint at GET /swaps/history. Unlike open orders,
+        base_ref is required — the history index is keyed by base token.
+
+        Args:
+            base_ref: Base token ref (required)
+            limit: Maximum results (default 50, max 200)
+            offset: Pagination offset (default 0)
+
+        Returns:
+            Trade history list/dict, or {'trades': [], 'error': ...} on bad input.
+        """
+        self.bump_cost(2.0)
+
+        if not self.swap_index:
+            return {'error': 'Swap indexing not enabled'}
+
+        if not base_ref:
+            return {'trades': [], 'error': 'base_ref is required'}
+
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+
+        try:
+            base_bytes = self._parse_ref(base_ref)
+            return self.swap_index.get_swap_history(
+                base_bytes, limit=limit, offset=offset,
+            )
+        except (ValueError, TypeError) as e:
+            return {'error': f'Invalid ref format: {e}'}
+        except Exception as e:
+            return {'error': str(e)}
+
     async def swap_get_user_unconfirmed(self, scripthash: str):
         """
         Get unconfirmed swap orders for a user.
@@ -1241,6 +1321,9 @@ GLYPH_METHODS = {
     'dmint.get_contract_daa': 'dmint_get_contract_daa',
     'dmint.get_mint_history': 'dmint_get_mint_history',
     'dmint.get_tokens': 'dmint_get_tokens',
+    # Swap DEX (confirmed)
+    'swap.get_orders': 'swap_get_orders',
+    'swap.get_history': 'swap_get_history',
     # Mempool Glyph/Swap
     'glyph.get_unconfirmed_balance': 'glyph_get_unconfirmed_balance',
     'glyph.get_unconfirmed_txs': 'glyph_get_unconfirmed_txs',
