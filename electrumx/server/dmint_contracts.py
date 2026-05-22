@@ -286,8 +286,12 @@ class DMintContractsManager:
                         existing[key] = value
                         changed = True
                 
-                # Check if fully mined
-                if token.get('percent_mined', 0) >= 100:
+                # Check if fully mined.
+                # Use `or 0` rather than the dict.get default — when the
+                # key exists but is None (e.g. freshly-deployed contract
+                # with no mints, percent_mined unset), get() returns None
+                # which can't be compared to int and crashes the indexer.
+                if (token.get('percent_mined') or 0) >= 100:
                     if existing.get('active', True):
                         existing['active'] = False
                         changed = True
