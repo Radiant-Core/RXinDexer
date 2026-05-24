@@ -553,9 +553,17 @@ class DMintContractsManager:
         }
     
     def get_contract(self, ref: str) -> Optional[Dict[str, Any]]:
-        """Get a single contract by ref."""
+        """Get a single contract by ref.
+
+        Stored refs use the internal format `64-hex-txid + decimal-vout`
+        (e.g. `bee9...0` for vout 0). Callers from the REST API pass the
+        external format `64-hex-txid + 8-hex-vout` (e.g. `bee9...00000000`).
+        Normalize both sides to the external format for comparison so the
+        endpoint works regardless of which form the caller sends.
+        """
+        normalized = self._normalize_ref(ref)
         for c in self.contracts:
-            if c['ref'] == ref:
+            if self._normalize_ref(c['ref']) == normalized:
                 return c
         return None
     
