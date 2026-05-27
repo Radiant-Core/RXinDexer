@@ -329,6 +329,12 @@ Extended format (`data/contracts_extended.json`) - for enhanced miners:
 | 1 | SHA256D |
 | 2 | RadiantHash |
 
+**Operator Denylist (`data/dmint_denylist.json`)** — optional. Refs listed here
+are hidden from all `/dmint/contracts` responses, dropped from
+`contracts_extended.json` on the next sync, and never re-added. Hot-reloaded on
+file mtime change (no restart). Used for abandoned, bricked, or illegal-content
+takedowns. See `contrib/dmint_denylist.example.json` for the format.
+
 ### 3.5 Mempool Glyph/Swap Methods
 
 Real-time unconfirmed transaction queries for wallets and DEX UIs:
