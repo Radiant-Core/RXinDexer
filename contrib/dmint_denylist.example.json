@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "_doc": "Operator denylist for dMint contracts. Refs listed here are hidden from /dmint/contracts API responses, dropped from contracts_extended.json on the next sync, and never re-added. Hot-reloaded on file mtime change — no rxindexer restart required. Copy this file to <DB_DIRECTORY>/dmint_denylist.json on the indexer host. Accepted ref forms: 72-char hex (preferred), txid_vout, or txid:vout.",
+  "refs": [
+    { "ref": "df185ceb0b21e6208149ab5f23e01da6e414d8db9d570852167c33d54abc798e00000000", "ticker": "B3T",  "reason": "Abandoned BLAKE3 deployment" },
+    { "ref": "bee9f94b1069d14c6311563f456e9708bd32a6196ce6ab4acc497eebe7c4780b00000000", "ticker": "B3T2", "reason": "Abandoned BLAKE3 deployment" },
+    { "ref": "3bc74f8ca8977ce1a4871f53aa19c4a8abdac0d3fccacd8ebdf9c7cf5b27ecf900000000", "ticker": "B3T3", "reason": "Abandoned BLAKE3 deployment" },
+    { "ref": "7e7ca57a34a5ce88e2e7b55ea72ad94e5763b1689f826a4ec83e7156817c8ab000000000", "ticker": "SLOP", "reason": "Abandoned BLAKE3 deployment" },
+    { "ref": "e0b2db071cad8646f879c1ab12618c77d4c90685146bdb8b81b5ac78707a581600000000", "ticker": "VRT",  "reason": "Abandoned BLAKE3 deployment" },
+    { "ref": "4988121e8d0b75ddc9a92422a82a4be76507d97080914fc1072a9385a3a34c1100000000", "ticker": "BLF",  "reason": "Abandoned BLAKE3 deployment" }
+  ]
+}

@@ -13,12 +13,65 @@ Extended format (for enhanced miners):
 
 import json
 import os
+import re
 import struct
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str
+
+
+_NON_HEX = re.compile(r'[^0-9a-f]')
+
+
+def _is_hex(s: str) -> bool:
+    return bool(s) and _NON_HEX.search(s) is None
+
+
+def _canonical_ref(ref: Any) -> str:
+    """Normalize a Glyph ref to canonical 72-char hex (txid_BE + 8-char hex vout).
+
+    Accepts the common input forms:
+      - 72-char hex (already canonical)
+      - "<txid_hex>_<decimal_vout>"  (the form GlyphIndex stores)
+      - "<txid_hex>:<decimal_vout>"  (the form humans copy from explorers)
+      - "<txid_hex><decimal_vout>"   (concatenated, vout 0-99 — 65-66 chars)
+
+    Returns lowercase canonical form, or '' if the input can't be parsed.
+    """
+    if not isinstance(ref, str):
+        return ''
+    s = ref.strip().lower()
+    if not s:
+        return ''
+
+    # Form: txid_vout or txid:vout
+    for sep in ('_', ':'):
+        if sep in s:
+            txid, _, vout_str = s.partition(sep)
+            if len(txid) == 64 and _is_hex(txid):
+                try:
+                    return txid + format(int(vout_str, 10), '08x')
+                except (ValueError, TypeError):
+                    return ''
+            return ''
+
+    # Form: pure 72-char hex
+    if len(s) == 72 and _is_hex(s):
+        return s
+
+    # Form: txid + decimal vout (e.g. df185c…798e0 for vout 0). Strip leading
+    # hex txid (64 chars) and treat the remainder as decimal vout.
+    if 64 < len(s) <= 74 and _is_hex(s[:64]):
+        tail = s[64:]
+        if tail.isdigit():
+            try:
+                return s[:64] + format(int(tail, 10), '08x')
+            except (ValueError, TypeError):
+                return ''
+
+    return ''
 
 
 class DMintContractsManager:
@@ -55,17 +108,90 @@ class DMintContractsManager:
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.data_dir = data_dir
         self.glyph_index = glyph_index
-        
+
         # File paths
         self.simple_path = os.path.join(data_dir, 'contracts.json')
         self.extended_path = os.path.join(data_dir, 'contracts_extended.json')
-        
+        self.denylist_path = os.path.join(data_dir, 'dmint_denylist.json')
+
         # In-memory cache
         self.contracts: List[Dict[str, Any]] = []
         self.last_updated_height = 0
-        
-        # Load existing contracts
+
+        # Denylist: canonical 72-char hex refs hidden from all API responses
+        # and skipped during sync. Hot-reloaded on file mtime change.
+        self._denylist: Set[str] = set()
+        self._denylist_mtime: float = -1.0
+
+        # Load existing contracts, then strip anything already on the denylist
         self._load_contracts()
+        self._load_denylist()
+        self._purge_denied()
+
+    def _load_denylist(self) -> bool:
+        """Reload denylist if the file's mtime has changed. Returns True if reloaded."""
+        try:
+            mtime = os.path.getmtime(self.denylist_path)
+        except OSError:
+            # File missing — clear cached denylist if it was previously populated
+            if self._denylist:
+                self.logger.info('dMint denylist file removed; clearing %d entries',
+                                 len(self._denylist))
+                self._denylist = set()
+                self._denylist_mtime = -1.0
+                return True
+            return False
+
+        if mtime == self._denylist_mtime:
+            return False
+
+        try:
+            with open(self.denylist_path, 'r') as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            self.logger.error('Failed to read dMint denylist: %s', e)
+            return False
+
+        # Accept either {"refs": [...]} or a bare list. Entries can be plain
+        # strings or {"ref": "...", "reason": "..."} objects.
+        raw_entries = data.get('refs', []) if isinstance(data, dict) else data
+        if not isinstance(raw_entries, list):
+            self.logger.error('dMint denylist must be a list of refs')
+            return False
+
+        new_denylist: Set[str] = set()
+        for entry in raw_entries:
+            ref_str = entry.get('ref') if isinstance(entry, dict) else entry
+            canonical = _canonical_ref(ref_str)
+            if canonical:
+                new_denylist.add(canonical)
+            else:
+                self.logger.warning('Skipping unparseable denylist entry: %r', ref_str)
+
+        self._denylist = new_denylist
+        self._denylist_mtime = mtime
+        self.logger.info('Loaded dMint denylist: %d entries', len(new_denylist))
+        return True
+
+    def _is_denied(self, ref: Any) -> bool:
+        """Check if a contract ref (any form) is on the denylist."""
+        if not self._denylist:
+            return False
+        canonical = _canonical_ref(ref)
+        return bool(canonical) and canonical in self._denylist
+
+    def _purge_denied(self) -> int:
+        """Drop any in-memory contracts that match the denylist; persist if changed.
+        Returns the number of contracts removed."""
+        if not self._denylist or not self.contracts:
+            return 0
+        kept = [c for c in self.contracts if not self._is_denied(c.get('ref'))]
+        removed = len(self.contracts) - len(kept)
+        if removed:
+            self.contracts = kept
+            self._save_contracts()
+            self.logger.info('Purged %d denied dMint contract(s) from listings', removed)
+        return removed
     
     def _load_contracts(self):
         """Load contracts from extended JSON file."""
@@ -238,9 +364,14 @@ class DMintContractsManager:
         """
         if not self.glyph_index:
             return 0
-        
+
         from electrumx.lib.glyph import GlyphProtocol
-        
+
+        # Hot-reload denylist before sync so newly-added entries take effect on
+        # this tick. If the denylist changed, purge in-memory matches up front.
+        if self._load_denylist():
+            self._purge_denied()
+
         updated = 0
         # Track which refs the index knows about so we can detect orphans
         index_refs = set()
@@ -256,9 +387,15 @@ class DMintContractsManager:
             ref = token.get('ref', '').replace('_', '')
             if not ref:
                 continue
-            
+
+            # Silently skip refs on the operator denylist (abandoned / illegal
+            # / takedown content). Do NOT add to index_refs — we want any stale
+            # in-memory entry to fall through the orphan sweep below.
+            if self._is_denied(ref):
+                continue
+
             index_refs.add(ref)
-            
+
             # Check if new
             existing = next((c for c in self.contracts if c['ref'] == ref), None)
             
@@ -372,14 +509,20 @@ class DMintContractsManager:
     
     def get_contracts_simple(self) -> List[List]:
         """Get contracts in simple format for basic miners."""
-        return [[c['ref'], c['outputs']] for c in self.contracts if c.get('active', True)]
-    
+        if self._load_denylist():
+            self._purge_denied()
+        return [[c['ref'], c['outputs']] for c in self.contracts
+                if c.get('active', True) and not self._is_denied(c.get('ref'))]
+
     def get_contracts_extended(self, active_only: bool = True) -> Dict[str, Any]:
         """Get contracts in extended format."""
-        contracts = self.contracts
+        if self._load_denylist():
+            self._purge_denied()
+
+        contracts = [c for c in self.contracts if not self._is_denied(c.get('ref'))]
         if active_only:
             contracts = [c for c in contracts if c.get('active', True)]
-        
+
         return {
             'version': 1,
             'updated_at': datetime.now(timezone.utc).isoformat(),
@@ -497,7 +640,11 @@ class DMintContractsManager:
             if isinstance(algo, (int, float, str))
         }
 
-        items = [self._to_token_summary_item(c) for c in self.contracts]
+        if self._load_denylist():
+            self._purge_denied()
+
+        items = [self._to_token_summary_item(c) for c in self.contracts
+                 if not self._is_denied(c.get('ref'))]
 
         if status == 'mineable':
             items = [i for i in items if not i.get('is_fully_mined')]
