@@ -1,6 +1,16 @@
-# Database directories (large, mounted as volumes)
+# Database directories (large, mounted as volumes — must never be copied
+# into the image). Patterns cover both upstream layouts and stray dirs that
+# operators sometimes leave under docker/full-stack/.
 electrumx-db/
 electrumx-db-*/
+electrumdb/
+electrumdb-*/
+electrumdb.*/
+**/electrumdb/
+**/electrumdb-*/
+**/electrumdb.*/
+**/*.sst
+**/*.ldb
 
 # Python virtual environment
 venv/
