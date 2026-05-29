@@ -696,14 +696,25 @@ async def get_top_token_holders(
 async def get_token_history(
     ref: str = Path(..., min_length=72, max_length=72),
     limit: int = Query(default=100, le=500),
-    offset: int = Query(default=0, ge=0)
+    offset: int = Query(default=0, ge=0),
+    cursor: Optional[str] = Query(default=None),
 ):
-    """Get full event history (deploy, mint, transfer, burn, update) for a token."""
+    """Get full event history (deploy, mint, transfer, burn, update) for a token.
+
+    When ``cursor`` is supplied (even as an empty string) the response shape
+    switches to ``{entries, next_cursor, has_more}`` for stable pagination
+    across mempool churn. Omit ``cursor`` to keep the legacy list shape.
+    See docs/pagination-cursors.md.
+    """
     _ensure_glyph_index()
 
     try:
         ref_bytes = bytes.fromhex(ref)
-        return _glyph_index.get_token_history(ref_bytes, limit=limit, offset=offset)
+        if cursor is None:
+            return _glyph_index.get_token_history(ref_bytes, limit=limit, offset=offset)
+        return _glyph_index.get_token_history(
+            ref_bytes, limit=limit, cursor=cursor or None, _use_cursor=True
+        )
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:

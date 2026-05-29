@@ -15,6 +15,7 @@ Database Schema:
 - wave_zones: ref -> zone records (cached metadata)
 """
 
+import base64
 import struct
 from typing import Optional, Dict, Any, List, Tuple, Set
 from collections import defaultdict
@@ -889,24 +890,65 @@ class WaveIndex:
                 'name': normalize_name(name),
             }
     
-    def get_subdomains(self, parent_name: str, limit: int = 100, 
-                       offset: int = 0) -> List[Dict[str, Any]]:
-        """Get subdomains of a parent name."""
-        # This would iterate over the tree entries for the parent
-        # Simplified implementation
-        results = []
-        
+    def get_subdomains(self, parent_name: str, limit: int = 100,
+                       offset: int = 0,
+                       cursor: Optional[str] = None,
+                       _use_cursor: bool = False):
+        """Get subdomains of a parent name.
+
+        The underlying loop is bounded (37 char slots) and the index keys
+        are deterministic per char_idx, so cursor support here is mostly
+        for API consistency with the other paginated methods. The cursor
+        encodes the next char_idx to scan from.
+
+        Legacy shape: ``List[Dict]``.
+        Cursor shape: ``{entries, next_cursor, has_more}``.
+        See docs/pagination-cursors.md.
+        """
         parent_ref = self._resolve_name_to_ref(parent_name)
+
+        if _use_cursor:
+            entries: List[Dict[str, Any]] = []
+            next_cursor = None
+            if not parent_ref:
+                return {'entries': entries, 'next_cursor': None, 'has_more': False}
+            start_char = 0
+            if cursor:
+                try:
+                    decoded = base64.b64decode(cursor)
+                    if len(decoded) == 1:
+                        start_char = decoded[0]
+                except Exception:
+                    start_char = 0
+            for char_idx in range(start_char, 37):
+                output_idx = char_idx + 1
+                tree_key = WaveDBKeys.TREE + parent_ref + struct.pack('<B', output_idx)
+                child_ref = self.db.utxo_db.get(tree_key)
+                if not child_ref:
+                    continue
+                if len(entries) >= limit:
+                    next_cursor = base64.b64encode(bytes([char_idx])).decode()
+                    break
+                entries.append({
+                    'char': index_to_char(char_idx),
+                    'ref': self._format_ref(child_ref),
+                })
+            return {
+                'entries': entries,
+                'next_cursor': next_cursor,
+                'has_more': next_cursor is not None,
+            }
+
+        results: List[Dict[str, Any]] = []
         if not parent_ref:
             return results
-        
-        # Iterate over all possible branch outputs
+
         count = 0
         for char_idx in range(37):
             output_idx = char_idx + 1
             tree_key = WaveDBKeys.TREE + parent_ref + struct.pack('<B', output_idx)
             child_ref = self.db.utxo_db.get(tree_key)
-            
+
             if child_ref:
                 if count >= offset and len(results) < limit:
                     char = index_to_char(char_idx)
@@ -915,7 +957,7 @@ class WaveIndex:
                         'ref': self._format_ref(child_ref),
                     })
                 count += 1
-        
+
         return results
     
     def reverse_lookup(self, scripthash: bytes, limit: int = 100) -> List[Dict[str, Any]]:
