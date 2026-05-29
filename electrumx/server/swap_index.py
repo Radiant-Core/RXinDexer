@@ -8,6 +8,7 @@ and swap history.
 Designed to serve explorers, wallets, DEX interfaces, and market data APIs.
 """
 
+import base64
 import struct
 import time
 from typing import Optional, Dict, Any, List, Tuple
@@ -24,6 +25,24 @@ try:
     HAS_CBOR = True
 except ImportError:
     HAS_CBOR = False
+
+
+def _encode_cursor(raw_key: bytes) -> str:
+    """Encode raw RocksDB seek key to opaque base64 cursor.
+
+    Shared helper for cursor pagination. See docs/pagination-cursors.md.
+    """
+    return base64.b64encode(raw_key).decode()
+
+
+def _decode_cursor(cursor: Optional[str]) -> Optional[bytes]:
+    """Decode opaque cursor back to seek key. Returns None on failure."""
+    if not cursor:
+        return None
+    try:
+        return base64.b64decode(cursor)
+    except Exception:
+        return None
 
 
 # Database key prefixes for Swap data
@@ -780,29 +799,54 @@ class SwapIndex:
         return {'bids': bids, 'asks': asks}
     
     def get_open_orders(self, base_ref: bytes = None, limit: int = 100,
-                        offset: int = 0) -> List[Dict]:
-        """Get open orders, optionally filtered by base token."""
-        results = []
-        count = 0
-        
+                        offset: int = 0,
+                        cursor: Optional[str] = None,
+                        _use_cursor: bool = False):
+        """Get open orders, optionally filtered by base token.
+
+        Legacy shape (``_use_cursor=False``): plain ``List[Dict]``.
+        Cursor shape (``_use_cursor=True``):
+        ``{entries, next_cursor, has_more}`` with a stable seek-key cursor.
+        See docs/pagination-cursors.md.
+        """
         if base_ref:
             prefix = SwapDBKeys.OPEN_BY_PAIR + base_ref
         else:
             prefix = SwapDBKeys.OPEN_BY_PAIR
-        
+
+        if _use_cursor:
+            entries = []
+            seek = _decode_cursor(cursor) or prefix
+            next_cursor = None
+            for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+                if len(entries) >= limit:
+                    next_cursor = _encode_cursor(key)
+                    break
+                order_id = key[-36:]
+                order = self.get_order(order_id)
+                if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
+                    entries.append(self._order_to_dict(order))
+            return {
+                'entries': entries,
+                'next_cursor': next_cursor,
+                'has_more': next_cursor is not None,
+            }
+
+        results = []
+        count = 0
         for key, _ in self.db.utxo_db.iterator(prefix=prefix):
             if count < offset:
                 count += 1
                 continue
             if len(results) >= limit:
                 break
-            
+
             order_id = key[-36:]
             order = self.get_order(order_id)
             if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
                 results.append(self._order_to_dict(order))
             count += 1
-        
+
         return results
     
     def get_user_orders(self, scripthash: bytes, status: int = None,
@@ -824,20 +868,51 @@ class SwapIndex:
         return results
     
     def get_swap_history(self, base_ref: bytes, limit: int = 100,
-                         offset: int = 0) -> List[Dict]:
-        """Get trade history for a token."""
-        results = []
+                         offset: int = 0,
+                         cursor: Optional[str] = None,
+                         _use_cursor: bool = False):
+        """Get trade history for a token (newest-first).
+
+        Legacy shape (``_use_cursor=False``): plain ``List[Dict]``.
+        Cursor shape (``_use_cursor=True``):
+        ``{entries, next_cursor, has_more}``. The cursor encodes the
+        next-unread key in the reverse scan; pagination is stable under
+        new history rows landing during the walk.
+        See docs/pagination-cursors.md.
+        """
         prefix = SwapDBKeys.HISTORY + base_ref
+
+        if _use_cursor:
+            entries = []
+            seek = _decode_cursor(cursor)
+            it_kwargs = {'prefix': prefix, 'reverse': True}
+            if seek is not None:
+                it_kwargs['seek'] = seek
+            next_cursor = None
+            for key, value in self.db.utxo_db.iterator(**it_kwargs):
+                if len(entries) >= limit:
+                    next_cursor = _encode_cursor(key)
+                    break
+                if HAS_CBOR:
+                    try:
+                        entries.append(cbor2.loads(value))
+                    except Exception:
+                        pass
+            return {
+                'entries': entries,
+                'next_cursor': next_cursor,
+                'has_more': next_cursor is not None,
+            }
+
+        results = []
         count = 0
-        
         for key, value in self.db.utxo_db.iterator(prefix=prefix, reverse=True):
             if count < offset:
                 count += 1
                 continue
             if len(results) >= limit:
                 break
-            
-            # Parse history entry
+
             if HAS_CBOR:
                 try:
                     entry = cbor2.loads(value)
@@ -845,7 +920,7 @@ class SwapIndex:
                 except Exception:
                     pass
             count += 1
-        
+
         return results
     
     def get_swap_count(self, base_ref: bytes) -> int:

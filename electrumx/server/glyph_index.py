@@ -1654,28 +1654,66 @@ class GlyphIndex:
 
         return {'balances': results, 'next_cursor': next_cursor}
     
-    def get_token_history(self, ref: bytes, limit: int = 100, 
-                          offset: int = 0) -> List[Dict]:
-        """Get transaction history for a token."""
-        results = []
+    def get_token_history(self, ref: bytes, limit: int = 100,
+                          offset: int = 0,
+                          cursor: Optional[str] = None,
+                          _use_cursor: bool = False):
+        """Get transaction history for a token.
+
+        Two response shapes for backwards compatibility:
+
+        * Legacy (``_use_cursor=False``, the default): returns a plain
+          ``List[Dict]`` and honours ``offset``. This preserves the
+          contract that existing offset/limit callers depend on.
+        * Cursor (``_use_cursor=True``, set by the JSON-RPC handler when
+          the client explicitly passes a ``cursor`` argument): returns
+          ``{'entries', 'next_cursor', 'has_more'}``. ``offset`` is
+          ignored. ``cursor`` is an opaque token returned by a prior
+          response; pass ``None`` to start from the beginning.
+
+        See docs/pagination-cursors.md for the design rationale.
+        """
         prefix = GlyphDBKeys.HISTORY + ref
+
+        if _use_cursor:
+            seek = self._decode_cursor(cursor) or prefix
+            entries = []
+            next_cursor = None
+            for key, value in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+                if len(entries) >= limit:
+                    next_cursor = self._encode_cursor(key)
+                    break
+                prefix_len = len(prefix)
+                height = struct.unpack('>I', key[prefix_len:prefix_len + 4])[0]
+                tx_idx = struct.unpack('>H', key[prefix_len + 4:prefix_len + 6])[0]
+                event_type = value[0]
+                txid = value[1:33]
+                entries.append({
+                    'height': height,
+                    'tx_idx': tx_idx,
+                    'txid': hash_to_hex_str(txid),
+                    'event': self._event_type_name(event_type),
+                })
+            return {
+                'entries': entries,
+                'next_cursor': next_cursor,
+                'has_more': next_cursor is not None,
+            }
+
+        results = []
         count = 0
-        
         for key, value in self.db.utxo_db.iterator(prefix=prefix):
             if count < offset:
                 count += 1
                 continue
             if len(results) >= limit:
                 break
-            
-            # Unpack height and tx_idx from key
+
             height = struct.unpack('>I', key[len(prefix):len(prefix)+4])[0]
             tx_idx = struct.unpack('>H', key[len(prefix)+4:len(prefix)+6])[0]
-            
-            # Unpack event type and txid from value
             event_type = value[0]
             txid = value[1:33]
-            
+
             results.append({
                 'height': height,
                 'tx_idx': tx_idx,
@@ -1683,7 +1721,7 @@ class GlyphIndex:
                 'event': self._event_type_name(event_type),
             })
             count += 1
-        
+
         return results
     
     def get_mint_history(self, ref: bytes, limit: int = 100,
@@ -1771,28 +1809,51 @@ class GlyphIndex:
         }
     
     def search_tokens(self, query: str, protocols: List[int] = None,
-                      limit: int = 50) -> List[Dict]:
-        """Search tokens by name or ticker."""
-        results = []
+                      limit: int = 50,
+                      cursor: Optional[str] = None,
+                      _use_cursor: bool = False):
+        """Search tokens by name or ticker.
+
+        Legacy shape (``_use_cursor=False``): returns ``List[Dict]``.
+        Cursor shape (``_use_cursor=True``): returns
+        ``{entries, next_cursor, has_more}`` with a stable seek-key cursor.
+
+        See docs/pagination-cursors.md.
+        """
         query_lower = query.lower()
-        
-        # Search by name hash
         name_hash = sha256(query_lower.encode('utf-8'))[:16]
         prefix = GlyphDBKeys.BY_NAME + name_hash
-        
+
+        if _use_cursor:
+            entries = []
+            seek = self._decode_cursor(cursor) or prefix
+            next_cursor = None
+            for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+                if len(entries) >= limit:
+                    next_cursor = self._encode_cursor(key)
+                    break
+                ref = key[len(prefix):]
+                token = self.get_token(ref)
+                if token:
+                    if protocols and not any(p in token.protocols for p in protocols):
+                        continue
+                    entries.append(self._token_to_dict(token))
+            return {
+                'entries': entries,
+                'next_cursor': next_cursor,
+                'has_more': next_cursor is not None,
+            }
+
+        results = []
         for key, _ in self.db.utxo_db.iterator(prefix=prefix):
             if len(results) >= limit:
                 break
-            
             ref = key[len(prefix):]
             token = self.get_token(ref)
-            
             if token:
-                # Filter by protocols if specified
                 if protocols and not any(p in token.protocols for p in protocols):
                     continue
                 results.append(self._token_to_dict(token))
-        
         return results
     
     def get_tokens_by_type(self, token_type: int, limit: int = 100,

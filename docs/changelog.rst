@@ -2,6 +2,19 @@
  ChangeLog
 ===========
 
+Unreleased
+==========
+
+* **Stable cursor pagination for paginated RPCs.** ``glyph.get_history``,
+  ``glyph.list_tokens``, ``glyph.search_tokens``, ``swap.get_orders``,
+  ``swap.get_history``, and ``wave.get_subdomains`` now accept an opaque
+  ``cursor`` argument. When supplied (even as ``null``), the response
+  shape becomes ``{entries, next_cursor, has_more}`` and pagination is
+  stable across mempool churn / new blocks. Existing
+  ``(limit, offset)`` callers see the legacy list/dict shape unchanged.
+  The matching ``GET /tokens/{ref}/history`` REST endpoint also accepts
+  the new ``cursor`` query param. See ``docs/pagination-cursors.md``.
+
 Version 1.3.0 (21 Jan 2026)
 ===========================
 
