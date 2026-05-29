@@ -1,6 +1,6 @@
 version = 'ElectrumX 1.4.1'
 version_short = version.split()[-1]
-rxindexer_version = 'RXinDexer 3.0.0'
+rxindexer_version = 'RXinDexer 3.0.1'
 rxindexer_version_short = rxindexer_version.split()[-1]
 
 

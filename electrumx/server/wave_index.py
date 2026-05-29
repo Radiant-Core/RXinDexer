@@ -529,6 +529,29 @@ class WaveIndex:
             batch.delete(self._undo_key(height))
         self._last_undo_pruned = prune_to
     
+    def memory_estimate(self) -> int:
+        '''Approximate bytes held by unflushed in-memory caches.
+
+        Used by block_processor.check_cache_size() to trigger a flush before
+        these caches grow large enough to OOM the process.
+        '''
+        if not self.enabled:
+            return 0
+        undo_entries = sum(len(v) for v in self._undo_cache.values())
+        return (
+            len(self.tree_cache) * 190
+            + len(self.name_cache) * 190
+            + len(self.zone_cache) * 600
+            + len(self.owner_cache) * 190
+            + len(self.tree_height) * 140
+            + len(self.name_height) * 140
+            + len(self.zone_height) * 140
+            + len(self.owner_height) * 140
+            + undo_entries * 120
+            + len(self._pending_heights) * 140
+            + len(self.hot_names) * 400
+        )
+
     def flush(self, batch):
         """Flush cached WAVE data to the database."""
         if not self.enabled:

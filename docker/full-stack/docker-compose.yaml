@@ -50,6 +50,12 @@ services:
       dockerfile: docker/full-stack/Dockerfile
     container_name: rxindexer
     restart: unless-stopped
+    # Run with tini as PID 1 so orphaned child processes (e.g. RocksDB
+    # background threads, asyncio subprocesses) get reaped on shutdown.
+    # Without this, python (PID 1) can't reap zombies, leaving the container
+    # in a state dockerd cannot kill — causing the restart-manager loop to
+    # spin the daemon at 80% CPU until the host is rebooted.
+    init: true
     depends_on:
       radiantd:
         condition: service_healthy

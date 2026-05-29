@@ -1021,6 +1021,16 @@ class SessionBase(RPCSession):
         '''Handle client disconnection.'''
         await super().connection_lost()
         self.session_mgr.remove_session(self)
+        # Clean up any glyph/swap/wave subscription state for this session.
+        # Without this, sessions that drop without sending explicit
+        # unsubscribe RPCs leak entries in GlyphSubscriptionManager forever.
+        bp = getattr(self.session_mgr, 'bp', None)
+        subs = getattr(bp, 'subscriptions', None) if bp is not None else None
+        if subs is not None and self.session_id is not None:
+            try:
+                subs.unsubscribe_session(self.session_id)
+            except Exception:
+                self.logger.exception('error cleaning subscription state')
         msg = ''
         if self._incoming_concurrency.max_concurrent < self.initial_concurrent * 0.8:
             msg += ' whilst throttled'

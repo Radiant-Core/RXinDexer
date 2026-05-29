@@ -440,14 +440,28 @@ class BlockProcessor:
         # Roughly ntxs * 32 + nblocks * 42
         tx_hash_size = ((self.tx_count - self.db.fs_tx_count) * 32
                         + (self.height - self.db.fs_height) * 42)
+        # Add-on indices (Glyph/WAVE/Swap/Analytics) keep their own pre-flush
+        # caches that are not captured by utxo/ref/hist accounting above.  Before
+        # this was added, those caches could grow into the tens of GB while
+        # reported totals stayed under cache_MB, triggering OOM kills.
+        index_cache_size = 0
+        if self.glyph_index is not None:
+            index_cache_size += self.glyph_index.memory_estimate()
+        if self.wave_index is not None:
+            index_cache_size += self.wave_index.memory_estimate()
+        if self.swap_index is not None:
+            index_cache_size += self.swap_index.memory_estimate()
+        if self.analytics_index is not None:
+            index_cache_size += self.analytics_index.memory_estimate()
         utxo_MB = (db_deletes_size + utxo_cache_size) // one_MB
         ref_MB =  (ref_cache_size) // one_MB
         hist_MB = (hist_cache_size + tx_hash_size) // one_MB
+        index_MB = index_cache_size // one_MB
 
         self.logger.info('our height: {:,d} daemon: {:,d} '
-                         'UTXOs {:,d}MB hist {:,d}MB refs {:,d}MB'
+                         'UTXOs {:,d}MB hist {:,d}MB refs {:,d}MB idx {:,d}MB'
                          .format(self.height, self.daemon.cached_height(),
-                                 utxo_MB, hist_MB, ref_MB))
+                                 utxo_MB, hist_MB, ref_MB, index_MB))
 
         # Flush history if it takes up over 20% of cache memory.
         # Always do a full flush (UTXOs + refs) to prevent ref_cache from
@@ -455,7 +469,7 @@ class BlockProcessor:
         # more frequent full flushes (~13s each) is negligible compared to
         # hours of lost progress from OOM-induced restarts.
         cache_MB = self.env.cache_MB
-        total_MB = utxo_MB + hist_MB + ref_MB
+        total_MB = utxo_MB + hist_MB + ref_MB + index_MB
         if total_MB >= cache_MB or hist_MB >= cache_MB // 5:
             return True
         return None
