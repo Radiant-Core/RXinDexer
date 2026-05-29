@@ -382,6 +382,17 @@ Get contracts sorted by estimated profitability.
 | dmint.get_contract | 1.0 |
 | dmint.get_by_algorithm | 1.5 |
 | dmint.get_most_profitable | 2.0 |
+| glyph.subscribe.balance | 0.5 |
+| glyph.unsubscribe.balance | 0.1 |
+| glyph.subscribe.token | 0.5 |
+| glyph.unsubscribe.token | 0.1 |
+| glyph.subscribe.transfers | 0.5 |
+| swap.subscribe.orderbook | 0.5 |
+| swap.unsubscribe.orderbook | 0.1 |
+| swap.subscribe.fills | 0.5 |
+| swap.subscribe.user_orders | 0.5 |
+| wave.subscribe.name | 0.5 |
+| dmint.subscribe.token | 0.5 |
 
 ## Error Handling
 
@@ -395,10 +406,224 @@ Methods return `null` for not found items or an error dict:
 
 ## WebSocket Subscriptions
 
-RXinDexer supports WebSocket subscriptions for real-time token updates:
+RXinDexer pushes real-time notifications over the same `ws://` / `wss://` Electrum
+endpoints used for ordinary JSON-RPC calls. Subscriptions are scoped to the
+session that created them and are released automatically when the connection
+closes.
 
-- `glyph.subscribe_token` - Subscribe to token state changes
-- `glyph.subscribe_balance` - Subscribe to balance changes for an address
+### Enabling
+
+Subscriptions are gated by `GLYPH_SUBSCRIPTIONS` (default `1`). Set
+`GLYPH_SUBSCRIPTIONS=0` to disable; with subscriptions off, every
+`*.subscribe.*` RPC returns `{"error": "Subscriptions not enabled"}`.
+
+### Rate limits
+
+Per-client limits (configurable via env vars, defaults shown):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_SUBS_PER_CLIENT` | `10000` | Maximum live subscriptions per session |
+| `SUB_RATE_LIMIT` | `100` | New-subscription rate per client (subs/sec) |
+| `SUB_BURST_LIMIT` | `500` | Burst allowance (token-bucket capacity) |
+
+Exceeding the rate triggers temporary blocking; exceeding the count returns an
+error from the relevant subscribe RPC.
+
+### Wire format
+
+All subscribe RPCs take **positional** string parameters (hex scripthash, ref,
+WAVE name) and return a boolean (`true` on accept) or an `{"error": "..."}`
+object.
+
+Notifications are JSON-RPC notifications (no `id`) whose `params` is a
+**single-element positional array containing one object**:
+
+```json
+{"jsonrpc": "2.0", "method": "glyph.balance",
+ "params": [{"scripthash": "...", "ref": "...", "balance": 1000, "delta": 50}]}
+```
+
+This matches the Electrum convention used by `blockchain.scripthash.subscribe`,
+so any client that already spreads subscription params (`(...params) => ...`)
+receives the object as a single argument without per-method branching.
+
+### Ref string format
+
+Token refs accept either form:
+
+- **Underscore form**: `"<txid_hex_be>_<vout>"` (the form RXinDexer emits in
+  notifications and most responses), e.g. `"abc123…def_0"`.
+- **72-hex form**: 36 raw bytes hex-encoded as `txid_le || vout_le32`, e.g.
+  `"<64 hex>00000000"`.
+
+### Subscribe RPCs
+
+| Method | Params (positional) | Returns | Notification |
+|--------|---------------------|---------|--------------|
+| `glyph.subscribe.balance` | `scripthash_hex`, `ref` | `bool` | `glyph.balance` |
+| `glyph.unsubscribe.balance` | `scripthash_hex`, `ref` | `bool` | — |
+| `glyph.subscribe.token` | `ref` | `bool` | `glyph.token` |
+| `glyph.unsubscribe.token` | `ref` | `bool` | — |
+| `glyph.subscribe.transfers` | `ref` | `bool` | `glyph.transfer` |
+| `swap.subscribe.orderbook` | `base_ref`, `quote_ref` | `bool` | `swap.orderbook` |
+| `swap.unsubscribe.orderbook` | `base_ref`, `quote_ref` | `bool` | — |
+| `swap.subscribe.fills` | `base_ref`, `quote_ref` | `bool` | `swap.fill` |
+| `swap.subscribe.user_orders` | `scripthash_hex` | `bool` | `swap.user_order` |
+| `wave.subscribe.name` | `name` (string, case-insensitive) | `bool` | `wave.name` |
+| `dmint.subscribe.token` | `ref` | `bool` | `dmint.update` |
+
+Subscriptions are de-duplicated per `(session, key)`: re-subscribing with the
+same arguments is a no-op that still returns `true`. There is no "subscribe to
+everything" RPC — callers must subscribe to each token/pair/name explicitly.
+
+### Notification methods
+
+All `params` are wrapped in a single-element positional array, as described
+above. The object's field schemas:
+
+#### `glyph.balance`
+
+Pushed whenever a subscribed `(scripthash, token_ref)` pair's confirmed balance
+changes.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scripthash` | hex string | 32-byte scripthash (64 chars) |
+| `ref` | string | Token ref in `txid_vout` form |
+| `balance` | int | New confirmed balance |
+| `delta` | int | Signed change since previous notification |
+
+#### `glyph.token`
+
+Pushed when token state changes (supply, metadata, freeze flags, etc.).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ref` | string | Token ref |
+| `data` | object | Token state snapshot (shape mirrors `glyph.get_token_info`) |
+
+#### `glyph.transfer`
+
+Pushed for every confirmed transfer of the subscribed token.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ref` | string | Token ref |
+| `txid` | hex string | Transaction id (big-endian display form) |
+| `from` | hex string \| null | Sender scripthash, `null` for mint |
+| `to` | hex string \| null | Recipient scripthash, `null` for burn |
+| `amount` | int | Transfer amount |
+| `height` | int | Block height of inclusion |
+
+#### `swap.orderbook`
+
+Pushed when an order is added, modified, or removed from the orderbook for the
+subscribed trading pair.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `base_ref` | string | Base token ref |
+| `quote_ref` | string | Quote token ref |
+| `change` | string | `"add"`, `"update"`, or `"remove"` |
+| `order` | object | Order data (shape mirrors `swap.get_orders` entries) |
+
+#### `swap.fill`
+
+Pushed when a trade fills against an order in the subscribed pair.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `base_ref` | string | Base token ref |
+| `quote_ref` | string | Quote token ref |
+| `fill` | object | Fill record (shape mirrors `swap.get_history` entries) |
+
+#### `swap.user_order`
+
+Pushed when an order owned by the subscribed scripthash changes state.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scripthash` | hex string | Owner scripthash |
+| `change` | string | `"new"`, `"filled"`, `"partial"`, or `"cancelled"` |
+| `order` | object | Order data |
+
+#### `wave.name`
+
+Pushed when the subscribed WAVE name's ownership changes (mint, transfer, or
+release).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | WAVE name (original case as registered) |
+| `owner` | hex string \| null | New owner scripthash, `null` if released |
+| `txid` | hex string | Transaction id of the ownership change |
+| `height` | int | Block height of inclusion |
+
+#### `dmint.update`
+
+Pushed when the subscribed dMint contract's mining stats change.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ref` | string | dMint contract ref |
+| `data` | object | Mining stats (shape mirrors `dmint.get_contract`) |
+
+### Lifecycle
+
+1. **Connect** over `ws://` or `wss://` to a Radiant-aware ElectrumX endpoint.
+2. **Subscribe** by calling the relevant `*.subscribe.*` RPC. The RPC returns
+   `true` on accept (or an `{"error": "..."}` object).
+3. **Receive notifications** as JSON-RPC notifications (no `id` field). Match on
+   the `method` field; read `params[0]` as the payload object.
+4. **Unsubscribe** explicitly with the matching `*.unsubscribe.*` RPC where one
+   exists, or simply close the connection — all subscriptions for a session are
+   released automatically when the WebSocket disconnects.
+
+### Example: track a token balance
+
+```javascript
+// Subscribe
+ws.send(JSON.stringify({
+  jsonrpc: "2.0", id: 1,
+  method: "glyph.subscribe.balance",
+  params: ["aa…32-byte-scripthash-hex…bb", "abc…txid_hex…def_0"],
+}));
+
+// Incoming push (no `id`):
+// {"jsonrpc": "2.0", "method": "glyph.balance",
+//  "params": [{"scripthash": "aa…bb", "ref": "abc…def_0",
+//              "balance": 1500, "delta": 500}]}
+
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.method === "glyph.balance") {
+    const { scripthash, ref, balance, delta } = msg.params[0];
+    // update UI
+  }
+};
+
+// Unsubscribe later
+ws.send(JSON.stringify({
+  jsonrpc: "2.0", id: 2,
+  method: "glyph.unsubscribe.balance",
+  params: ["aa…bb", "abc…def_0"],
+}));
+```
+
+### Operational notes
+
+- **No replay on subscribe**: subscribing only delivers *future* events. If you
+  need current state, call the corresponding `glyph.get_*` / `swap.get_*` REST
+  or RPC method first, then subscribe.
+- **Mempool vs. confirmed**: notifications fire from the block processor, so
+  they reflect confirmed (in-block) changes. Mempool changes are not pushed.
+- **Reorg handling**: a reorg replays the affected blocks, which may re-emit
+  `glyph.transfer` / `swap.fill` for the same `txid`. Clients should treat
+  notifications as idempotent keyed on `(method, txid, height)` or equivalent.
+- **Backpressure**: if a session's send buffer fills, individual notifications
+  may be dropped silently (logged at debug level on the server). Clients that
+  need guaranteed delivery should periodically reconcile via the `get_*` RPCs.
 
 ---
 
