@@ -29,6 +29,12 @@ from electrumx.lib.glyph import (
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
 
 
+# Sentinel distinguishing "client did not pass cursor" (legacy list shape)
+# from "client passed cursor=null" (new dict shape, first page).
+# See docs/pagination-cursors.md.
+_CURSOR_UNSET = object()
+
+
 class GlyphAPIMixin:
     """
     Mixin class providing Glyph v2 token API methods.
@@ -327,79 +333,112 @@ class GlyphAPIMixin:
         except Exception as e:
             return {'error': str(e)}
 
-    async def glyph_list_tokens(self, scripthash: str, limit: int = 100):
+    async def glyph_list_tokens(self, scripthash: str, limit: int = 100,
+                                cursor=_CURSOR_UNSET):
         """
         List all tokens held by a scripthash.
-        
+
         Args:
             scripthash: Address scripthash (64 hex chars)
             limit: Maximum results (default 100)
-            
-        Returns:
-            List of token balances
+            cursor: Opaque pagination cursor. When supplied (even as
+                    ``null``), response shape becomes
+                    ``{entries, next_cursor, has_more}``. Omit to keep
+                    the legacy plain-list shape.
+
+        See docs/pagination-cursors.md.
         """
         self.bump_cost(2.0)
-        
+
         if not hasattr(self, 'glyph_index') or not self.glyph_index:
             return {'error': 'Glyph indexing not enabled'}
-        
+
         try:
             scripthash_bytes = bytes.fromhex(scripthash)
+            if cursor is _CURSOR_UNSET:
+                result = self.glyph_index.get_balances_for_scripthash(
+                    scripthash_bytes, limit=limit
+                )
+                return result.get('balances', result)
             result = self.glyph_index.get_balances_for_scripthash(
-                scripthash_bytes, limit=limit
+                scripthash_bytes, limit=limit, cursor=cursor
             )
-            return result.get('balances', result)
+            return {
+                'entries': result.get('balances', []),
+                'next_cursor': result.get('next_cursor'),
+                'has_more': result.get('next_cursor') is not None,
+            }
         except Exception as e:
             return {'error': str(e)}
 
-    async def glyph_get_history(self, ref: str, limit: int = 100, offset: int = 0):
+    async def glyph_get_history(self, ref: str, limit: int = 100,
+                                offset: int = 0,
+                                cursor=_CURSOR_UNSET):
         """
         Get transaction history for a token.
-        
+
         Args:
             ref: Token ref in format "txid_vout"
             limit: Maximum results
-            offset: Pagination offset
-            
+            offset: Pagination offset (ignored when ``cursor`` is supplied)
+            cursor: Opaque pagination cursor from a prior response's
+                    ``next_cursor``. Pass ``null`` on the first call.
+                    When provided (including ``null``), the response
+                    shape switches to ``{entries, next_cursor, has_more}``.
+                    Omit entirely to preserve the legacy list shape.
+
         Returns:
-            List of history events
+            Legacy: list of history events (when ``cursor`` is omitted).
+            Cursor: dict with ``entries``, ``next_cursor``, ``has_more``.
+
+        See docs/pagination-cursors.md.
         """
         self.bump_cost(2.0)
-        
+
         if not hasattr(self, 'glyph_index') or not self.glyph_index:
             return {'error': 'Glyph indexing not enabled'}
-        
+
         try:
             txid, vout = parse_ref(ref)
             from electrumx.server.glyph_index import pack_ref
             ref_bytes = pack_ref(hex_str_to_hash(txid), vout)
-            
+
+            if cursor is _CURSOR_UNSET:
+                return self.glyph_index.get_token_history(
+                    ref_bytes, limit=limit, offset=offset
+                )
             return self.glyph_index.get_token_history(
-                ref_bytes, limit=limit, offset=offset
+                ref_bytes, limit=limit, cursor=cursor, _use_cursor=True
             )
         except Exception as e:
             return {'error': str(e)}
 
-    async def glyph_search_tokens(self, query: str, protocols: list = None, 
-                                   limit: int = 50):
+    async def glyph_search_tokens(self, query: str, protocols: list = None,
+                                   limit: int = 50,
+                                   cursor=_CURSOR_UNSET):
         """
         Search tokens by name or ticker.
-        
+
         Args:
             query: Search query string
             protocols: Optional list of protocol IDs to filter
             limit: Maximum results
-            
-        Returns:
-            List of matching tokens
+            cursor: Opaque pagination cursor (see docs/pagination-cursors.md).
+                    When supplied, response shape is
+                    ``{entries, next_cursor, has_more}``.
         """
         self.bump_cost(3.0)
-        
+
         if not hasattr(self, 'glyph_index') or not self.glyph_index:
             return {'error': 'Glyph indexing not enabled'}
-        
+
+        if cursor is _CURSOR_UNSET:
+            return self.glyph_index.search_tokens(
+                query, protocols=protocols, limit=limit
+            )
         return self.glyph_index.search_tokens(
-            query, protocols=protocols, limit=limit
+            query, protocols=protocols, limit=limit,
+            cursor=cursor, _use_cursor=True,
         )
 
     async def glyph_get_tokens_by_type(self, token_type: int, limit: int = 100,
@@ -908,7 +947,8 @@ class GlyphAPIMixin:
             return {'error': str(e)}
 
     async def swap_get_orders(self, base_ref: str = None, quote_ref: str = None,
-                              limit: int = 50, offset: int = 0):
+                              limit: int = 50, offset: int = 0,
+                              cursor=_CURSOR_UNSET):
         """
         Get active (confirmed) swap orders, optionally filtered by trading pair.
 
@@ -924,6 +964,11 @@ class GlyphAPIMixin:
             quote_ref: Optional quote token ref (txid_vout or 72-hex)
             limit: Maximum results (default 50, max 200)
             offset: Pagination offset (default 0)
+            cursor: Opaque pagination cursor. When supplied, response
+                    shape becomes ``{entries, next_cursor, has_more}``.
+                    Ignored for the orderbook view (both refs supplied)
+                    since the orderbook is a snapshot, not a paged feed.
+                    See docs/pagination-cursors.md.
 
         Returns:
             List of swap orders (or orderbook dict when both refs given).
@@ -943,17 +988,24 @@ class GlyphAPIMixin:
                 return self.swap_index.get_orderbook(
                     base_bytes, quote_bytes, limit=limit,
                 )
+            if cursor is _CURSOR_UNSET:
+                return self.swap_index.get_open_orders(
+                    base_ref=base_bytes, limit=limit, offset=offset,
+                )
             return self.swap_index.get_open_orders(
-                base_ref=base_bytes, limit=limit, offset=offset,
+                base_ref=base_bytes, limit=limit,
+                cursor=cursor, _use_cursor=True,
             )
         except (ValueError, TypeError) as e:
             return {'error': f'Invalid ref format: {e}'}
         except Exception as e:
             return {'error': str(e)}
 
-    async def swap_get_history(self, base_ref: str, limit: int = 50, offset: int = 0):
+    async def swap_get_history(self, base_ref: str, limit: int = 50,
+                               offset: int = 0,
+                               cursor=_CURSOR_UNSET):
         """
-        Get swap trade/fill history for a trading pair.
+        Get swap trade/fill history for a trading pair (newest-first).
 
         Mirrors the REST endpoint at GET /swaps/history. Unlike open orders,
         base_ref is required — the history index is keyed by base token.
@@ -962,6 +1014,9 @@ class GlyphAPIMixin:
             base_ref: Base token ref (required)
             limit: Maximum results (default 50, max 200)
             offset: Pagination offset (default 0)
+            cursor: Opaque pagination cursor. When supplied, response
+                    shape becomes ``{entries, next_cursor, has_more}``.
+                    See docs/pagination-cursors.md.
 
         Returns:
             Trade history list/dict, or {'trades': [], 'error': ...} on bad input.
@@ -979,8 +1034,13 @@ class GlyphAPIMixin:
 
         try:
             base_bytes = self._parse_ref(base_ref)
+            if cursor is _CURSOR_UNSET:
+                return self.swap_index.get_swap_history(
+                    base_bytes, limit=limit, offset=offset,
+                )
             return self.swap_index.get_swap_history(
-                base_bytes, limit=limit, offset=offset,
+                base_bytes, limit=limit,
+                cursor=cursor, _use_cursor=True,
             )
         except (ValueError, TypeError) as e:
             return {'error': f'Invalid ref format: {e}'}
@@ -1055,7 +1115,7 @@ class GlyphAPIMixin:
         try:
             scripthash_bytes = bytes.fromhex(scripthash)
             ref_bytes = self._parse_ref(ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.subscribe_balance(session_id, scripthash_bytes, ref_bytes)
         except Exception as e:
             return {'error': str(e)}
@@ -1070,7 +1130,7 @@ class GlyphAPIMixin:
         try:
             scripthash_bytes = bytes.fromhex(scripthash)
             ref_bytes = self._parse_ref(ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.unsubscribe_balance(session_id, scripthash_bytes, ref_bytes)
         except Exception:
             return False
@@ -1084,7 +1144,7 @@ class GlyphAPIMixin:
         
         try:
             ref_bytes = self._parse_ref(ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.subscribe_token(session_id, ref_bytes)
         except Exception as e:
             return {'error': str(e)}
@@ -1098,7 +1158,7 @@ class GlyphAPIMixin:
         
         try:
             ref_bytes = self._parse_ref(ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.unsubscribe_token(session_id, ref_bytes)
         except Exception:
             return False
@@ -1112,7 +1172,7 @@ class GlyphAPIMixin:
         
         try:
             ref_bytes = self._parse_ref(ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.subscribe_transfers(session_id, ref_bytes)
         except Exception as e:
             return {'error': str(e)}
@@ -1127,7 +1187,7 @@ class GlyphAPIMixin:
         try:
             base_bytes = self._parse_ref(base_ref)
             quote_bytes = self._parse_ref(quote_ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.subscribe_orderbook(session_id, base_bytes, quote_bytes)
         except Exception as e:
             return {'error': str(e)}
@@ -1142,7 +1202,7 @@ class GlyphAPIMixin:
         try:
             base_bytes = self._parse_ref(base_ref)
             quote_bytes = self._parse_ref(quote_ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.unsubscribe_orderbook(session_id, base_bytes, quote_bytes)
         except Exception:
             return False
@@ -1157,7 +1217,7 @@ class GlyphAPIMixin:
         try:
             base_bytes = self._parse_ref(base_ref)
             quote_bytes = self._parse_ref(quote_ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.subscribe_fills(session_id, base_bytes, quote_bytes)
         except Exception as e:
             return {'error': str(e)}
@@ -1171,7 +1231,7 @@ class GlyphAPIMixin:
         
         try:
             scripthash_bytes = bytes.fromhex(scripthash)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.subscribe_user_orders(session_id, scripthash_bytes)
         except Exception as e:
             return {'error': str(e)}
@@ -1184,7 +1244,7 @@ class GlyphAPIMixin:
             return {'error': 'Subscriptions not enabled'}
         
         try:
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.subscribe_wave_name(session_id, name)
         except Exception as e:
             return {'error': str(e)}
@@ -1198,7 +1258,7 @@ class GlyphAPIMixin:
         
         try:
             ref_bytes = self._parse_ref(ref)
-            session_id = id(self)
+            session_id = self.session_id
             return self.glyph_subscriptions.subscribe_dmint(session_id, ref_bytes)
         except Exception as e:
             return {'error': str(e)}
@@ -1241,26 +1301,36 @@ class GlyphAPIMixin:
         
         return self.wave_index.check_available(name)
 
-    async def wave_get_subdomains(self, parent_name: str, limit: int = 100, 
-                                   offset: int = 0):
+    async def wave_get_subdomains(self, parent_name: str, limit: int = 100,
+                                   offset: int = 0,
+                                   cursor=_CURSOR_UNSET):
         """
         Get subdomains of a parent WAVE name.
-        
+
         Args:
             parent_name: Parent name to query
             limit: Maximum results (default 100)
             offset: Pagination offset
-            
+            cursor: Opaque pagination cursor. When supplied, response
+                    shape becomes ``{entries, next_cursor, has_more}``.
+                    See docs/pagination-cursors.md.
+
         Returns:
-            List of {char, ref} for registered subdomains
+            List of {char, ref} for registered subdomains, or the
+            cursor-shaped dict when cursor is supplied.
         """
         self.bump_cost(2.0)
-        
+
         if not hasattr(self, 'wave_index') or not self.wave_index:
             return {'error': 'WAVE indexing not enabled'}
-        
+
+        if cursor is _CURSOR_UNSET:
+            return self.wave_index.get_subdomains(
+                parent_name, limit=min(limit, 1000), offset=offset
+            )
         return self.wave_index.get_subdomains(
-            parent_name, limit=min(limit, 1000), offset=offset
+            parent_name, limit=min(limit, 1000),
+            cursor=cursor, _use_cursor=True,
         )
 
     async def wave_reverse_lookup(self, scripthash: str, limit: int = 100):
