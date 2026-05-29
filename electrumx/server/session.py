@@ -141,6 +141,7 @@ class SessionManager:
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.servers = {}           # service->server
         self.sessions = {}          # session->iterable of its SessionGroups
+        self.sessions_by_id = {}    # session_id->session, for O(1) glyph notification dispatch
         self.session_groups = {}    # group name->SessionGroup instance
         self.txs_sent = 0
         # Would use monotonic time, but aiorpcx sessions use Unix time:
@@ -648,6 +649,13 @@ class SessionManager:
                                  .format(self.env.drop_client.pattern))
             for service in self.env.report_services:
                 self.logger.info(f'advertising service {service}')
+            # Wire glyph/swap/wave/dmint subscription dispatch to live sessions.
+            # The block_processor owns the GlyphSubscriptionManager, but only the
+            # session layer knows how to reach a session_id, so the callback is
+            # installed here before notifications start flowing.
+            subs = getattr(self.bp, 'subscriptions', None)
+            if subs is not None:
+                subs.set_notify_callback(self._notify_glyph_session)
             # Start notifications; initialize hsub_results
             await notifications.start(self.db.db_height, self._notify_sessions)
             await self._start_external_servers()
@@ -945,6 +953,8 @@ class SessionManager:
         )
         groups = [group for group in groups if group is not None]
         self.sessions[session] = groups
+        if session.session_id is not None:
+            self.sessions_by_id[session.session_id] = session
         for group in groups:
             group.sessions.add(session)
 
@@ -952,9 +962,33 @@ class SessionManager:
         '''Remove a session from our sessions list if there.'''
         self.session_event.set()
         groups = self.sessions.pop(session)
+        if session.session_id is not None:
+            self.sessions_by_id.pop(session.session_id, None)
         for group in groups:
             group.retained_cost += session.cost
             group.sessions.remove(session)
+
+    async def _notify_glyph_session(self, session_id, notification):
+        '''Deliver a single glyph/swap/wave/dmint notification to one session.
+
+        Wire shape: positional params array with one object, e.g.
+        ``{"method": "glyph.balance", "params": [{...}]}``.  Matches the
+        Electrum subscription convention used by blockchain.scripthash.subscribe
+        so client-side `(...params)` spreads receive one dict argument.
+        '''
+        session = self.sessions_by_id.get(session_id)
+        if session is None:
+            return
+        method = notification.get('method')
+        params = notification.get('params')
+        if method is None:
+            return
+        try:
+            await session.send_notification(method, (params,))
+        except Exception:
+            self.logger.debug(
+                f'failed to send {method} to session {session_id}', exc_info=True
+            )
 
 
 class SessionBase(RPCSession):
