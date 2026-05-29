@@ -1362,6 +1362,34 @@ class GlyphIndex:
             batch.delete(self._undo_key(height))
         self._last_undo_pruned = prune_to
     
+    def memory_estimate(self) -> int:
+        '''Approximate bytes held by unflushed in-memory caches.
+
+        Used by block_processor.check_cache_size() to trigger a flush before
+        these caches grow large enough to OOM the process.  Per-entry numbers
+        follow the same convention as block_processor (~190B for dict[bytes,bytes]
+        with 32B values) and intentionally err on the conservative (high) side.
+        '''
+        if not self.enabled:
+            return 0
+        undo_entries = sum(len(v) for v in self._undo_cache.values())
+        return (
+            len(self.token_cache) * 300
+            + len(self.balance_cache) * 140
+            + len(self.balance_height) * 140
+            + len(self.balance_deletes) * 100
+            + len(self.history_cache) * 250
+            + len(self.metadata_cache) * 600
+            + len(self.metadata_height) * 140
+            + len(self.token_height) * 140
+            + len(self.key_reveal_cache) * 600
+            + len(self.key_reveal_height) * 140
+            + len(self.contract_to_token_cache) * 190
+            + len(self.contract_to_token_height) * 140
+            + undo_entries * 120
+            + len(self._known_refs) * 100
+        )
+
     def flush(self, batch):
         """Flush cached Glyph data to the database."""
         if not self.enabled:

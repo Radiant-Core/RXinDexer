@@ -8,7 +8,7 @@
 FROM ubuntu:22.04
 
 LABEL maintainer="The Radiant Core devs"
-LABEL version="2.0.0"
+LABEL version="3.0.1"
 LABEL description="RXinDexer - Radiant blockchain indexer with Glyph/WAVE/Swap support"
 
 ARG DEBIAN_FRONTEND=noninteractive

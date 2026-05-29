@@ -112,6 +112,31 @@ class AnalyticsIndex:
                 batch.put(key, prev)
         batch.delete(self._undo_key(height))
 
+    def memory_estimate(self) -> int:
+        '''Approximate bytes held by unflushed in-memory caches.
+
+        Used by block_processor.check_cache_size() to trigger a flush before
+        these caches grow large enough to OOM the process.
+        '''
+        if not self.enabled:
+            return 0
+        undo_entries = sum(len(v) for v in self._undo_cache.values())
+        return (
+            len(self.summary_cache) * 400
+            + len(self.summary_height) * 140
+            + len(self.balance_cache) * 140
+            + len(self.balance_height) * 140
+            + len(self.balance_deletes) * 100
+            + len(self.display_cache) * 400
+            + len(self.display_height) * 140
+            + len(self.utxo_meta_cache) * 400
+            + len(self.utxo_meta_height) * 140
+            + len(self.utxo_meta_deletes) * 100
+            + len(self.daily_cache) * 400
+            + len(self.daily_height) * 140
+            + undo_entries * 120
+        )
+
     def flush(self, batch):
         if not self.enabled:
             return

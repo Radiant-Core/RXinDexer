@@ -654,6 +654,23 @@ class SwapIndex:
             return struct.unpack('<I', padded)[0]
         return None
 
+    def memory_estimate(self) -> int:
+        '''Approximate bytes held by unflushed in-memory caches.
+
+        Used by block_processor.check_cache_size() to trigger a flush before
+        these caches grow large enough to OOM the process.
+        '''
+        if not self.enabled:
+            return 0
+        undo_entries = sum(len(v) for v in self._undo_cache.values())
+        return (
+            len(self.order_cache) * 350
+            + len(self.order_height) * 140
+            + len(self.stats_cache) * 250
+            + len(self.history_cache) * 250
+            + undo_entries * 120
+        )
+
     def flush(self, batch):
         """Flush cached swap data to the database."""
         if not self.enabled:
