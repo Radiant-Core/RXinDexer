@@ -433,6 +433,49 @@ class Script(object):
         return script
 
     @classmethod
+    def base_locking_script(cls, script):
+        '''Return the base locking script with any leading Radiant input-ref
+        commitment preamble removed.
+
+        Radiant token outputs prepend a "ref preamble" to an otherwise standard
+        locking script, e.g. an NFT pays to:
+
+            OP_PUSHINPUTREFSINGLETON <36-byte ref> OP_DROP <P2PKH ...>
+
+        For per-address ownership we want the hashX/scripthash of the underlying
+        address (the ``<P2PKH ...>`` tail), so that a wallet can look up the
+        tokens it holds using its normal address scripthash.  This strips the
+        leading run of input-ref ops (each followed by a 36-byte operand) and
+        the OP_DROP/OP_2DROP ops that consume them, returning the remainder.
+
+        For a plain (non-token) script there is no preamble, so the script is
+        returned unchanged.  Used together with ``hashX_from_script`` to derive
+        the recipient's base-address hashX.  Symmetry of credit/debit accounting
+        does not depend on this being a "clean" address for exotic scripts: the
+        value is computed once at output creation and read back verbatim when
+        the output is spent.
+        '''
+        try:
+            n = 0
+            length = len(script)
+            while n < length:
+                op = script[n]
+                if op in INPUT_REF_OPS:
+                    # ref op + 36-byte operand
+                    if n + 1 + 36 > length:
+                        break
+                    n += 1 + 36
+                elif op == OpCodes.OP_DROP or op == OpCodes.OP_2DROP:
+                    n += 1
+                else:
+                    break
+            remainder = script[n:]
+            # Guard against a script that is nothing but a ref preamble.
+            return remainder if remainder else script
+        except Exception:
+            return script
+
+    @classmethod
     def push_data(cls, data):
         '''Returns the opcodes to push the data on the stack.'''
         assert isinstance(data, (bytes, bytearray))

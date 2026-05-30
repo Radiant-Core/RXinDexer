@@ -526,19 +526,31 @@ class GlyphAPIMixin:
             Parsed metadata dict
         """
         self.bump_cost(1.5)
-        
-        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+
+        if not getattr(self, 'glyph_index', None):
             return {'error': 'Glyph indexing not enabled'}
-        
+
         try:
-            token = self.glyph_index.get_token_by_ref_str(ref)
-            if not token:
+            from electrumx.server.glyph_index import pack_ref
+            # Accept the same ref forms as glyph.get_by_ref / glyph.get_token:
+            #   * 72-hex packed ref  -> txid(32, internal LE) + vout(4, LE)
+            #   * "txid_vout" / "txid:vout" -> txid in display (big-endian) order
+            r = ref.strip()
+            if len(r) == 72 and '_' not in r and ':' not in r:
+                ref_bytes = bytes.fromhex(r)
+            else:
+                sep = '_' if '_' in r else ':'
+                txid_hex, vout_str = r.rsplit(sep, 1)
+                ref_bytes = pack_ref(hex_str_to_hash(txid_hex), int(vout_str))
+
+            token = self.glyph_index.get_token(ref_bytes)
+            if not token or not token.metadata_hash:
                 return None
-            
-            metadata_hash = token.get('metadata_hash')
-            if metadata_hash:
-                return self.glyph_index.get_metadata(bytes.fromhex(metadata_hash))
-            return None
+            # token.metadata_hash is the raw sha256 (exactly the GM row key), so
+            # no byte-order juggling is needed here.  Returns the full decoded
+            # CBOR metadata (header + app profile + attrs + files + voxel_payload)
+            # so consumers need not refetch and decode the raw reveal tx.
+            return to_jsonsafe(self.glyph_index.get_metadata(token.metadata_hash))
         except Exception as e:
             return {'error': str(e)}
 
