@@ -219,6 +219,12 @@ class Radiant(Coin):
 
 class RadiantTestnetMixin:
     """Mixin for Radiant testnet variants."""
+    # Use the token-aware session class (Glyph/WAVE/Swap/dMint RPC handlers),
+    # same as mainnet Radiant. Without this, testnet/regtest fall back to
+    # Coin.SESSIONCLS (plain ElectrumX) and every glyph.*/swap.*/wave.* method
+    # returns "unknown method". The mixin precedes Coin in each variant's MRO,
+    # so this attribute wins over Coin.SESSIONCLS.
+    SESSIONCLS = RadiantElectrumX
     SHORTNAME = "XTN"
     NET = "testnet"
     P2PKH_VERBYTE = bytes.fromhex("6f")  # 111

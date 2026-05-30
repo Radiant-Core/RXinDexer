@@ -55,11 +55,15 @@ services:
     volumes:
       # Persist database across restarts
       - ./electrumdb:/data/electrumdb
-      # Mount local code over cloned repo for live development
-      - ./electrumx:/root/electrumx/electrumx:ro
-      - ./electrumx_server:/root/electrumx/electrumx_server:ro
-      - ./electrumx_rpc:/root/electrumx/electrumx_rpc:ro
-      - ./electrumx_rest_api:/root/electrumx/electrumx_rest_api:ro
+      # Mount local code over cloned repo for live development.
+      # The image clones into /opt/electrumx and runs with WORKDIR/PYTHONPATH=/opt/electrumx
+      # (see Dockerfile), so mounts MUST target /opt/electrumx/* — mounting under
+      # /root/electrumx/* lands off PYTHONPATH and the running process keeps using the
+      # baked GitHub clone, silently ignoring local edits.
+      - ./electrumx:/opt/electrumx/electrumx:ro
+      - ./electrumx_server:/opt/electrumx/electrumx_server:ro
+      - ./electrumx_rpc:/opt/electrumx/electrumx_rpc:ro
+      - ./electrumx_rest_api:/opt/electrumx/electrumx_rest_api:ro
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 50010 || exit 1"]
       interval: 30s
