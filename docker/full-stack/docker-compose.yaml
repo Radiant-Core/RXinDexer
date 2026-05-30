@@ -56,6 +56,16 @@ services:
     # in a state dockerd cannot kill — causing the restart-manager loop to
     # spin the daemon at 80% CPU until the host is rebooted.
     init: true
+    # Memory caps — production safety net.
+    # Observed plateau on v3.0.1 with CACHE_MB=2000: python RSS ~8 GiB
+    # (4× cache budget, normal pymalloc retention for asyncio+RocksDB).
+    # mem_limit 12 GiB → docker OOM-kills the container cleanly on regression
+    # (and `restart: unless-stopped` brings it back), instead of letting the
+    # host OOM-killer pick a victim (radiantd / caddy) on a 16 GiB host.
+    # mem_reservation 4 GiB lets the scheduler avoid evicting us under
+    # normal load. Adjust both if CACHE_MB is raised.
+    mem_limit: 12g
+    mem_reservation: 4g
     depends_on:
       radiantd:
         condition: service_healthy
