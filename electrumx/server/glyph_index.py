@@ -1595,9 +1595,28 @@ class GlyphIndex:
             pass
         return None
     
+    @staticmethod
+    def _scripthash_to_hashX(scripthash: bytes) -> bytes:
+        """Convert an Electrum scripthash to the internal 11-byte hashX.
+
+        Glyph balance/holder rows are keyed by ``hashX`` (the recipient's
+        base-address hashX), exactly as the rest of ElectrumX keys address
+        indexes.  Clients, however, pass the standard Electrum *scripthash*
+        (``sha256(scriptPubKey)``, 32 bytes, the same value accepted by
+        ``blockchain.scripthash.*``).  This mirrors
+        ``electrumx.server.session.scripthash_to_hashX``: reverse to the
+        natural sha256 byte order, then take the first HASHX_LEN bytes.
+
+        A value that is already hashX-length (internal callers) is returned
+        unchanged.
+        """
+        if len(scripthash) == 32:
+            return scripthash[::-1][:HASHX_LEN]
+        return scripthash[:HASHX_LEN]
+
     def get_balance(self, scripthash: bytes, ref: bytes) -> int:
-        """Get token balance for a scripthash."""
-        key = pack_balance_key(scripthash, ref)
+        """Get token balance for an address scripthash + token ref."""
+        key = pack_balance_key(self._scripthash_to_hashX(scripthash), ref)
         
         # Check cache
         if key in self.balance_cache:
@@ -1627,9 +1646,13 @@ class GlyphIndex:
     def get_balances_for_scripthash(self, scripthash: bytes,
                                      limit: int = 100,
                                      cursor: Optional[str] = None) -> Dict[str, Any]:
-        """Get all token balances for a scripthash."""
+        """Get all token balances held by an address.
+
+        ``scripthash`` is the standard Electrum scripthash; balances are keyed
+        by the recipient's base-address ``hashX``, so convert before seeking.
+        """
         results = []
-        prefix = GlyphDBKeys.BALANCE + scripthash
+        prefix = GlyphDBKeys.BALANCE + self._scripthash_to_hashX(scripthash)
         seek = self._decode_cursor(cursor) or prefix
         next_cursor = None
 

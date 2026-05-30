@@ -339,10 +339,16 @@ class TestBalancesCursorStillWorks:
     def test_full_walk(self):
         idx = make_index()
         scripthash = b'\x11' * 32
+        # Balances are keyed by the 11-byte hashX (the recipient's base-address
+        # hashX), exactly as the block processor writes them.  The query
+        # converts the Electrum scripthash to that hashX before seeking, so the
+        # seed rows must use the hashX too.
+        from electrumx.lib.hash import HASHX_LEN
+        hashX = scripthash[::-1][:HASHX_LEN]
         refs = [make_ref(0x30 + i, i) for i in range(6)]
         for ref in refs:
             # Seed a balance row and a token.
-            bal_key = GlyphDBKeys.BALANCE + scripthash + ref
+            bal_key = GlyphDBKeys.BALANCE + hashX + ref
             idx.db.utxo_db.put(bal_key, struct.pack('<Q', 1000))
             t = GlyphTokenInfo()
             t.ref = ref
@@ -361,6 +367,80 @@ class TestBalancesCursorStillWorks:
             if cursor is None:
                 break
         assert len(seen) == 6
+
+
+# ---------------------------------------------------------------------------
+# Current-ownership semantics: mint credits the recipient, a transfer debits
+# the sender and credits the new owner.  This is what lets glyph.list_tokens be
+# the *current ownership* source of truth instead of an "addresses ever
+# involved" history (which over-reports a minted-then-sent NFT).
+# ---------------------------------------------------------------------------
+
+class _DictBatch:
+    """Minimal write-batch that applies put/delete straight to MockRocksDB."""
+
+    def __init__(self, db: "MockRocksDB"):
+        self._db = db
+
+    def put(self, key: bytes, value: bytes):
+        self._db._store[key] = value
+
+    def delete(self, key: bytes):
+        self._db._store.pop(key, None)
+
+
+class TestCurrentOwnership:
+    def test_mint_then_transfer_reflects_current_ownership(self):
+        from electrumx.lib.hash import HASHX_LEN
+
+        idx = make_index()
+
+        ref = make_ref(0x42, 0)  # 36-byte singleton (NFT) ref
+        t = GlyphTokenInfo()
+        t.ref = ref
+        t.name = "Radiant Cube"
+        t.protocols = [GlyphProtocol.GLYPH_NFT]
+        t.token_type = 2  # NFT
+        idx.token_cache[ref] = t  # registered -> "known" + name-resolvable
+        idx.token_height[ref] = 1  # so flush() persists it to the DB
+
+        # Two holders addressed by their standard Electrum scripthashes.  The
+        # glyph_index methods receive the raw 32-byte scripthash (the API layer
+        # does bytes.fromhex), exactly as the JSON-RPC handlers pass them.
+        scripthash_A = bytes.fromhex(
+            "59dea47da05ec1d2ecf6ed312b523926c7ac1058860dcf2bfe3338ce4495d1e6")
+        scripthash_B = bytes.fromhex("aa" * 32)
+        # Recipient base-address hashX — what block_processor credits/debits and
+        # what _scripthash_to_hashX derives from the client scripthash.
+        base_A = scripthash_A[::-1][:HASHX_LEN]
+        base_B = scripthash_B[::-1][:HASHX_LEN]
+
+        # --- Mint: token output (1 photon) paid to A ---
+        idx.process_balance_changes(1, debits=[], credits=[(base_A, 1, [ref])])
+        assert idx.get_balance(scripthash_A, ref) == 1
+        assert idx.get_balance(scripthash_B, ref) == 0
+
+        # --- Transfer A -> B ---
+        # block_processor supplies the spent output's base-address hashX (base_A,
+        # read back from the per-outpoint b'rb' map) as the debit key, and base_B
+        # as the credit.  refs_data is the 37-byte (ref + singleton-type) entry
+        # exactly as stored in the 'ri' index and consumed by the debit loop.
+        refs_data = ref + b"\x01"
+        idx.process_balance_changes(
+            2, debits=[(base_A, 1, refs_data)], credits=[(base_B, 1, [ref])]
+        )
+
+        # Immediate (cache) view.
+        assert idx.get_balance(scripthash_A, ref) == 0   # A no longer owns it
+        assert idx.get_balance(scripthash_B, ref) == 1   # B now owns it
+
+        # DB view — the real glyph.list_tokens path — after a flush.
+        idx.flush(_DictBatch(idx.db.utxo_db))
+        a_tokens = idx.get_balances_for_scripthash(scripthash_A)["balances"]
+        b_tokens = idx.get_balances_for_scripthash(scripthash_B)["balances"]
+        assert a_tokens == []                            # dropped from sender
+        assert len(b_tokens) == 1
+        assert b_tokens[0]["name"] == "Radiant Cube"     # current owner only
 
 
 # ---------------------------------------------------------------------------

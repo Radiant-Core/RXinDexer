@@ -436,6 +436,8 @@ class BlockProcessor:
         # The old 38B estimate caused ref_cache to silently consume 5x reported memory,
         # leading to OOM kills when reported ref_MB was ~1000 but actual was ~5GB.
         ref_cache_size = len(self.ref_cache) * 190
+        # b'rb' base-address hashX side table (one ~60B entry per token output).
+        ref_cache_size += len(self.data_cache) * 60
         db_deletes_size = len(self.db_deletes) * 57
         hist_cache_size = self.db.history.unflushed_memsize()
         # Roughly ntxs * 32 + nblocks * 42
@@ -591,11 +593,19 @@ class BlockProcessor:
                         cache_value[:HASHX_LEN],
                         unpack_le_uint64(cache_value[-8:])[0],
                     ))
-                # Collect debit: hashX(11) + codeScriptHash(32) + tx_numb(5) + value(8)
+                # Collect debit for Glyph balance accounting.  Glyph ownership is
+                # keyed by the recipient's *base address* hashX (see the credit
+                # path below), so we must debit the same base hashX that was
+                # recorded when this output was created (b'rb' + outpoint).  The
+                # spent output's script is not available here, hence the side
+                # table.  Fall back to the output's own hashX if no record
+                # exists (e.g. a token output created before this index existed).
                 if spent_refs:
-                    spent_hashX = cache_value[:HASHX_LEN]
                     spent_value = unpack_le_uint64(cache_value[-8:])[0]
-                    balance_debits.append((spent_hashX, spent_value, spent_refs))
+                    spent_base_hashX = (self.data_cache.get(b'rb' + outpoint)
+                                        or self.db.utxo_db.get(b'rb' + outpoint)
+                                        or cache_value[:HASHX_LEN])
+                    balance_debits.append((spent_base_hashX, spent_value, spent_refs))
                     # Extract singleton refs for burn detection (37 bytes per entry)
                     for i in range(0, len(spent_refs), 37):
                         if i + 37 <= len(spent_refs) and spent_refs[i + 36] == 1:
@@ -677,9 +687,17 @@ class BlockProcessor:
                 # We could check for refs used in inputs that are burnt in this tx,
                 # but current burn implementations are done using op return so this may not be needed
 
-                # Collect credit for balance tracking
+                # Collect credit for Glyph balance tracking.  The ownership index
+                # is keyed by the recipient's *base address* hashX (the locking
+                # script with the Radiant ref preamble stripped) rather than the
+                # token output's own (ref-wrapped) hashX, so that a wallet can
+                # list the tokens it holds using its normal address scripthash.
+                # The base hashX is persisted per-outpoint (b'rb' + outpoint) so
+                # the matching debit can be applied symmetrically on spend.
                 if self.glyph_index and all_refs_dedup:
-                    balance_credits.append((hashX, txout.value, list(all_refs_dedup.keys())))
+                    base_hashX = script_hashX(Script.base_locking_script(txout.pk_script))
+                    put_data(b'rb' + cache_key, base_hashX)
+                    balance_credits.append((base_hashX, txout.value, list(all_refs_dedup.keys())))
 
             append_hashXs(hashXs)
             update_touched(hashXs)
@@ -974,6 +992,11 @@ class BlockProcessor:
         if cached_value and ref_value_packed:
             raise IndexError(f'Critical Error: Found in cache and DB')
         self.db_deletes.append(ri_db_key)
+        # Mirror for the base-address hashX side table (b'rb' + outpoint).
+        # It is immutable per outpoint and rebuilt on replay, so deleting it
+        # on reorg unwind keeps the table clean without extra undo state.
+        self.data_cache.pop(b'rb' + outpoint, None)
+        self.db_deletes.append(b'rb' + outpoint)
 
     async def _process_blocks(self):
         '''Loop forever processing blocks as they arrive.'''
