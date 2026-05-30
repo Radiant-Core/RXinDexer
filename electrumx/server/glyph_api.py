@@ -25,6 +25,9 @@ from electrumx.lib.glyph import (
     parse_glyph_id,
     parse_ref,
     format_ref,
+    parse_glyph_metadata,
+    extract_token_info,
+    to_jsonsafe,
 )
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
 
@@ -63,80 +66,129 @@ class GlyphAPIMixin:
         except (ValueError, IndexError):
             return {'error': 'Invalid glyph_id format. Expected txid:vout'}
         
-        # Fetch the transaction
+        # The Glyph envelope can live in an output script (OP_RETURN style) or,
+        # for commit/reveal tokens, in an input scriptSig (the redeem script
+        # revealed when the committed outpoint is spent). The original code only
+        # inspected the named output and so returned null for ordinary
+        # commit/reveal NFTs whose envelope is in vin[0].scriptSig.
         try:
             raw_tx = await self.daemon_request('getrawtransaction', txid, True)
         except Exception:
             return None
-        
-        if not raw_tx or 'vout' not in raw_tx:
+
+        if not raw_tx:
             return None
-        
-        if vout >= len(raw_tx['vout']):
-            return None
-        
-        output = raw_tx['vout'][vout]
-        script_hex = output.get('scriptPubKey', {}).get('hex', '')
-        
-        if not script_hex:
-            return None
-        
-        script_bytes = bytes.fromhex(script_hex)
-        envelope = parse_glyph_envelope(script_bytes)
-        
+
+        def _parse(script_hex):
+            if not script_hex:
+                return None
+            try:
+                return parse_glyph_envelope(bytes.fromhex(script_hex))
+            except Exception:
+                return None
+
+        vouts = raw_tx.get('vout', []) or []
+        # Value of the queried outpoint (txid:vout) — the token-bearing UTXO the
+        # caller identified. This is independent of where the envelope text
+        # physically lives: a Style A reveal puts the envelope in an OP_RETURN
+        # output while the token sits in a different output, and a Style B / v1
+        # reveal puts it in an input scriptSig (which carries no value in the
+        # verbose tx at all). Reporting the named outpoint's value is both
+        # accurate and stable; 0 only when the named vout is absent.
+        named_value = 0
+        if 0 <= vout < len(vouts):
+            named_value = int(vouts[vout].get('value', 0) * 100_000_000)
+
+        envelope = None
+        source = None
+        # Search order: 1) the named output, 2) any other output,
+        #               3) any input scriptSig (commit/reveal redeem script).
+        # `source` records where the envelope was actually parsed from, so the
+        # caller can tell when it did not come from the named vout.
+        if 0 <= vout < len(vouts):
+            envelope = _parse(vouts[vout].get('scriptPubKey', {}).get('hex', ''))
+            if envelope:
+                source = f'output:{vout}'
+        if not envelope:
+            for idx, out in enumerate(vouts):
+                envelope = _parse(out.get('scriptPubKey', {}).get('hex', ''))
+                if envelope:
+                    source = f'output:{idx}'
+                    break
+        if not envelope:
+            for idx, inp in enumerate(raw_tx.get('vin', []) or []):
+                envelope = _parse(inp.get('scriptSig', {}).get('hex', ''))
+                if envelope:
+                    source = f'input:{idx}'
+                    break
+
         if not envelope:
             return None
-        
+
         result = {
             'glyph_id': glyph_id,
             'txid': txid,
             'vout': vout,
-            'value': int(output.get('value', 0) * 100_000_000),
+            'value': named_value,
+            'envelope_source': source,
             'version': envelope.get('version'),
             'is_reveal': envelope.get('is_reveal', False),
         }
-        
+
         if envelope.get('commit_hash'):
             result['commit_hash'] = envelope['commit_hash']
-        
+
         if envelope.get('content_root'):
             result['content_root'] = envelope['content_root']
-        
-        return result
+
+        # For reveals, decode and surface token metadata (name, protocols,
+        # type) so inventory callers get a useful envelope in one round-trip.
+        if envelope.get('is_reveal'):
+            metadata = parse_glyph_metadata(envelope)
+            if metadata:
+                info = extract_token_info(metadata, envelope)
+                result['token_type'] = get_token_type(info.get('protocols', []) or [])
+                result['metadata'] = info
+
+        # The decoded reveal metadata above (CBOR dict / CBORTag values, binary
+        # attrs) can contain raw bytes that JSON cannot encode. (commit_hash /
+        # content_root are already hex-encoded by the envelope parser.)
+        # Hex-encode any remaining bytes recursively.
+        return to_jsonsafe(result)
 
     async def glyph_get_by_ref(self, ref: str):
         """
-        Get all UTXOs containing a specific reference.
-        
+        Get the indexed Glyph token for a 36-byte reference.
+
         Args:
-            ref: 36-byte reference in hex (72 characters)
-            
+            ref: 36-byte reference in hex (72 characters) — txid(32, internal
+                 byte order) + vout(4, little-endian), i.e. a packed ref.
+
         Returns:
-            List of UTXOs with the reference
+            The token record dict, or None if no token is indexed for this ref.
         """
         self.bump_cost(2.0)
-        
+
         if len(ref) != 72:
             return {'error': 'Invalid ref format. Expected 72 hex characters'}
-        
+
         try:
             ref_bytes = bytes.fromhex(ref)
         except ValueError:
             return {'error': 'Invalid hex in ref'}
-        
-        # Query the database for UTXOs with this reference
-        utxos = await self.db.get_utxos_by_ref(ref_bytes)
-        
-        result = []
-        for utxo in utxos:
-            result.append({
-                'tx_hash': hash_to_hex_str(utxo.tx_hash),
-                'tx_pos': utxo.tx_pos,
-                'height': utxo.height,
-                'value': utxo.value,
-            })
-        
-        return result
+
+        if not getattr(self, 'glyph_index', None):
+            return {'error': 'Glyph indexing not enabled'}
+
+        # The ref is the token's singleton/commit ref — exactly the key the
+        # Glyph index stores tokens under. (The earlier implementation called
+        # self.db.get_utxos_by_ref, which does not exist, so every call raised
+        # AttributeError -> -32603 internal server error.)
+        token = self.glyph_index.get_token(ref_bytes)
+        if not token:
+            return None
+
+        return to_jsonsafe(self.glyph_index._token_to_dict(token))
 
     async def glyph_validate_protocols(self, protocols: list):
         """

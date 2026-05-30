@@ -8,7 +8,14 @@ RXinDexer extends the ElectrumX protocol with comprehensive Glyph v2 token index
 
 ### glyph.get_token
 
-Get token information by Glyph ID.
+Get token information by Glyph ID, parsed directly from the transaction.
+
+The envelope is located by searching, in order: the named output, any other
+output, then any input `scriptSig` (commit/reveal redeem script — where v1 /
+v2 Style B reveals carry their envelope). `envelope_source` reports where it
+was actually found. `value` is the value of the queried outpoint (`txid:vout`),
+independent of where the envelope text lives. Returns `null` if no envelope is
+found.
 
 **Parameters:**
 | Name | Type | Description |
@@ -22,23 +29,32 @@ Get token information by Glyph ID.
   "txid": "abc123...def",
   "vout": 0,
   "value": 100000000,
+  "envelope_source": "input:0",
   "version": 2,
-  "is_reveal": true
+  "is_reveal": true,
+  "commit_hash": "....",
+  "content_root": "....",
+  "token_type": "NFT",
+  "metadata": { "name": "...", "protocols": [1], "...": "..." }
 }
 ```
+
+`commit_hash` / `content_root` appear only when present in the envelope.
+`token_type` / `metadata` are included for reveals (`is_reveal: true`). All
+binary values are hex-encoded.
 
 ---
 
 ### glyph.get_by_ref
 
-Get all UTXOs containing a specific reference.
+Get the indexed Glyph token for a 36-byte reference.
 
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
-| `ref` | string | 36-byte reference in hex (72 characters) |
+| `ref` | string | 36-byte reference in hex (72 characters): txid (32, internal byte order) + vout (4, little-endian) |
 
-**Returns:** Array of UTXOs
+**Returns:** The token record dict (same shape as `glyph.get_token_info`), or `null` if no token is indexed for this ref. Requires Glyph indexing to be enabled.
 
 ---
 

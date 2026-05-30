@@ -440,6 +440,29 @@ def parse_ref(ref_str: str) -> Tuple[str, int]:
     return txid_hex, int(vout_str)
 
 
+def to_jsonsafe(obj: Any) -> Any:
+    """Recursively convert a decoded Glyph structure into JSON-serialisable form.
+
+    CBOR-decoded metadata can contain raw ``bytes`` — NFT ``attrs`` values,
+    embedded binary, and ``cbor2.CBORTag`` payloads (e.g. typed arrays). Most
+    token-record fields are already hex-encoded by ``_token_to_dict`` / the
+    envelope parser, but this metadata is passed through verbatim. aiorpcX/JSON
+    cannot encode ``bytes``, so returning such a structure from an RPC handler
+    raises and the client sees ``-32603 internal server error``. This converts
+    every bytes value to a hex string and recurses through dicts/lists, leaving
+    scalars untouched; ``CBORTag`` values are unwrapped to their ``.value``.
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.hex()
+    if isinstance(obj, dict):
+        return {to_jsonsafe(k): to_jsonsafe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonsafe(v) for v in obj]
+    if obj.__class__.__name__ == 'CBORTag' and hasattr(obj, 'value'):
+        return to_jsonsafe(obj.value)
+    return obj
+
+
 def extract_token_info(metadata: Dict[str, Any], envelope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Extract a normalized token-info dict from decoded metadata.
 
