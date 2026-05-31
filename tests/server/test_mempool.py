@@ -9,13 +9,16 @@ import pytest
 from aiorpcx import Event, TaskGroup, sleep, ignore_after
 
 from electrumx.server.mempool import MemPool, MemPoolAPI
-from electrumx.lib.coins import Bitcoin
+# This fork ships only the Radiant coin family (no Bitcoin class). Radiant
+# inherits the generic DESERIALIZER / hashX machinery from the base Coin, so
+# these coin-agnostic mempool tests run against it unchanged.
+from electrumx.lib.coins import Radiant
 from electrumx.lib.hash import HASHX_LEN, hex_str_to_hash, hash_to_hex_str, double_sha256
 from electrumx.lib.tx import Tx, TxInput, TxOutput
 from electrumx.lib.util import make_logger
 
 
-coin = Bitcoin
+coin = Radiant
 # Change seed daily
 seed(datetime.date.today().toordinal)
 

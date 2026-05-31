@@ -16,7 +16,7 @@ from typing import Dict, Set, Optional, Any, Callable
 from collections import defaultdict
 
 from electrumx.lib import util
-from electrumx.lib.hash import hash_to_hex_str
+from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 
 
 class GlyphSubscriptionManager:
@@ -41,7 +41,13 @@ class GlyphSubscriptionManager:
         
         # Subscription maps: key -> set of session_ids
         # Glyph subscriptions
-        self.balance_subs: Dict[bytes, Set[int]] = defaultdict(set)  # scripthash+ref -> sessions
+        # Keyed by base-address hashX(11) + ref(36) — the same key space the
+        # block/mempool indexers notify on, so client 32-byte scripthashes are
+        # converted before subscribing (see _to_hashX).
+        self.balance_subs: Dict[bytes, Set[int]] = defaultdict(set)  # hashX+ref -> sessions
+        # base-address hashX -> last client 32-byte scripthash, so the
+        # notification payload can echo the wallet's original scripthash.
+        self.balance_scripthash: Dict[bytes, bytes] = {}
         self.token_subs: Dict[bytes, Set[int]] = defaultdict(set)    # token_ref -> sessions
         self.transfer_subs: Dict[bytes, Set[int]] = defaultdict(set) # token_ref -> sessions
         
@@ -73,16 +79,38 @@ class GlyphSubscriptionManager:
     # Subscribe/Unsubscribe Methods
     # ========================================================================
     
+    @staticmethod
+    def _to_hashX(scripthash: bytes) -> bytes:
+        """Convert a 32-byte Electrum scripthash to the 11-byte base-address
+        hashX used as the balance key.
+
+        Mirrors ``GlyphIndex._scripthash_to_hashX`` and is idempotent for
+        values already of hashX length (the notify path passes the 11-byte
+        base-address hashX directly), so subscribe and notify share one key.
+        """
+        if scripthash is None:
+            return scripthash
+        if len(scripthash) == 32:
+            return scripthash[::-1][:HASHX_LEN]
+        return scripthash[:HASHX_LEN]
+
     def subscribe_balance(self, session_id: int, scripthash: bytes, token_ref: bytes) -> bool:
-        """Subscribe to token balance changes for an address."""
-        key = scripthash + token_ref
+        """Subscribe to token balance changes for an address.
+
+        ``scripthash`` is the standard 32-byte Electrum scripthash; it is
+        converted to the holder's base-address hashX so the key matches the
+        notification key produced during block/mempool processing.
+        """
+        hashX = self._to_hashX(scripthash)
+        key = hashX + token_ref
         self.balance_subs[key].add(session_id)
+        self.balance_scripthash[hashX] = scripthash
         self.session_subs[session_id].add(('balance', key))
         return True
-    
+
     def unsubscribe_balance(self, session_id: int, scripthash: bytes, token_ref: bytes) -> bool:
         """Unsubscribe from token balance changes."""
-        key = scripthash + token_ref
+        key = self._to_hashX(scripthash) + token_ref
         if session_id in self.balance_subs.get(key, set()):
             self.balance_subs[key].discard(session_id)
             self.session_subs[session_id].discard(('balance', key))
@@ -199,20 +227,28 @@ class GlyphSubscriptionManager:
     # Notification Methods (called by indexers)
     # ========================================================================
     
-    async def notify_balance_change(self, scripthash: bytes, token_ref: bytes, 
+    async def notify_balance_change(self, scripthash: bytes, token_ref: bytes,
                                      new_balance: int, delta: int):
-        """Notify subscribers of a balance change."""
+        """Notify subscribers of a balance change.
+
+        ``scripthash`` may be the 32-byte Electrum scripthash or the 11-byte
+        base-address hashX produced by block/mempool processing; both normalise
+        to the same hashX key so the subscription matches.  The payload echoes
+        the subscriber's original 32-byte scripthash when it is known.
+        """
         if not self.notify_callback:
             return
-        
-        key = scripthash + token_ref
+
+        hashX = self._to_hashX(scripthash)
+        key = hashX + token_ref
         sessions = self.balance_subs.get(key, set())
-        
+
         if sessions:
+            display_sh = self.balance_scripthash.get(hashX, scripthash)
             notification = {
                 'method': 'glyph.balance',
                 'params': {
-                    'scripthash': scripthash.hex(),
+                    'scripthash': display_sh.hex(),
                     'ref': self._format_ref(token_ref),
                     'balance': new_balance,
                     'delta': delta,

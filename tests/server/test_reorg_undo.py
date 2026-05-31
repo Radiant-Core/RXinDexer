@@ -325,7 +325,9 @@ def test_schema_version_written_on_fresh_db():
 
     db = FakeDB()
     env = FakeEnv()
-    GlyphIndex(db, env)
+    # The schema check is deferred to post_open_init() (utxo_db isn't available
+    # in __init__); the server calls it after opening the DB, so the test does too.
+    GlyphIndex(db, env).post_open_init()
 
     raw = db.utxo_db.get(GlyphDBKeys.SCHEMA_VERSION)
     assert raw is not None
@@ -342,5 +344,8 @@ def test_schema_version_mismatch_raises():
     db.utxo_db._store[GlyphDBKeys.SCHEMA_VERSION] = (1).to_bytes(4, 'big')
 
     env = FakeEnv()
+    idx = GlyphIndex(db, env)
+    # Schema validation happens in post_open_init() (after the DB is opened),
+    # not in __init__.
     with pytest.raises(RuntimeError, match='reindex'):
-        GlyphIndex(db, env)
+        idx.post_open_init()

@@ -111,7 +111,7 @@ class MemPool(object):
     '''
 
     def __init__(self, coin, api, refresh_secs=5.0, log_status_secs=60.0,
-                 env=None, glyph_index=None, swap_index=None):
+                 env=None, glyph_index=None, swap_index=None, subscriptions=None):
         assert isinstance(api, MemPoolAPI)
         self.coin = coin
         self.api = api
@@ -124,6 +124,10 @@ class MemPool(object):
         self.refresh_secs = refresh_secs
         self.log_status_secs = log_status_secs
         
+        # Subscription manager (owned by the block processor) used to push
+        # glyph.subscribe.balance notifications on unconfirmed balance changes.
+        self.subscriptions = subscriptions
+
         # Initialize Glyph mempool index if available and enabled
         self.glyph_mempool = None
         if HAS_MEMPOOL_GLYPH and env:
@@ -196,6 +200,14 @@ class MemPool(object):
                              sum(v for _, v in tx.out_pairs)))
             txs[tx_hash] = tx
 
+            # Index unconfirmed Glyph balance movements for this accepted tx.
+            # tx.in_pairs is now resolved, so sender debits carry spent values.
+            if self.glyph_mempool:
+                try:
+                    self.glyph_mempool.process_mempool_tx(tx_hash, tx)
+                except Exception:
+                    self.logger.exception('mempool glyph processing failed')
+
             for hashX, _value in itertools.chain(tx.in_pairs, tx.out_pairs):
                 touched.add(hashX)
                 hashXs[hashX].add(tx_hash)
@@ -254,7 +266,36 @@ class MemPool(object):
                 synchronized_event.clear()
                 await self.api.on_mempool(touched, height)
                 touched = set()
+                await self._dispatch_glyph_balance()
             await sleep(self.refresh_secs)
+
+    async def _dispatch_glyph_balance(self):
+        '''Push glyph.subscribe.balance notifications for the unconfirmed
+        balance changes accumulated during the last mempool refresh.
+
+        Keys are the holder's base-address hashX (the same key space
+        glyph.subscribe.balance converts client scripthashes into), so a
+        subscriber for that address is matched.  The touched set is always
+        drained to bound memory even when no subscribers are present.
+        '''
+        gm = self.glyph_mempool
+        if not gm:
+            return
+        try:
+            pairs = gm.get_touched_balance_and_clear()
+        except Exception:
+            return
+        subs = self.subscriptions
+        if not subs or not pairs or not subs.balance_subs:
+            return
+        gi = gm.glyph_index
+        for hashX, ref in pairs:
+            try:
+                delta = gm.get_unconfirmed_glyph_balance(hashX, ref)
+                confirmed = gi.get_balance(hashX, ref) if gi is not None else 0
+                await subs.notify_balance_change(hashX, ref, confirmed + delta, delta)
+            except Exception:
+                self.logger.debug('glyph balance notify failed', exc_info=True)
 
     async def _process_mempool(self, all_hashes, touched, mempool_height):
         # Re-sync with the new set of hashes
@@ -271,6 +312,12 @@ class MemPool(object):
         # First handle txs that have disappeared
         for tx_hash in set(txs).difference(all_hashes):
             tx = txs.pop(tx_hash)
+            # Drop any Glyph balance movements this tx contributed.
+            if self.glyph_mempool:
+                try:
+                    self.glyph_mempool.remove_tx(tx_hash)
+                except Exception:
+                    self.logger.exception('mempool glyph remove failed')
             tx_hashXs = set(hashX for hashX, value in tx.in_pairs)
             tx_hashXs.update(hashX for hashX, value in tx.out_pairs)
             tx_hashXs.update(ref_hash for ref_hashes in tx.out_srefs for ref_hash in ref_hashes)

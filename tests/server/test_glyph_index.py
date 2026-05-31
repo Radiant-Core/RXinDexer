@@ -1410,6 +1410,7 @@ class TestSyncBurnDeactivation:
 
     def _make_manager(self):
         """Create a minimal DMintContractsManager for testing."""
+        import os
         from electrumx.server.dmint_contracts import DMintContractsManager
         mgr = DMintContractsManager.__new__(DMintContractsManager)
         mgr.contracts = []
@@ -1423,6 +1424,11 @@ class TestSyncBurnDeactivation:
         mgr.ALGO_K12 = 2
         mgr.ALGORITHM_NAMES = {0: 'sha256d', 1: 'blake3', 2: 'k12'}
         mgr.DAA_MODE_NAMES = {0: 'Fixed', 1: 'Epoch', 2: 'ASERT', 3: 'LWMA'}
+        # Denylist state normally set by __init__ (bypassed here via __new__).
+        # The file does not exist under data_dir, so _load_denylist() is a no-op.
+        mgr.denylist_path = os.path.join(mgr.data_dir, 'dmint_denylist.json')
+        mgr._denylist = set()
+        mgr._denylist_mtime = -1.0
         return mgr
 
     def test_sync_deactivates_burned_contract(self):

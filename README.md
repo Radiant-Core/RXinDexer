@@ -142,7 +142,8 @@ Configure `.env`:
 # Your Radiant Core RPC credentials
 DAEMON_URL=http://YOUR_RPC_USER:YOUR_RPC_PASSWORD@localhost:7332/
 
-# Network
+# Network — keep COIN=Radiant and pick the network with NET:
+#   NET=mainnet | testnet | scalingtest | regtest
 COIN=Radiant
 NET=mainnet
 

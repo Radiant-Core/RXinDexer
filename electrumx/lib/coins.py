@@ -225,6 +225,13 @@ class RadiantTestnetMixin:
     # returns "unknown method". The mixin precedes Coin in each variant's MRO,
     # so this attribute wins over Coin.SESSIONCLS.
     SESSIONCLS = RadiantElectrumX
+    # All Radiant networks share NAME="Radiant" and are distinguished by NET
+    # (mainnet/testnet/scalingtest/regtest). This matches the ElectrumX
+    # convention so operators select a network by setting NET alone, e.g.
+    # `COIN=Radiant NET=testnet` — the way every shipped compose file templates
+    # it (COIN=${COIN:-Radiant} NET=${NET:-mainnet}). Each (NAME, NET) pair is
+    # unique, so Coin.lookup_coin_class resolves the right variant.
+    NAME = "Radiant"
     SHORTNAME = "XTN"
     NET = "testnet"
     P2PKH_VERBYTE = bytes.fromhex("6f")  # 111
@@ -238,8 +245,7 @@ class RadiantTestnetMixin:
 
 
 class RadiantTestnet(RadiantTestnetMixin, Coin):
-    """Radiant Testnet (current) - RPC port 27332"""
-    NAME = "RadiantTestnet"
+    """Radiant Testnet (current) - RPC port 27332. NAME=Radiant, NET=testnet."""
     GENESIS_HASH = ('000000000d8ada264d16f87a590b2af3'
                     '20cd3c7e3f9be5482163e830fd00aca2')
     PEERS = []
@@ -248,8 +254,7 @@ class RadiantTestnet(RadiantTestnetMixin, Coin):
 
 
 class RadiantScalingTestnet(RadiantTestnetMixin, Coin):
-    """Radiant Scaling Testnet - RPC port 37332"""
-    NAME = "RadiantScalingTestnet"
+    """Radiant Scaling Testnet - RPC port 37332. NAME=Radiant, NET=scalingtest."""
     NET = "scalingtest"
     GENESIS_HASH = ('00000000ea7340a6e9ae28ad8ca95a65'
                     '2c8da00ee7ea97e6cb42cd1558884c87')
@@ -268,8 +273,7 @@ class RadiantScalingTestnet(RadiantTestnetMixin, Coin):
 
 
 class RadiantRegtest(RadiantTestnetMixin, Coin):
-    """Radiant Regtest - RPC port 17443"""
-    NAME = "RadiantRegtest"
+    """Radiant Regtest - RPC port 17443. NAME=Radiant, NET=regtest."""
     NET = "regtest"
     GENESIS_HASH = ('7c1797514a165b0d99953a993a2a4208'
                     '1d6c0706026c36c06fc6fe728f93a5dd')

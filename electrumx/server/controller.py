@@ -121,7 +121,8 @@ class Controller(ServerBase):
             notifications.lookup_utxos = db.lookup_utxos
             MemPoolAPI.register(Notifications)
             mempool = MemPool(env.coin, notifications, env=env,
-                              glyph_index=bp.glyph_index, swap_index=bp.swap_index)
+                              glyph_index=bp.glyph_index, swap_index=bp.swap_index,
+                              subscriptions=bp.subscriptions)
 
             async def run_rest_api():
                 if not rest_enabled:
