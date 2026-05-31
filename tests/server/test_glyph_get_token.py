@@ -196,7 +196,9 @@ def test_get_by_ref_bad_length():
 
 def test_get_by_ref_bad_hex():
     res = run(FakeSession().glyph_get_by_ref("zz" * 36))  # 72 chars, not hex
-    assert res == {"error": "Invalid hex in ref"}
+    # get_by_ref now accepts both 72-hex and txid_vout, so unparseable input
+    # returns the unified format error.
+    assert res == {"error": "Invalid ref format. Expected 72 hex chars or txid_vout"}
 
 
 def test_get_by_ref_indexing_disabled():
