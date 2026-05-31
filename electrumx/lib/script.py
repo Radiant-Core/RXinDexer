@@ -433,35 +433,88 @@ class Script(object):
         return script
 
     @classmethod
+    def _walk_ops(cls, script):
+        '''Yield (opcode, data_len, op_start, op_end) for each opcode in the
+        script, consuming push operands and 36-byte input-ref operands so that
+        operand bytes are never mis-parsed as opcodes. Raises on truncation.'''
+        ops = []
+        n = 0
+        length = len(script)
+        while n < length:
+            start = n
+            op = script[n]
+            n += 1
+            if op <= OpCodes.OP_PUSHDATA4:
+                if op < OpCodes.OP_PUSHDATA1:
+                    dlen = op
+                elif op == OpCodes.OP_PUSHDATA1:
+                    dlen = script[n]; n += 1
+                elif op == OpCodes.OP_PUSHDATA2:
+                    dlen, = unpack_le_uint16_from(script[n:n + 2]); n += 2
+                else:
+                    dlen, = unpack_le_uint32_from(script[n:n + 4]); n += 4
+                n += dlen
+                if n > length:
+                    raise IndexError('truncated push')
+                ops.append((op, dlen, start, n))
+            elif op in INPUT_REF_OPS:
+                n += 36
+                if n > length:
+                    raise IndexError('truncated ref')
+                ops.append((op, 36, start, n))
+            else:
+                ops.append((op, 0, start, n))
+        return ops
+
+    @classmethod
     def base_locking_script(cls, script):
-        '''Return the base locking script with any leading Radiant input-ref
-        commitment preamble removed.
+        '''Return the owner's base locking script (the spendable P2PKH/P2SH)
+        embedded in a Radiant token output.
 
-        Radiant token outputs prepend a "ref preamble" to an otherwise standard
-        locking script, e.g. an NFT pays to:
+        Token scripts wrap a standard pay-to-address with Glyph/token machinery,
+        and the address sits in different places depending on the contract:
 
-            OP_PUSHINPUTREFSINGLETON <36-byte ref> OP_DROP <P2PKH ...>
+            NFT:  OP_PUSHINPUTREFSINGLETON <ref> OP_DROP <P2PKH>      (address last)
+            FT:   <P2PKH> OP_STATESEPARATOR OP_PUSHINPUTREF <ref> ...  (address first)
 
         For per-address ownership we want the hashX/scripthash of the underlying
-        address (the ``<P2PKH ...>`` tail), so that a wallet can look up the
-        tokens it holds using its normal address scripthash.  This strips the
-        leading run of input-ref ops (each followed by a 36-byte operand) and
-        the OP_DROP/OP_2DROP ops that consume them, returning the remainder.
-
-        For a plain (non-token) script there is no preamble, so the script is
-        returned unchanged.  Used together with ``hashX_from_script`` to derive
-        the recipient's base-address hashX.  Symmetry of credit/debit accounting
-        does not depend on this being a "clean" address for exotic scripts: the
-        value is computed once at output creation and read back verbatim when
-        the output is spent.
+        address so a wallet can list the tokens it holds using its normal address
+        scripthash. We therefore locate the standard P2PKH (or P2SH) template
+        wherever it appears — walking opcodes so ref/data bytes can't produce a
+        false match — and return just that sub-script. Falls back to stripping a
+        leading input-ref preamble (and then the whole script) for exotic
+        non-standard scripts; credit/debit symmetry only needs the value to be
+        computed identically at create and spend time (the b'rb' side table
+        stores it verbatim).
         '''
+        try:
+            ops = cls._walk_ops(script)
+        except Exception:
+            return script
+
+        # P2PKH: OP_DUP OP_HASH160 <push20> OP_EQUALVERIFY OP_CHECKSIG
+        for i in range(len(ops) - 4):
+            if (ops[i][0] == OpCodes.OP_DUP
+                    and ops[i + 1][0] == OpCodes.OP_HASH160
+                    and ops[i + 2][0] == 0x14 and ops[i + 2][1] == 20
+                    and ops[i + 3][0] == OpCodes.OP_EQUALVERIFY
+                    and ops[i + 4][0] == OpCodes.OP_CHECKSIG):
+                return script[ops[i][2]:ops[i + 4][3]]
+        # P2SH: OP_HASH160 <push20> OP_EQUAL
+        for i in range(len(ops) - 2):
+            if (ops[i][0] == OpCodes.OP_HASH160
+                    and ops[i + 1][0] == 0x14 and ops[i + 1][1] == 20
+                    and ops[i + 2][0] == OpCodes.OP_EQUAL):
+                return script[ops[i][2]:ops[i + 2][3]]
+
+        # Fallback: strip a leading input-ref preamble (+ DROP/2DROP), then
+        # return the remainder (or the whole script if nothing remains).
         try:
             n = 0
             length = len(script)
             while n < length:
                 op = script[n]
                 if op in INPUT_REF_OPS:
-                    # ref op + 36-byte operand
                     if n + 1 + 36 > length:
                         break
                     n += 1 + 36
@@ -470,7 +523,6 @@ class Script(object):
                 else:
                     break
             remainder = script[n:]
-            # Guard against a script that is nothing but a ref preamble.
             return remainder if remainder else script
         except Exception:
             return script

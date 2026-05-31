@@ -222,6 +222,23 @@ def test_glyphs_summary_total_is_o1_and_paginates():
     assert page2['tokens'][0]['ref_hex'] != out['tokens'][0]['ref_hex']
 
 
+def test_base_locking_script_extracts_p2pkh_for_ft_and_nft():
+    """base_locking_script must return the owner P2PKH regardless of where it
+    sits — at the end (NFT, after a ref preamble) or the front (FT, before a
+    state separator + covenant). Otherwise FTs are keyed by the wrong hashX and
+    a wallet can't find them by its address scripthash."""
+    from electrumx.lib.script import Script, ScriptPubKey, OpCodes
+    h160 = bytes(range(20))
+    p2pkh = ScriptPubKey.P2PKH_script(h160)
+    # NFT: OP_PUSHINPUTREFSINGLETON <ref> OP_DROP <P2PKH>
+    nft = bytes([0xd8]) + bytes(36) + bytes([OpCodes.OP_DROP]) + p2pkh
+    # FT: <P2PKH> OP_STATESEPARATOR OP_PUSHINPUTREF <ref> <covenant…>
+    ft = p2pkh + bytes([0xbd, 0xd0]) + bytes(36) + bytes([0xc0, 0xc1, 0x76, 0xa8, 0x88])
+    assert Script.base_locking_script(nft) == p2pkh
+    assert Script.base_locking_script(ft) == p2pkh
+    assert Script.base_locking_script(p2pkh) == p2pkh  # plain script unchanged
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
