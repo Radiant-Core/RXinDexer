@@ -114,9 +114,10 @@ def test_analytics_process_block_updates_summaries():
     assert top["rows"][0]["address"] == addr_two
     assert top["rows"][0]["balance"] == 20 * env.coin.VALUE_PER_COIN
 
+    # get_balance_distribution() returns {bucket: {"count": N, "amount": sats}}.
     distribution = idx.get_balance_distribution()
-    assert distribution["10-100"] == 1
-    assert distribution["1-10"] == 1
+    assert distribution["10-100"]["count"] == 1
+    assert distribution["1-10"]["count"] == 1
 
     aging = idx.get_supply_aging()
     assert aging["<1d"] == 22 * env.coin.VALUE_PER_COIN

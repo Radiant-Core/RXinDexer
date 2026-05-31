@@ -87,16 +87,31 @@ def test_DAEMON_URL():
 
 
 def test_COIN_NET():
-    '''Test COIN and NET defaults and redirection.'''
+    '''COIN/NET selection across the Radiant coin classes.
+
+    All Radiant networks share NAME="Radiant" and are distinguished by NET, per
+    the ElectrumX convention. A network is therefore selected by setting NET
+    alone (COIN stays "Radiant") — which is how the shipped compose files
+    template it: COIN=${COIN:-Radiant} NET=${NET:-mainnet}.
+    '''
     setup_base_env()
     e = Env()
-    assert e.coin == lib_coins.Radiant
+    assert e.coin == lib_coins.Radiant  # default NET=mainnet
+
+    os.environ['NET'] = 'mainnet'
+    assert Env().coin == lib_coins.Radiant
+
+    # NET redirects to each variant without changing COIN.
     os.environ['NET'] = 'testnet'
-    e = Env()
-    assert e.coin == lib_coins.RadiantTestnet
+    assert Env().coin == lib_coins.RadiantTestnet
+    os.environ['NET'] = 'scalingtest'
+    assert Env().coin == lib_coins.RadiantScalingTestnet
+    os.environ['NET'] = 'regtest'
+    assert Env().coin == lib_coins.RadiantRegtest
+
+    # NET is stripped of surrounding whitespace.
     os.environ['NET'] = ' testnet '
-    e = Env()
-    assert e.coin == lib_coins.RadiantTestnet
+    assert Env().coin == lib_coins.RadiantTestnet
 
 
 def test_CACHE_MB():
@@ -117,11 +132,16 @@ def test_SERVICES():
     ]
 
 def test_SERVICES_default_rpc():
+    # Reset to the base env first; this test sets only SERVICES and otherwise
+    # relies on the required vars (DB_DIRECTORY etc.) being present. Without
+    # this it depends on environment left over from a prior test.
+    setup_base_env()
     # This has a blank entry between commas
     os.environ['SERVICES'] = 'rpc://foo.bar'
     e = Env()
     assert e.services[0].host == 'foo.bar'
-    assert e.services[0].port == 8000
+    # Fork default RPC port (env.py services_to_run): 8001.
+    assert e.services[0].port == 8001
     os.environ['SERVICES'] = 'rpc://:800'
     e = Env()
     assert e.services[0].host == 'localhost'
@@ -129,7 +149,7 @@ def test_SERVICES_default_rpc():
     os.environ['SERVICES'] = 'rpc://'
     e = Env()
     assert e.services[0].host == 'localhost'
-    assert e.services[0].port == 8000
+    assert e.services[0].port == 8001
 
 
 def test_bad_SERVICES():
@@ -232,19 +252,23 @@ def test_REORG_LIMIT():
 
 
 def test_COST_HARD_LIMIT():
-    assert_integer('COST_HARD_LIMIT', 'cost_hard_limit', 10000)
+    # Fork default (env.py): COST_HARD_LIMIT=100000.
+    assert_integer('COST_HARD_LIMIT', 'cost_hard_limit', 100000)
 
 
 def test_COST_SOFT_LIMIT():
-    assert_integer('COST_SOFT_LIMIT', 'cost_soft_limit', 1000)
+    # Fork default (env.py): COST_SOFT_LIMIT=10000.
+    assert_integer('COST_SOFT_LIMIT', 'cost_soft_limit', 10000)
 
 
 def test_INITIAL_CONCURRENT():
-    assert_integer('INITIAL_CONCURRENT', 'initial_concurrent', 10)
+    # Fork default (env.py): INITIAL_CONCURRENT=50.
+    assert_integer('INITIAL_CONCURRENT', 'initial_concurrent', 50)
 
 
 def test_REQUEST_SLEEP():
-    assert_integer('REQUEST_SLEEP', 'request_sleep', 2500)
+    # Fork default (env.py): REQUEST_SLEEP=500.
+    assert_integer('REQUEST_SLEEP', 'request_sleep', 500)
 
 
 def test_BANDWIDTH_UNIT_COST():
@@ -256,7 +280,8 @@ def test_DONATION_ADDRESS():
 
 
 def test_DB_ENGINE():
-    assert_default('DB_ENGINE', 'db_engine', 'leveldb')
+    # Fork default (env.py): DB_ENGINE=rocksdb.
+    assert_default('DB_ENGINE', 'db_engine', 'rocksdb')
 
 
 def test_MAX_SEND():
@@ -273,7 +298,15 @@ def test_LOG_LEVEL():
 
 
 def test_MAX_SESSIONS():
-    too_big = 1000000
+    # sane_max_sessions() caps MAX_SESSIONS at (RLIMIT_NOFILE - 350). Derive the
+    # test value from the actual open-file limit so it always exceeds the cap
+    # and must be lowered — RLIMIT_NOFILE varies by host (~1024 on CI Linux,
+    # ~1048576 on macOS), which is why a fixed 1_000_000 was host-dependent.
+    import resource
+    nofile = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if nofile < 0 or nofile > 10 ** 12:
+        pytest.skip('open-file limit effectively unbounded; session cap cannot trigger')
+    too_big = nofile + 1000
     os.environ['MAX_SESSIONS'] = str(too_big)
     e = Env()
     assert e.max_sessions < too_big

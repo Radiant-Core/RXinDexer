@@ -128,6 +128,11 @@ async def run_test(db_dir):
     check_written(history, histories)
 
 def test_compaction(tmpdir):
+    # The default DB_ENGINE is rocksdb; its native module is optional and not
+    # present in every dev environment (CI installs librocksdb-dev). Skip
+    # cleanly rather than erroring at collection/run time when it's absent.
+    import pytest
+    pytest.importorskip('rocksdb')
     db_dir = str(tmpdir)
     print('Temp dir: {}'.format(db_dir))
     loop = asyncio.get_event_loop()

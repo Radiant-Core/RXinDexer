@@ -9,20 +9,24 @@ from aiorpcx import (
     JSONRPCv1, JSONRPCLoose, RPCError, ignore_after,
     Request, Batch,
 )
-from electrumx.lib.coins import Bitcoin, CoinError
+# This fork ships only the Radiant coin family (no Bitcoin class). Radiant
+# inherits the generic Daemon/DESERIALIZER from the base Coin, so these
+# coin-agnostic daemon tests run against it unchanged.
+from electrumx.lib.coins import Radiant as coin_cls, CoinError
 from electrumx.server.daemon import Daemon, DaemonError
 
 
-coin = Bitcoin
+coin = coin_cls
 
-# These should be full, canonical URLs
-urls = ['http://rpc_user:rpc_pass@127.0.0.1:8332/',
-        'http://rpc_user:rpc_pass@192.168.0.1:8332/']
+# These should be full, canonical URLs. Port matches coin.RPC_PORT (Radiant
+# = 7332) so the "no explicit port" cases below re-derive the same URL.
+urls = ['http://rpc_user:rpc_pass@127.0.0.1:7332/',
+        'http://rpc_user:rpc_pass@192.168.0.1:7332/']
 
 
 @pytest.fixture
 def daemon():
-    return coin.DAEMON(Bitcoin, ','.join(urls))
+    return coin.DAEMON(coin_cls, ','.join(urls))
 
 
 class ResponseBase(object):
@@ -157,7 +161,7 @@ async def test_set_urls_one(caplog):
         assert daemon.current_url() == urls[0]
         assert len(daemon.urls) == 1
         logged_url = daemon.logged_url()
-        assert logged_url == '127.0.0.1:8332/'
+        assert logged_url == '127.0.0.1:7332/'
         assert in_caplog(caplog, f'daemon #1 at {logged_url} (current)')
 
 
@@ -168,9 +172,9 @@ async def test_set_urls_two(caplog):
         assert daemon.current_url() == urls[0]
         assert len(daemon.urls) == 2
         logged_url = daemon.logged_url()
-        assert logged_url == '127.0.0.1:8332/'
+        assert logged_url == '127.0.0.1:7332/'
         assert in_caplog(caplog, f'daemon #1 at {logged_url} (current)')
-        assert in_caplog(caplog, 'daemon #2 at 192.168.0.1:8332')
+        assert in_caplog(caplog, 'daemon #2 at 192.168.0.1:7332')
 
 
 @pytest.mark.asyncio
