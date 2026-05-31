@@ -1,3 +1,4 @@
+import heapq
 import json
 import struct
 from collections import defaultdict
@@ -492,25 +493,46 @@ class AnalyticsIndex:
         return self._get_summary(AnalyticsDBKeys.SUMMARY + b'age_distribution', {label: 0 for _, label in AGE_BUCKETS})
 
     def get_top_addresses(self, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
-        rows = []
+        """Rich list (top RXD balances).
+
+        A global top-N is inherently a scan of the balance keyspace, but we keep
+        it cheap: a single *sequential* iteration feeding a bounded min-heap of
+        size ``offset+limit`` (so memory is O(page), not O(all addresses)), and
+        we resolve the display address only for the returned page rather than
+        doing a random DB read per address (the previous version's timeout
+        cause). Result is cached by the REST layer.
+        """
         prefix = AnalyticsDBKeys.BALANCE
+        need = offset + limit
+        heap = []  # min-heap of (amount, hashX); smallest of the top-`need` at root
+        total = 0
         for key, raw in self.db.utxo_db.iterator(prefix=prefix):
             amount = struct.unpack('<Q', raw)[0]
             if amount <= 0:
                 continue
-            hashX = key[2:]
+            total += 1
+            if need <= 0:
+                continue
+            entry = (amount, key[2:])
+            if len(heap) < need:
+                heapq.heappush(heap, entry)
+            elif amount > heap[0][0]:
+                heapq.heapreplace(heap, entry)
+
+        top = sorted(heap, key=lambda t: t[0], reverse=True)[offset:offset + limit]
+        rows = []
+        for amount, hashX in top:
             display = self.db.utxo_db.get(self._display_key(hashX))
             rows.append({
                 'hashX': hashX.hex(),
                 'address': display.decode() if display else hashX.hex(),
                 'balance': amount,
             })
-        rows.sort(key=lambda item: item['balance'], reverse=True)
         return {
-            'total': len(rows),
+            'total': total,
             'limit': limit,
             'offset': offset,
-            'rows': rows[offset:offset + limit],
+            'rows': rows,
         }
 
     def get_movement(self, days: int = 30) -> Dict[str, Any]:

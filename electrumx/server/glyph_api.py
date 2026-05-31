@@ -161,21 +161,21 @@ class GlyphAPIMixin:
         Get the indexed Glyph token for a 36-byte reference.
 
         Args:
-            ref: 36-byte reference in hex (72 characters) — txid(32, internal
-                 byte order) + vout(4, little-endian), i.e. a packed ref.
+            ref: token reference, either as 72 hex chars (txid internal-order +
+                 little-endian vout) or the display ``txid_vout`` form.
 
         Returns:
-            The token record dict, or None if no token is indexed for this ref.
+            The token record dict (including a resolvable ``owner`` for
+            single-holder tokens and a ``holder_count``), or None if no token is
+            indexed for this ref.
         """
         self.bump_cost(2.0)
 
-        if len(ref) != 72:
-            return {'error': 'Invalid ref format. Expected 72 hex characters'}
-
+        from electrumx.server.glyph_index import parse_ref_any
         try:
-            ref_bytes = bytes.fromhex(ref)
-        except ValueError:
-            return {'error': 'Invalid hex in ref'}
+            ref_bytes = parse_ref_any(ref)
+        except Exception:
+            return {'error': 'Invalid ref format. Expected 72 hex chars or txid_vout'}
 
         if not getattr(self, 'glyph_index', None):
             return {'error': 'Glyph indexing not enabled'}
@@ -188,7 +188,20 @@ class GlyphAPIMixin:
         if not token:
             return None
 
-        return to_jsonsafe(self.glyph_index._token_to_dict(token))
+        record = self.glyph_index._token_to_dict(token)
+        # Attach a resolvable current owner for the marketplace/provenance layer.
+        # Well-defined for single-holder tokens (NFTs); for multi-holder FTs the
+        # caller should use /tokens/{ref}/holders instead.
+        try:
+            holders = self.glyph_index.get_token_holders(ref_bytes, limit=2)
+            hs = holders.get('holders', [])
+            record['holder_count'] = len(hs)
+            record['owner'] = hs[0] if len(hs) == 1 else None
+        except Exception:
+            record['holder_count'] = None
+            record['owner'] = None
+
+        return to_jsonsafe(record)
 
     async def glyph_validate_protocols(self, protocols: list):
         """
@@ -376,10 +389,9 @@ class GlyphAPIMixin:
         
         try:
             scripthash_bytes = bytes.fromhex(scripthash)
-            txid, vout = parse_ref(ref)
-            from electrumx.server.glyph_index import pack_ref
-            ref_bytes = pack_ref(hex_str_to_hash(txid), vout)
-            
+            from electrumx.server.glyph_index import parse_ref_any
+            ref_bytes = parse_ref_any(ref)  # accepts txid_vout or 72-hex
+
             balance = self.glyph_index.get_balance(scripthash_bytes, ref_bytes)
             return {'confirmed': balance, 'unconfirmed': 0}
         except Exception as e:
