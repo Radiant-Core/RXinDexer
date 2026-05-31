@@ -695,9 +695,13 @@ class BlockProcessor:
                 # The base hashX is persisted per-outpoint (b'rb' + outpoint) so
                 # the matching debit can be applied symmetrically on spend.
                 if self.glyph_index and all_refs_dedup:
-                    base_hashX = script_hashX(Script.base_locking_script(txout.pk_script))
+                    base_script = Script.base_locking_script(txout.pk_script)
+                    base_hashX = script_hashX(base_script)
                     put_data(b'rb' + cache_key, base_hashX)
-                    balance_credits.append((base_hashX, txout.value, list(all_refs_dedup.keys())))
+                    # Carry base_script so the glyph index can persist a
+                    # resolvable owner identity (GO: hashX -> base scriptPubKey).
+                    balance_credits.append((base_hashX, txout.value,
+                                            list(all_refs_dedup.keys()), base_script))
 
             append_hashXs(hashXs)
             update_touched(hashXs)

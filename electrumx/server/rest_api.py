@@ -115,6 +115,46 @@ app.add_middleware(
 )
 
 
+# --- Ref / scripthash helpers (defined before any endpoint that references them
+#     as a default param value, since decorators evaluate at import time) -------
+
+# Accepts a ref in either canonical form (72-hex internal, or display txid_vout)
+# and returns the 36 raw key bytes. Length bounds cover both: 72-hex == 72 chars,
+# display == 64 + '_' + 1..10 decimal digits.
+_REF_PATH = Path(..., min_length=66, max_length=80,
+                 description="Token ref — 72-hex (internal) or txid_vout form")
+
+
+def _parse_ref(ref: str) -> bytes:
+    """Parse a path ref in either supported form, or raise HTTP 400."""
+    from electrumx.server.glyph_index import parse_ref_any
+    try:
+        return parse_ref_any(ref)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+
+
+def _resolve_scripthash(ident: str) -> bytes:
+    """Resolve an ownership identifier to a 32-byte Electrum scripthash.
+
+    Accepts either a 64-hex Electrum scripthash (as a wallet computes and as
+    ``blockchain.scripthash.*`` uses) or a base58 address. Raises ValueError on
+    anything else.
+    """
+    from electrumx.lib.hash import sha256
+    s = ident.strip()
+    if len(s) == 64:
+        try:
+            return bytes.fromhex(s)
+        except ValueError:
+            pass
+    coin = getattr(getattr(_glyph_index, 'env', None), 'coin', None)
+    if coin is None:
+        raise ValueError('coin unavailable')
+    # base58 address -> Electrum scripthash (sha256(scriptPubKey) reversed)
+    return sha256(coin.pay_to_address_script(s))[::-1]
+
+
 def _require_api_key(x_api_key: Optional[str] = Header(default=None, alias='X-API-Key')):
     required_key = os.getenv('REST_API_KEY', '').strip()
     if not required_key:
@@ -473,11 +513,12 @@ async def get_block(height: int = Path(..., ge=0)):
 
 
 @app.get("/dmint/contracts/{ref}/icon-debug", tags=["dMint"])
-async def get_dmint_contract_icon_debug(ref: str = Path(..., min_length=72, max_length=72)):
+async def get_dmint_contract_icon_debug(ref: str = _REF_PATH):
     """Debug helper: inspect icon fields for a specific dMint contract."""
     _ensure_dmint()
 
     try:
+        ref = _parse_ref(ref).hex()  # accept 72-hex or txid_vout; normalize
         contract = _dmint_contracts.get_contract(ref)
         if not contract:
             raise HTTPException(status_code=404, detail="Contract not found")
@@ -583,12 +624,12 @@ async def get_glyphs_by_type(
 
 
 @app.get("/glyphs/{ref}", tags=["Glyphs"])
-async def get_glyph(ref: str = Path(..., min_length=72, max_length=72)):
+async def get_glyph(ref: str = _REF_PATH):
     """Get Glyph token by reference (72 hex chars = 36 bytes)."""
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         token = _glyph_index.get_token(ref_bytes)
         if not token:
             raise HTTPException(status_code=404, detail="Token not found")
@@ -604,7 +645,7 @@ async def get_glyph(ref: str = Path(..., min_length=72, max_length=72)):
 
 @app.get("/tokens/{ref}/holders", tags=["Token Analytics"])
 async def get_token_holders(
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
     limit: int = Query(default=100, le=500),
     cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
 ):
@@ -612,7 +653,7 @@ async def get_token_holders(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         return _glyph_index.get_token_holders(ref_bytes, limit=limit, cursor=cursor)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -620,13 +661,38 @@ async def get_token_holders(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/addresses/{ident}/glyphs", tags=["Ownership"])
+async def get_address_glyphs(
+    ident: str = Path(..., min_length=1, max_length=128,
+                      description="Electrum scripthash (64 hex) or base58 address"),
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Forward ownership: Glyph tokens (FT + NFT) held by an address.
+
+    This is the REST equivalent of the ElectrumX ``glyph.list_tokens`` method the
+    game/wallet uses. ``ident`` may be a 64-hex Electrum scripthash (what a wallet
+    computes from its address) or a base58 address. Refs are returned in canonical
+    ``txid_vout`` form.
+    """
+    _ensure_glyph_index()
+    try:
+        sh = _resolve_scripthash(ident)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid scripthash or address")
+    try:
+        return _glyph_index.get_balances_for_scripthash(sh, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/tokens/{ref}/supply", tags=["Token Analytics"])
-async def get_token_supply(ref: str = Path(..., min_length=72, max_length=72)):
+async def get_token_supply(ref: str = _REF_PATH):
     """Get detailed token supply information."""
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         result = _glyph_index.get_token_supply(ref_bytes)
         if not result:
             raise HTTPException(status_code=404, detail="Token not found")
@@ -641,7 +707,7 @@ async def get_token_supply(ref: str = Path(..., min_length=72, max_length=72)):
 
 @app.get("/tokens/{ref}/burns", tags=["Token Analytics"])
 async def get_token_burns(
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0)
 ):
@@ -649,7 +715,7 @@ async def get_token_burns(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         return _glyph_index.get_token_burns(ref_bytes, limit=limit, offset=offset)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -659,7 +725,7 @@ async def get_token_burns(
 
 @app.get("/tokens/{ref}/trades", tags=["Token Analytics"])
 async def get_token_trades(
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0)
 ):
@@ -667,7 +733,7 @@ async def get_token_trades(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         return _glyph_index.get_token_trades(ref_bytes, limit=limit, offset=offset)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -677,14 +743,14 @@ async def get_token_trades(
 
 @app.get("/tokens/{ref}/top-holders", tags=["Token Analytics"])
 async def get_top_token_holders(
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
     limit: int = Query(default=100, le=500)
 ):
     """Get top token holders (rich list) for a specific token."""
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         return _glyph_index.get_top_holders(ref_bytes, limit=limit)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -694,7 +760,7 @@ async def get_top_token_holders(
 
 @app.get("/tokens/{ref}/history", tags=["Token Analytics"])
 async def get_token_history(
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
     limit: int = Query(default=100, le=500),
     offset: int = Query(default=0, ge=0),
     cursor: Optional[str] = Query(default=None),
@@ -709,7 +775,7 @@ async def get_token_history(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         if cursor is None:
             return _glyph_index.get_token_history(ref_bytes, limit=limit, offset=offset)
         return _glyph_index.get_token_history(
@@ -740,12 +806,12 @@ def _sanitize_cbor(obj):
 
 
 @app.get("/tokens/{ref}/metadata", tags=["Token Analytics"])
-async def get_token_metadata(ref: str = Path(..., min_length=72, max_length=72)):
+async def get_token_metadata(ref: str = _REF_PATH):
     """Get parsed CBOR metadata for a token."""
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         token = _glyph_index.get_token(ref_bytes)
         if not token:
             raise HTTPException(status_code=404, detail="Token not found")
@@ -790,7 +856,7 @@ async def list_encrypted_tokens(
 
 
 @app.get("/glyphs/{ref}/key-reveal", tags=["Encrypted"])
-async def get_key_reveal(ref: str = Path(..., min_length=72, max_length=72)):
+async def get_key_reveal(ref: str = _REF_PATH):
     """
     Get the CEK reveal record for a timelocked token.
 
@@ -799,7 +865,7 @@ async def get_key_reveal(ref: str = Path(..., min_length=72, max_length=72)):
     """
     _ensure_glyph_index()
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         result = _glyph_index.get_key_reveal(ref_bytes)
         if result is None:
             return {"revealed": False}
@@ -812,7 +878,7 @@ async def get_key_reveal(ref: str = Path(..., min_length=72, max_length=72)):
 
 @app.post("/glyphs/{ref}/key-reveal", tags=["Encrypted"])
 async def record_key_reveal(
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
     reveal_tx: str = Query(..., min_length=64, max_length=64, description="Reveal tx txid (64 hex)"),
     revealed_key: str = Query(..., min_length=64, max_length=64, description="CEK hex (64 hex = 32 bytes)"),
     reveal_height: int = Query(..., ge=0, description="Block height of reveal confirmation"),
@@ -828,7 +894,7 @@ async def record_key_reveal(
         import hashlib
         import time as _time
 
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         cek_bytes = bytes.fromhex(revealed_key)
 
         # Verify CEK hash matches on-chain commitment
@@ -930,11 +996,12 @@ async def get_dmint_contracts(
 
 
 @app.get("/dmint/contracts/{ref}", tags=["dMint"])
-async def get_dmint_contract(ref: str = Path(..., min_length=72, max_length=72)):
+async def get_dmint_contract(ref: str = _REF_PATH):
     """Get details for a specific dMint contract."""
     _ensure_dmint()
 
     try:
+        ref = _parse_ref(ref).hex()  # accept 72-hex or txid_vout; normalize
         contract = _dmint_contracts.get_contract(ref)
         if not contract:
             raise HTTPException(status_code=404, detail="Contract not found")
@@ -1031,12 +1098,13 @@ async def get_dmint_stats():
 
 @app.get("/dmint/contracts/{ref}/daa", tags=["dMint"])
 async def get_dmint_contract_daa(
-    ref: str = Path(..., min_length=72, max_length=72)
+    ref: str = _REF_PATH
 ):
     """Get DAA (Difficulty Adjustment Algorithm) configuration for a specific dMint contract."""
     _ensure_dmint()
 
     try:
+        ref = _parse_ref(ref).hex()  # accept 72-hex or txid_vout; normalize
         contract = _dmint_contracts.get_contract(ref)
         if not contract:
             raise HTTPException(status_code=404, detail="Contract not found")
@@ -1084,7 +1152,7 @@ async def get_dmint_contract_daa(
 
 @app.get("/dmint/contracts/{ref}/mints", tags=["dMint"])
 async def get_dmint_mint_history(
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
     limit: int = Query(default=100, le=500),
     offset: int = Query(default=0, ge=0),
 ):
@@ -1092,7 +1160,7 @@ async def get_dmint_mint_history(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         return _glyph_index.get_mint_history(ref_bytes, limit=limit, offset=offset)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -1467,7 +1535,7 @@ def _get_mempool_glyph():
 @app.get("/mempool/glyphs/balance/{scripthash}/{ref}", tags=["Mempool"])
 async def mempool_glyph_balance(
     scripthash: str = Path(..., min_length=64, max_length=64),
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
 ):
     """Get unconfirmed balance delta for a token at an address."""
     mp = _get_mempool_glyph()
@@ -1476,7 +1544,7 @@ async def mempool_glyph_balance(
 
     try:
         sh_bytes = bytes.fromhex(scripthash)
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         delta = mp.get_unconfirmed_glyph_balance(sh_bytes, ref_bytes)
         return {"scripthash": scripthash, "ref": ref, "unconfirmed_delta": delta}
     except ValueError:
@@ -1506,7 +1574,7 @@ async def mempool_glyph_txs(
 
 @app.get("/mempool/glyphs/token/{ref}", tags=["Mempool"])
 async def mempool_token_txs(
-    ref: str = Path(..., min_length=72, max_length=72),
+    ref: str = _REF_PATH,
 ):
     """Get unconfirmed transactions for a specific token."""
     mp = _get_mempool_glyph()
@@ -1514,7 +1582,7 @@ async def mempool_token_txs(
         raise HTTPException(status_code=503, detail="Mempool Glyph indexing not available")
 
     try:
-        ref_bytes = bytes.fromhex(ref)
+        ref_bytes = _parse_ref(ref)
         txs = mp.get_unconfirmed_token_txs(ref_bytes)
         return {"ref": ref, "txs": txs, "count": len(txs)}
     except ValueError:
