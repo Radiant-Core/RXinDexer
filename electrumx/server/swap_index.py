@@ -15,9 +15,9 @@ from typing import Optional, Dict, Any, List, Tuple
 from collections import defaultdict
 
 from electrumx.lib import util
-from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256
+from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256, Base58, Base58Error
 from electrumx.lib.util import pack_be_uint32, encode_undo, decode_undo
-from electrumx.lib.script import OpCodes
+from electrumx.lib.script import OpCodes, Script, ScriptError
 from electrumx.server.metrics import swap_parse_errors_total as _swap_parse_errors
 
 try:
@@ -415,11 +415,12 @@ class SwapIndex:
             return None
         offered_type = chunks[idx][0]
         idx += 1
-        
-        # Terms type
+
+        # Constant 0x01 marker (Photonic `buildSwapAdvertisementScript` emits a
+        # literal 0x01 push here — it is NOT a terms-type selector. The actual
+        # terms live in the priceTerms MultiTxOutV1 blob below.)
         if len(chunks[idx]) != 1:
             return None
-        terms_type = chunks[idx][0]
         idx += 1
         
         # Token ID (32 bytes)
@@ -458,13 +459,11 @@ class SwapIndex:
         remaining = chunks[idx:]
         if len(remaining) < 2:
             return None
-        
-        # Signature is last push
+
+        # Layout after utxoIndex is exactly: <priceTerms push> <signature push>.
+        price_terms_blob = remaining[0]
         signature = remaining[-1]
-        
-        # Price term pushes are all pushes before the signature
-        price_term_chunks = remaining[:-1]
-        
+
         # Build order
         order.order_id = utxo_hash + struct.pack('<I', utxo_index)
         order.base_ref = token_id + struct.pack('<I', 0)  # Token ref
@@ -472,11 +471,112 @@ class SwapIndex:
             order.quote_ref = want_token_id + struct.pack('<I', 0)
         order.side = OrderSide.SELL if offered_type == 1 else OrderSide.BUY
         order.status = OrderStatus.OPEN
-        
-        # Parse price/amount from price_term_chunks based on termsType
-        self._parse_price_terms(terms_type, price_term_chunks, order)
-        
+
+        # priceTerms is a MultiTxOutV1 blob: the exact payout outputs a taker
+        # must create to fill the order. Decode it for the requested amount and
+        # the resolvable maker (recipient of the payout).
+        self._apply_price_terms(price_terms_blob, order)
+
         return order
+
+    def _parse_multi_txout(self, blob: bytes):
+        """Decode an RSWP MultiTxOutV1 priceTerms blob.
+
+        Layout (see Photonic ``encodePriceTermsOutputs`` / ``parsePriceTerms``):
+            <CompactSize count> { <value: 8-byte LE> <CompactSize scriptLen> <script> }*count
+        Legacy fallback: a bare ``<value:8-LE><script:rest>`` single output.
+        Returns a list of ``(value:int, script:bytes)`` or ``None``.
+        """
+        if not blob:
+            return None
+
+        def read_compact(b, o):
+            n = b[o]
+            if n < 253:
+                return n, o + 1
+            if n == 253:
+                return struct.unpack_from('<H', b, o + 1)[0], o + 3
+            if n == 254:
+                return struct.unpack_from('<I', b, o + 1)[0], o + 5
+            return struct.unpack_from('<Q', b, o + 1)[0], o + 9
+
+        try:
+            outputs = []
+            o = 0
+            count, o = read_compact(blob, o)
+            if count <= 0 or count > 1000:
+                raise ValueError('bad count')
+            for _ in range(count):
+                if o + 8 > len(blob):
+                    raise ValueError('truncated value')
+                value = struct.unpack_from('<Q', blob, o)[0]
+                o += 8
+                slen, o = read_compact(blob, o)
+                if o + slen > len(blob):
+                    raise ValueError('truncated script')
+                outputs.append((value, blob[o:o + slen]))
+                o += slen
+            if o != len(blob) or not outputs:
+                raise ValueError('trailing bytes')
+            return outputs
+        except Exception:
+            # Legacy single-output fallback: value(8 LE) + rest = script
+            if len(blob) >= 9:
+                return [(struct.unpack_from('<Q', blob, 0)[0], blob[8:])]
+            return None
+
+    def _maker_from_script(self, script: bytes):
+        """Resolve a payout output script to (electrum_scripthash_32, address).
+
+        The maker is the recipient of the priceTerms payout; the script is a
+        p2pkh (RXD) or an ftScript (token) that embeds the maker P2PKH. Returns
+        (b'', None) if no standard address can be extracted.
+        """
+        try:
+            base = Script.base_locking_script(script)
+        except (ScriptError, Exception):
+            return b'', None
+        coin = getattr(self.env, 'coin', None)
+        # Standard templates: P2PKH (OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG) / P2SH
+        address = None
+        try:
+            if (len(base) == 25 and base[0] == OpCodes.OP_DUP
+                    and base[1] == OpCodes.OP_HASH160 and base[2] == 0x14
+                    and base[23] == OpCodes.OP_EQUALVERIFY and base[24] == OpCodes.OP_CHECKSIG):
+                if coin is not None:
+                    address = Base58.encode_check(coin.P2PKH_VERBYTE + base[3:23])
+            elif (len(base) == 23 and base[0] == OpCodes.OP_HASH160
+                    and base[1] == 0x14 and base[22] == OpCodes.OP_EQUAL):
+                if coin is not None:
+                    address = Base58.encode_check(coin.P2SH_VERBYTES[0] + base[2:22])
+            else:
+                return b'', None
+        except (Base58Error, Exception):
+            address = None
+        # Electrum scripthash convention: sha256(script) reversed.
+        return sha256(base)[::-1], address
+
+    def _apply_price_terms(self, price_terms_blob: bytes, order: SwapOrderInfo):
+        """Populate amount / price / maker from the priceTerms MultiTxOutV1 blob.
+
+        RSWP orders are fixed-payment swaps (offer this UTXO, pay me these exact
+        outputs), so there is no separate per-unit price: ``amount`` is the total
+        requested payout and ``price`` mirrors it. The maker is the recipient.
+        """
+        outputs = self._parse_multi_txout(price_terms_blob)
+        if not outputs:
+            return
+        total = sum(v for v, _ in outputs)
+        order.amount = total
+        order.remaining_amount = total
+        order.price = total
+        # Maker = recipient of the first standard payout output.
+        for _, out_script in outputs:
+            sh, addr = self._maker_from_script(out_script)
+            if sh:
+                order.maker_scripthash = sh
+                order.maker_address = addr
+                break
     
     def _parse_price_terms(self, terms_type: int, term_chunks: List[bytes],
                            order: SwapOrderInfo):
