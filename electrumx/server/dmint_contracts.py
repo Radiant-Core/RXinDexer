@@ -423,25 +423,53 @@ class DMintContractsManager:
                         existing[key] = value
                         changed = True
                 
-                # Check if fully mined.
-                # Use `or 0` rather than the dict.get default — when the
-                # key exists but is None (e.g. freshly-deployed contract
-                # with no mints, percent_mined unset), get() returns None
-                # which can't be compared to int and crashes the indexer.
-                if (token.get('percent_mined') or 0) >= 100:
-                    if existing.get('active', True):
+                # Recompute liveness from ground truth. `active` and
+                # `orphaned` must NOT be one-way latches: a contract present
+                # in the index this pass, with supply remaining and no burn,
+                # is mineable — even if a previous sync deactivated it (e.g.
+                # the orphan sweep below firing while the GlyphIndex was
+                # mid-resync and returned a partial token set). Without this
+                # reactivation, a single lagging-index pass permanently hid
+                # every live contract from the miner.
+                #
+                # Use `or 0` rather than the dict.get default — when the key
+                # exists but is None (e.g. a freshly-deployed contract with no
+                # mints) get() returns None, which can't be compared to int
+                # and would crash the indexer.
+                is_burned = bool(token.get('is_spent'))
+                pct = token.get('percent_mined')
+                pct = pct if pct is not None else existing.get('percent_mined', 0)
+                total_supply = token.get('total_supply', existing.get('total_supply', 0)) or 0
+                mined_supply = token.get('mined_supply', existing.get('mined_supply', 0)) or 0
+                supply_exhausted = (
+                    (pct or 0) >= 100
+                    or (total_supply > 0 and mined_supply >= total_supply)
+                )
+
+                if is_burned:
+                    # Contract singleton destroyed — permanently not mineable.
+                    if existing.get('active', True) or not existing.get('burned'):
                         existing['active'] = False
+                        existing['burned'] = True
                         changed = True
-                
-                # Check if burned (contract singleton destroyed)
-                if token.get('is_spent') and existing.get('active', True):
-                    existing['active'] = False
-                    existing['burned'] = True
-                    changed = True
-                    self.logger.info(
-                        f'Deactivated burned contract: {ref[:16]}... '
-                        f'({existing.get("ticker") or "unnamed"})'
-                    )
+                        self.logger.info(
+                            f'Deactivated burned contract: {ref[:16]}... '
+                            f'({existing.get("ticker") or "unnamed"})'
+                        )
+                else:
+                    desired_active = not supply_exhausted
+                    if bool(existing.get('active', True)) != desired_active:
+                        existing['active'] = desired_active
+                        changed = True
+                    # Back in the index — clear any stale orphan flag so the
+                    # contract self-heals after a resync that wrongly swept it.
+                    if existing.get('orphaned'):
+                        existing['orphaned'] = False
+                        changed = True
+                        self.logger.info(
+                            f'Reactivated contract seen in index: {ref[:16]}... '
+                            f'({existing.get("ticker") or "unnamed"})'
+                        )
                 
                 if changed:
                     updated += 1
@@ -483,18 +511,28 @@ class DMintContractsManager:
                     )
                     updated += 1
         
-        # Deactivate orphaned contracts not found in the index (e.g. after
-        # a reorg or if the token record was purged).
-        for contract in self.contracts:
-            cref = contract.get('ref', '')
-            if cref and cref not in index_refs and contract.get('active', True):
-                contract['active'] = False
-                contract['orphaned'] = True
-                updated += 1
-                self.logger.info(
-                    f'Deactivated orphaned contract: {cref[:16]}... '
-                    f'({contract.get("ticker") or "unnamed"})'
-                )
+        # Deactivate orphaned contracts not found in the index (e.g. after a
+        # reorg or if the token record was purged).
+        #
+        # Guard: only run the sweep when the index actually returned dMint
+        # tokens this pass. During an initial sync / resync the GlyphIndex can
+        # be mid-rebuild and return an empty set; treating that as "every
+        # contract is orphaned" permanently deactivated the entire listing in
+        # production (orphaned refs had no reactivation path). Requiring a
+        # non-empty index_refs keeps a lagging index from nuking live
+        # contracts; any transiently missing during a partial resync self-heal
+        # via the reactivation logic above once they reappear.
+        if index_refs:
+            for contract in self.contracts:
+                cref = contract.get('ref', '')
+                if cref and cref not in index_refs and contract.get('active', True):
+                    contract['active'] = False
+                    contract['orphaned'] = True
+                    updated += 1
+                    self.logger.info(
+                        f'Deactivated orphaned contract: {cref[:16]}... '
+                        f'({contract.get("ticker") or "unnamed"})'
+                    )
         
         if updated > 0:
             self.last_updated_height = height

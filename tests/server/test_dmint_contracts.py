@@ -153,6 +153,116 @@ def test_get_contracts_v2_rejects_invalid_status_filter(dmint_manager):
         )
 
 
+def _index_token(ref_internal: str, *, total_supply: int, mined_supply: int,
+                 percent_mined, is_spent: bool = False):
+    """Build a GlyphIndex dMint token as returned by get_tokens_by_type."""
+    return {
+        "ref": ref_internal,
+        "ticker": "LIVE",
+        "name": "Live Token",
+        "deploy_height": 100,
+        "total_supply": total_supply,
+        "mined_supply": mined_supply,
+        "percent_mined": percent_mined,
+        "is_spent": is_spent,
+        "dmint": {
+            "algorithm": 1,
+            "current_difficulty": 123,
+            "reward": 50,
+            "num_contracts": 1,
+            "daa_mode": 0,
+            "daa_mode_name": "Fixed",
+        },
+    }
+
+
+def test_sync_reactivates_orphaned_contract_still_in_index(tmp_path):
+    """Regression: a live contract wrongly orphaned by a past resync sweep
+    must be reactivated (and de-orphaned) when it reappears in the index, so
+    it is no longer hidden from the miner's `mineable` listing."""
+    glyph_index = Mock()
+    ref_internal = "a" * 64 + "_0"
+    ref_stored = "a" * 64 + "0"  # internal stored form (decimal vout)
+
+    # Simulate the production state: contract is only 5% mined but was latched
+    # inactive/orphaned by a previous orphan sweep, with no reactivation path.
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=glyph_index)
+    mgr.contracts = [{
+        "ref": ref_stored,
+        "outputs": 1,
+        "ticker": "LIVE",
+        "name": "Live Token",
+        "algorithm": 1,
+        "difficulty": 123,
+        "reward": 50,
+        "percent_mined": 5,
+        "active": False,
+        "orphaned": True,
+        "deploy_height": 100,
+        "daa_mode": 0,
+        "daa_mode_name": "Fixed",
+        "total_supply": 1000,
+        "mined_supply": 50,
+    }]
+
+    glyph_index.get_tokens_by_type.return_value = [
+        _index_token(ref_internal, total_supply=1000, mined_supply=50, percent_mined=5)
+    ]
+
+    mgr.sync_from_index(500)
+
+    c = mgr.contracts[0]
+    assert c["active"] is True
+    assert c.get("orphaned") is False
+
+    # It must now appear in the default `mineable` listing the miner uses.
+    response = mgr.get_contracts_v2({"version": 2, "view": "token_summary"})
+    assert response["count"] == 1
+    assert response["items"][0]["is_fully_mined"] is False
+
+
+def test_sync_does_not_orphan_when_index_returns_empty(tmp_path):
+    """Regression: an empty/lagging index pass (mid-resync) must not orphan
+    every live contract — that is the failure that blanked the miner."""
+    glyph_index = Mock()
+    glyph_index.get_tokens_by_type.return_value = []
+
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=glyph_index)
+    mgr.contracts = [_make_contract("a" * 72, "ALFA", algorithm=1, reward=300, deploy_height=10)]
+
+    mgr.sync_from_index(500)
+
+    c = mgr.contracts[0]
+    assert c.get("active", True) is True
+    assert c.get("orphaned") is not True
+
+
+def test_sync_still_orphans_missing_contract_when_index_populated(tmp_path):
+    """A contract genuinely absent from a populated index is still swept."""
+    glyph_index = Mock()
+    present_internal = "a" * 64 + "_0"
+    glyph_index.get_tokens_by_type.return_value = [
+        _index_token(present_internal, total_supply=1000, mined_supply=50, percent_mined=5)
+    ]
+
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=glyph_index)
+    mgr.contracts = [
+        {
+            "ref": "a" * 64 + "0",
+            "outputs": 1, "ticker": "LIVE", "name": "", "algorithm": 1,
+            "difficulty": 1, "reward": 1, "percent_mined": 5, "active": True,
+            "deploy_height": 100, "total_supply": 1000, "mined_supply": 50,
+        },
+        _make_contract("f" * 72, "GONE", algorithm=1, reward=1, deploy_height=11),
+    ]
+
+    mgr.sync_from_index(500)
+
+    gone = next(c for c in mgr.contracts if c["ticker"] == "GONE")
+    assert gone["active"] is False
+    assert gone["orphaned"] is True
+
+
 def test_sync_from_index_uses_icon_ref_when_remote_embed_absent(tmp_path):
     glyph_index = Mock()
     glyph_index.get_tokens_by_type.return_value = [
