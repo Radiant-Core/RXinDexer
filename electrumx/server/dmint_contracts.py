@@ -423,20 +423,21 @@ class DMintContractsManager:
                         existing[key] = value
                         changed = True
                 
-                # Recompute liveness from ground truth. `active` and
-                # `orphaned` must NOT be one-way latches: a contract present
-                # in the index this pass, with supply remaining and no burn,
-                # is mineable — even if a previous sync deactivated it (e.g.
-                # the orphan sweep below firing while the GlyphIndex was
-                # mid-resync and returned a partial token set). Without this
-                # reactivation, a single lagging-index pass permanently hid
-                # every live contract from the miner.
+                # Recompute liveness from ground truth each sync. `active`,
+                # `orphaned` and `burned` must NOT be one-way latches.
+                #
+                # Mineability of a dMint contract is decided by SUPPLY, never
+                # by the glyph token ref's `is_spent` flag. For dMint the
+                # immutable token ref (vout 0) is normally spent when the mining
+                # contracts are deployed from the genesis output, so `is_spent`
+                # is true for legitimately-mineable tokens (e.g. GRASS — 75.9%
+                # mined, genesis spent, still mineable). Treating is_spent as a
+                # burn wrongly hid every such token from the miner.
                 #
                 # Use `or 0` rather than the dict.get default — when the key
-                # exists but is None (e.g. a freshly-deployed contract with no
-                # mints) get() returns None, which can't be compared to int
-                # and would crash the indexer.
-                is_burned = bool(token.get('is_spent'))
+                # exists but is None (a freshly-deployed contract with no mints)
+                # get() returns None, which can't be compared to int and would
+                # crash the indexer.
                 pct = token.get('percent_mined')
                 pct = pct if pct is not None else existing.get('percent_mined', 0)
                 total_supply = token.get('total_supply', existing.get('total_supply', 0)) or 0
@@ -446,45 +447,44 @@ class DMintContractsManager:
                     or (total_supply > 0 and mined_supply >= total_supply)
                 )
 
-                if is_burned:
-                    # Contract singleton destroyed — permanently not mineable.
-                    if existing.get('active', True) or not existing.get('burned'):
-                        existing['active'] = False
-                        existing['burned'] = True
-                        changed = True
-                        self.logger.info(
-                            f'Deactivated burned contract: {ref[:16]}... '
-                            f'({existing.get("ticker") or "unnamed"})'
-                        )
-                else:
-                    desired_active = not supply_exhausted
-                    if bool(existing.get('active', True)) != desired_active:
-                        existing['active'] = desired_active
-                        changed = True
-                    # Back in the index — clear any stale orphan flag so the
-                    # contract self-heals after a resync that wrongly swept it.
-                    if existing.get('orphaned'):
-                        existing['orphaned'] = False
-                        changed = True
-                        self.logger.info(
-                            f'Reactivated contract seen in index: {ref[:16]}... '
-                            f'({existing.get("ticker") or "unnamed"})'
-                        )
-                
+                desired_active = not supply_exhausted
+                reactivated = False
+                if bool(existing.get('active', True)) != desired_active:
+                    existing['active'] = desired_active
+                    changed = True
+                    reactivated = desired_active
+                # Seen in the index with supply remaining: clear stale orphan /
+                # burned flags left by earlier (incorrect) is_spent-based
+                # deactivation so the contract self-heals.
+                if desired_active and existing.get('orphaned'):
+                    existing['orphaned'] = False
+                    changed = True
+                    reactivated = True
+                if desired_active and existing.get('burned'):
+                    existing['burned'] = False
+                    changed = True
+                    reactivated = True
+                if reactivated:
+                    self.logger.info(
+                        f'Reactivated mineable contract: {ref[:16]}... '
+                        f'({existing.get("ticker") or "unnamed"})'
+                    )
+
                 if changed:
                     updated += 1
             else:
-                # Skip burned tokens — don't add them to listings
-                if token.get('is_spent'):
-                    continue
-                
-                # Add new contract
+                # Add new contract. Do NOT skip on `is_spent`: for dMint the
+                # genesis/token ref is normally spent once the mining contracts
+                # are deployed, so is_spent is true for still-mineable tokens
+                # (e.g. GRASS). Inclusion is supply-based; fully-mined tokens are
+                # still added (they surface under status=finished) but marked
+                # inactive below.
                 # Need to get outputs count from contract data
                 outputs = token.get('dmint', {}).get('num_contracts', 1) or 1
-                
+
                 dmint = token.get('dmint', {})
                 icon_fields = self._extract_icon_fields(token)
-                
+
                 added = self.add_contract(
                     ref=ref,
                     outputs=outputs,
@@ -496,9 +496,16 @@ class DMintContractsManager:
                     deploy_height=token.get('deploy_height', 0),
                 )
                 if added:
+                    # Initial active state from supply (mirrors the existing-
+                    # contract path): a newly-seen fully-mined token is inactive.
+                    n_pct = token.get('percent_mined') or 0
+                    n_total = token.get('total_supply') or 0
+                    n_mined = token.get('mined_supply') or 0
+                    n_exhausted = n_pct >= 100 or (n_total > 0 and n_mined >= n_total)
                     # Set extra fields on the newly added contract
                     self.update_contract(
                         ref,
+                        active=not n_exhausted,
                         daa_mode=dmint.get('daa_mode', 0),
                         daa_mode_name=dmint.get('daa_mode_name', 'Fixed'),
                         icon_type=icon_fields.get('icon_type'),

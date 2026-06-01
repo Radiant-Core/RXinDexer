@@ -263,6 +263,91 @@ def test_sync_still_orphans_missing_contract_when_index_populated(tmp_path):
     assert gone["orphaned"] is True
 
 
+def test_sync_adds_spent_genesis_dmint_as_mineable(tmp_path):
+    """Regression (GRASS): a dMint token whose immutable genesis ref is spent
+    (is_spent=True) but which still has supply remaining must be ADDED as an
+    active/mineable contract — not skipped. For dMint the genesis ref is spent
+    when the mining contracts are deployed, so is_spent is not a burn signal."""
+    glyph_index = Mock()
+    glyph_index.get_tokens_by_type.return_value = [{
+        "ref": "a" * 64 + "_0",
+        "ticker": "GRASS",
+        "name": "Touch Grass",
+        "deploy_height": 305798,
+        "total_supply": 21000000,
+        "mined_supply": 15937900,   # 75.9% mined
+        "percent_mined": 75.89,
+        "is_spent": True,           # genesis ref spent — but still mineable
+        "dmint": {"algorithm": 0, "current_difficulty": 1, "reward": 100,
+                  "num_contracts": 21, "daa_mode": 0, "daa_mode_name": "Fixed"},
+    }]
+
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=glyph_index)
+    mgr.sync_from_index(434000)
+
+    assert len(mgr.contracts) == 1
+    c = mgr.contracts[0]
+    assert c["ticker"] == "GRASS"
+    assert c["active"] is True
+
+    # It must appear in the miner's default `mineable` listing.
+    resp = mgr.get_contracts_v2({"version": 2, "view": "token_summary"})
+    assert resp["count"] == 1
+    assert resp["items"][0]["ticker"] == "GRASS"
+    assert resp["items"][0]["is_fully_mined"] is False
+
+
+def test_sync_existing_spent_token_stays_active_when_supply_remains(tmp_path):
+    """An existing contract seen again with is_spent=True but supply remaining
+    must stay active (is_spent is not treated as a burn for dMint)."""
+    glyph_index = Mock()
+    glyph_index.get_tokens_by_type.return_value = [{
+        "ref": "a" * 64 + "_0",
+        "ticker": "GRASS", "name": "Touch Grass", "deploy_height": 305798,
+        "total_supply": 21000000, "mined_supply": 15937900, "percent_mined": 75.89,
+        "is_spent": True,
+        "dmint": {"algorithm": 0, "current_difficulty": 1, "reward": 100,
+                  "num_contracts": 21, "daa_mode": 0, "daa_mode_name": "Fixed"},
+    }]
+
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=glyph_index)
+    # Pre-existing record wrongly marked burned/inactive by old is_spent logic.
+    mgr.contracts = [{
+        "ref": "a" * 64 + "0", "outputs": 21, "ticker": "GRASS", "name": "",
+        "algorithm": 0, "difficulty": 1, "reward": 100, "percent_mined": 75.89,
+        "active": False, "burned": True, "deploy_height": 305798,
+        "total_supply": 21000000, "mined_supply": 15937900,
+    }]
+
+    mgr.sync_from_index(434000)
+
+    c = mgr.contracts[0]
+    assert c["active"] is True
+    assert c.get("burned") is False
+
+
+def test_sync_adds_fully_mined_spent_token_as_inactive(tmp_path):
+    """A spent, fully-mined dMint is still added (for status=finished) but
+    marked inactive — not mineable."""
+    glyph_index = Mock()
+    glyph_index.get_tokens_by_type.return_value = [{
+        "ref": "b" * 64 + "_0",
+        "ticker": "DONE", "name": "", "deploy_height": 300000,
+        "total_supply": 1000, "mined_supply": 1000, "percent_mined": 100,
+        "is_spent": True,
+        "dmint": {"algorithm": 0, "current_difficulty": 1, "reward": 1,
+                  "num_contracts": 1, "daa_mode": 0, "daa_mode_name": "Fixed"},
+    }]
+
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=glyph_index)
+    mgr.sync_from_index(434000)
+
+    assert len(mgr.contracts) == 1
+    assert mgr.contracts[0]["active"] is False
+    resp = mgr.get_contracts_v2({"version": 2, "view": "token_summary"})  # mineable
+    assert resp["count"] == 0
+
+
 def test_sync_from_index_uses_icon_ref_when_remote_embed_absent(tmp_path):
     glyph_index = Mock()
     glyph_index.get_tokens_by_type.return_value = [

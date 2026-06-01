@@ -1431,22 +1431,24 @@ class TestSyncBurnDeactivation:
         mgr._denylist_mtime = -1.0
         return mgr
 
-    def test_sync_deactivates_burned_contract(self):
-        """sync_from_index deactivates contracts whose tokens have is_spent=True."""
+    def test_sync_keeps_spent_contract_active_when_supply_remains(self):
+        """is_spent is NOT a burn signal for dMint: a contract whose genesis ref
+        is spent but which still has supply remaining (percent_mined < 100) stays
+        active/mineable. (Regression for GRASS — see dmint_contracts.py.)"""
         mgr = self._make_manager()
-        # Existing active contract
+        # Existing contract previously (wrongly) deactivated by is_spent burn logic
         mgr.contracts = [{
             'ref': 'aabb0000',
-            'active': True,
-            'ticker': 'BURN',
+            'active': False,
+            'burned': True,
+            'ticker': 'GRASS',
             'outputs': 1,
         }]
-        # Index returns this token as burned
         mgr.glyph_index.get_tokens_by_type.return_value = [{
             'ref': 'aabb_0000',
-            'is_spent': True,
-            'percent_mined': 50,
-            'ticker': 'BURN',
+            'is_spent': True,        # genesis spent — normal for deployed dMint
+            'percent_mined': 50,     # supply remaining → still mineable
+            'ticker': 'GRASS',
             'dmint': {},
         }]
         mgr._extract_icon_fields = MagicMock(return_value={})
@@ -1454,26 +1456,48 @@ class TestSyncBurnDeactivation:
         result = mgr.sync_from_index(1000)
 
         assert result >= 1
-        assert mgr.contracts[0]['active'] is False
-        assert mgr.contracts[0].get('burned') is True
+        assert mgr.contracts[0]['active'] is True
+        assert mgr.contracts[0].get('burned') is False
 
-    def test_sync_skips_adding_burned_token(self):
-        """sync_from_index does not add new contracts for burned tokens."""
+    def test_sync_adds_spent_token_with_supply_remaining(self):
+        """sync_from_index ADDS a spent-genesis dMint token that still has supply
+        remaining (is_spent no longer skips additions)."""
         mgr = self._make_manager()
         mgr.contracts = []
-        # Index returns a burned token that's not yet in the contracts list
         mgr.glyph_index.get_tokens_by_type.return_value = [{
             'ref': 'aabb_0000',
             'is_spent': True,
             'percent_mined': 50,
-            'ticker': 'BURNED',
+            'ticker': 'GRASS',
             'dmint': {},
         }]
+        mgr._extract_icon_fields = MagicMock(return_value={})
 
         result = mgr.sync_from_index(1000)
 
-        # No contract should be added
-        assert len(mgr.contracts) == 0
+        assert len(mgr.contracts) == 1
+        assert mgr.contracts[0]['ticker'] == 'GRASS'
+        assert mgr.contracts[0]['active'] is True
+
+    def test_sync_deactivates_fully_mined_contract(self):
+        """A contract that reaches percent_mined>=100 is deactivated (the real
+        'done' signal, replacing is_spent-based deactivation)."""
+        mgr = self._make_manager()
+        mgr.contracts = [{
+            'ref': 'aabb0000', 'active': True, 'ticker': 'DONE', 'outputs': 1,
+        }]
+        mgr.glyph_index.get_tokens_by_type.return_value = [{
+            'ref': 'aabb_0000',
+            'is_spent': True,
+            'percent_mined': 100,
+            'ticker': 'DONE',
+            'dmint': {},
+        }]
+        mgr._extract_icon_fields = MagicMock(return_value={})
+
+        result = mgr.sync_from_index(1000)
+
+        assert mgr.contracts[0]['active'] is False
 
     def test_sync_deactivates_orphaned_contracts(self):
         """sync_from_index deactivates contracts not found in the index."""
