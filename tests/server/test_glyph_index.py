@@ -1250,15 +1250,99 @@ class TestBurnDetection:
         tx_hash = b'\xcc' * 32
         index._process_contract_burn(tx_hash, 500, 0, singleton_ref)
 
-        # One contract destroyed → live_contracts decremented, token NOT marked
-        # spent (other contracts may still be mineable).
+        # One of three contracts destroyed → live_contracts decremented, token
+        # NOT marked spent (others may still be mineable), and NO BURN event yet
+        # (normal per-contract completion is not a token burn).
         assert index.token_cache[token_ref].live_contracts == 2
         assert index.token_cache[token_ref].is_spent is False
-        # BURN event recorded
+        assert len(index.history_cache) == 0
+
+    def test_process_contract_burn_emits_burn_only_on_early_termination(self):
+        """A token-level BURN event fires only when the LAST contract is
+        destroyed with supply remaining (genuinely terminated early) — not on
+        each contract completion (keeps burned_count at 0/1)."""
+        from electrumx.server.glyph_index import GlyphIndex, GlyphTokenInfo, GlyphEventType
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+
+        mock_db = MagicMock()
+        mock_db.utxo_db = MagicMock()
+        mock_db.utxo_db.get.return_value = None
+        mock_db.db_height = 100
+
+        index = GlyphIndex.__new__(GlyphIndex)
+        index.db = mock_db
+        index.logger = MagicMock()
+        index.enabled = True
+        index.token_cache = {}
+        index.token_height = {}
+        index.history_cache = []
+        index._known_refs = set()
+        index.contract_to_token_cache = {}
+
+        token_ref = b'\xaa' * 36
+        singleton_ref = b'\xbb' * 36
+        token = GlyphTokenInfo()
+        token.ref = token_ref
+        token.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
+        token.token_type = GlyphTokenType.DMINT
+        token.is_spent = False
+        token.total_supply = 1000
+        token.mined_supply = 400          # supply remaining → early termination
+        token.live_contracts = 1          # last live contract
+        token.deploy_txid = b'\x00' * 32
+        index.token_cache[token_ref] = token
+        index.contract_to_token_cache[singleton_ref] = token_ref
+
+        tx_hash = b'\xcc' * 32
+        index._process_contract_burn(tx_hash, 500, 0, singleton_ref)
+
+        assert index.token_cache[token_ref].live_contracts == 0
+        assert index.token_cache[token_ref].is_spent is False  # not fully mined
+        # Exactly one token-level BURN event
         assert len(index.history_cache) == 1
         _, _, history_value = index.history_cache[0]
         assert history_value[0] == GlyphEventType.BURN
         assert history_value[1:33] == tx_hash
+
+    def test_fully_mined_contract_completion_emits_no_burn(self):
+        """The last contract finishing on a FULLY-mined token is a completion,
+        not a burn — no BURN event (so burned_count stays 0)."""
+        from electrumx.server.glyph_index import GlyphIndex, GlyphTokenInfo
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+
+        mock_db = MagicMock()
+        mock_db.utxo_db = MagicMock()
+        mock_db.utxo_db.get.return_value = None
+        mock_db.db_height = 100
+
+        index = GlyphIndex.__new__(GlyphIndex)
+        index.db = mock_db
+        index.logger = MagicMock()
+        index.enabled = True
+        index.token_cache = {}
+        index.token_height = {}
+        index.history_cache = []
+        index._known_refs = set()
+        index.contract_to_token_cache = {}
+
+        token_ref = b'\xaa' * 36
+        singleton_ref = b'\xbb' * 36
+        token = GlyphTokenInfo()
+        token.ref = token_ref
+        token.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
+        token.token_type = GlyphTokenType.DMINT
+        token.is_spent = True             # fully mined
+        token.total_supply = 1000
+        token.mined_supply = 1000
+        token.live_contracts = 1
+        token.deploy_txid = b'\x00' * 32
+        index.token_cache[token_ref] = token
+        index.contract_to_token_cache[singleton_ref] = token_ref
+
+        index._process_contract_burn(b'\xcc' * 32, 500, 0, singleton_ref)
+
+        assert index.token_cache[token_ref].live_contracts == 0
+        assert len(index.history_cache) == 0  # completion, not a burn
 
     def test_process_contract_burn_ignores_unknown_singleton(self):
         """_process_contract_burn is a no-op for singletons not owned by any dMint token."""
