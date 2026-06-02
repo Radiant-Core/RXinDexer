@@ -422,3 +422,81 @@ def test_sync_from_index_normalizes_embedded_icon_data(tmp_path):
 
     response = mgr.get_contracts_v2({"version": 2, "view": "token_summary", "filters": {"status": "all"}})
     assert response["items"][0]["icon"]["data_hex"] == "aabbccdd"
+
+
+def _dmint_token(ref_internal, *, total_supply, mined_supply, percent_mined,
+                 mineable=None, live_contracts=None, is_spent=False):
+    """GlyphIndex dMint token dict (as get_tokens_by_type returns)."""
+    return {
+        "ref": ref_internal, "ticker": "TKN", "name": "Token",
+        "deploy_height": 300000, "total_supply": total_supply,
+        "mined_supply": mined_supply, "percent_mined": percent_mined,
+        "is_spent": is_spent, "mineable": mineable, "live_contracts": live_contracts,
+        "dmint": {"algorithm": 0, "current_difficulty": 1, "reward": 100,
+                  "num_contracts": 4, "daa_mode": 0, "daa_mode_name": "Fixed"},
+    }
+
+
+def test_manager_hides_burned_token_via_mineable_false(tmp_path):
+    """A token the indexer reports mineable=False (all contracts gone, supply
+    remaining) is listed inactive — restoring burn-hiding that supply-only loses."""
+    gi = Mock()
+    gi.get_tokens_by_type.return_value = [
+        _dmint_token("a" * 64 + "_0", total_supply=1000, mined_supply=400,
+                     percent_mined=40, mineable=False, live_contracts=0)
+    ]
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=gi)
+    mgr.sync_from_index(434000)
+    assert mgr.contracts[0]["active"] is False
+    # Not in the mineable listing
+    resp = mgr.get_contracts_v2({"version": 2, "view": "token_summary"})
+    assert resp["count"] == 0
+
+
+def test_manager_lists_live_token_via_mineable_true(tmp_path):
+    gi = Mock()
+    gi.get_tokens_by_type.return_value = [
+        _dmint_token("b" * 64 + "_0", total_supply=1000, mined_supply=400,
+                     percent_mined=40, mineable=True, live_contracts=3)
+    ]
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=gi)
+    mgr.sync_from_index(434000)
+    assert mgr.contracts[0]["active"] is True
+    assert mgr.contracts[0]["live_contracts"] == 3
+    # mineable_remaining surfaced from live_contracts
+    resp = mgr.get_contracts_v2({"version": 2, "view": "token_summary"})
+    assert resp["count"] == 1
+    assert resp["items"][0]["contracts"]["mineable_remaining"] == 3
+
+
+def test_manager_supply_fallback_when_mineable_untracked(tmp_path):
+    """Pre-v3 records (mineable=None) must not regress: supply-only decides."""
+    gi = Mock()
+    gi.get_tokens_by_type.return_value = [
+        _dmint_token("c" * 64 + "_0", total_supply=1000, mined_supply=400,
+                     percent_mined=40, mineable=None, live_contracts=None,
+                     is_spent=True)  # is_spent must NOT hide it
+    ]
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=gi)
+    mgr.sync_from_index(434000)
+    assert mgr.contracts[0]["active"] is True
+
+
+def test_manager_reactivates_then_burn_hides_on_mineable_flip(tmp_path):
+    """An existing active contract flips inactive once the indexer reports
+    mineable=False (e.g. its last contract was burned)."""
+    gi = Mock()
+    gi.get_tokens_by_type.return_value = [
+        _dmint_token("d" * 64 + "_0", total_supply=1000, mined_supply=400,
+                     percent_mined=40, mineable=False, live_contracts=0)
+    ]
+    mgr = DMintContractsManager(str(tmp_path), glyph_index=gi)
+    mgr.contracts = [{
+        "ref": "d" * 64 + "0", "outputs": 4, "ticker": "TKN", "name": "",
+        "algorithm": 0, "difficulty": 1, "reward": 100, "percent_mined": 40,
+        "active": True, "deploy_height": 300000,
+        "total_supply": 1000, "mined_supply": 400,
+    }]
+    mgr.sync_from_index(434000)
+    assert mgr.contracts[0]["active"] is False
+    assert mgr.contracts[0]["live_contracts"] == 0

@@ -1207,8 +1207,9 @@ class TestTokenToDictImages:
 class TestBurnDetection:
     """Tests for dMint contract burn detection and deactivation."""
 
-    def test_process_contract_burn_marks_token_spent(self):
-        """_process_contract_burn sets is_spent=True and records BURN event."""
+    def test_process_contract_burn_decrements_live_contracts(self):
+        """_process_contract_burn decrements live_contracts (not whole-token
+        is_spent) and records a BURN event."""
         from electrumx.server.glyph_index import GlyphIndex, GlyphTokenInfo, GlyphEventType
         from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
 
@@ -1232,7 +1233,7 @@ class TestBurnDetection:
         index._undo_seen = {}
         index.contract_to_token_cache = {}
 
-        # Create a dMint token with a known contract_ref
+        # Create a multi-contract dMint token (3 live contracts)
         token_ref = b'\xaa' * 36
         singleton_ref = b'\xbb' * 36
         token = GlyphTokenInfo()
@@ -1241,6 +1242,7 @@ class TestBurnDetection:
         token.token_type = GlyphTokenType.DMINT
         token.contract_ref = singleton_ref.hex()
         token.is_spent = False
+        token.live_contracts = 3
         token.deploy_txid = b'\x00' * 32
         index.token_cache[token_ref] = token
         index.contract_to_token_cache[singleton_ref] = token_ref
@@ -1248,8 +1250,10 @@ class TestBurnDetection:
         tx_hash = b'\xcc' * 32
         index._process_contract_burn(tx_hash, 500, 0, singleton_ref)
 
-        # Token should be marked spent
-        assert index.token_cache[token_ref].is_spent is True
+        # One contract destroyed → live_contracts decremented, token NOT marked
+        # spent (other contracts may still be mineable).
+        assert index.token_cache[token_ref].live_contracts == 2
+        assert index.token_cache[token_ref].is_spent is False
         # BURN event recorded
         assert len(index.history_cache) == 1
         _, _, history_value = index.history_cache[0]
@@ -1578,3 +1582,76 @@ class TestSubscriptionCallbackWiring:
         asyncio.run(mgr.notify_balance_change(sh, ref, 100, 10))
         asyncio.run(mgr.notify_token_change(ref, {'name': 'test'}))
         asyncio.run(mgr.notify_transfer(ref, b'\xcc' * 32, sh, sh, 50, 1000))
+
+
+class TestDmintLiveContracts:
+    """P1 — per-contract liveness for correct dMint burn detection."""
+
+    def _token(self):
+        from electrumx.server.glyph_index import GlyphTokenInfo
+        from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+        t = GlyphTokenInfo()
+        t.ref = b'\xaa' * 36
+        t.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
+        t.token_type = GlyphTokenType.DMINT
+        return t
+
+    def test_serialization_roundtrip_live_contracts(self):
+        from electrumx.server.glyph_index import GlyphTokenInfo
+        for val in (None, 0, 5, 21):
+            t = self._token()
+            t.live_contracts = val
+            back = GlyphTokenInfo.from_bytes(t.to_bytes())
+            assert back.live_contracts == val, f'roundtrip failed for {val!r}'
+
+    def test_serialization_zero_preserved_not_stripped(self):
+        # 0 must survive (it means "no live contracts"), distinct from None.
+        from electrumx.server.glyph_index import GlyphTokenInfo
+        t = self._token(); t.live_contracts = 0
+        assert GlyphTokenInfo.from_bytes(t.to_bytes()).live_contracts == 0
+        t2 = self._token()  # never set
+        assert GlyphTokenInfo.from_bytes(t2.to_bytes()).live_contracts is None
+
+    def test_dmint_mineable_semantics(self):
+        t = self._token()
+        t.total_supply = 1000
+
+        # untracked → None (caller falls back to supply)
+        t.live_contracts = None; t.mined_supply = 100
+        assert t.dmint_mineable() is None
+
+        # live contracts + supply remaining → mineable
+        t.live_contracts = 5
+        assert t.dmint_mineable() is True
+
+        # all contracts gone, supply remains → burned/terminated → not mineable
+        t.live_contracts = 0
+        assert t.dmint_mineable() is False
+
+        # fully mined → not mineable regardless of live count
+        t.mined_supply = 1000; t.live_contracts = 3
+        assert t.dmint_mineable() is False
+
+    def test_find_all_contract_refs_filters_to_token_txid(self):
+        from electrumx.server.glyph_index import GlyphIndex
+        idx = GlyphIndex.__new__(GlyphIndex)
+        gen = b'\x11' * 32
+        token_ref = gen + (0).to_bytes(4, 'little')          # GEN:0
+        c1 = gen + (1).to_bytes(4, 'little')                 # GEN:1 contract
+        c2 = gen + (2).to_bytes(4, 'little')                 # GEN:2 contract
+        covenant = b'\x22' * 32 + (9).to_bytes(4, 'little')  # singleton, other txid
+        scripts = {
+            b's0': [(c1, 1), (token_ref, 0), (covenant, 1)],
+            b's1': [(c2, 1), (token_ref, 0), (covenant, 1)],
+        }
+        idx._extract_refs_from_script = lambda s: scripts[s]
+
+        class _O:
+            def __init__(self, pk): self.pk_script = pk
+
+        class _T:
+            outputs = [_O(b's0'), _O(b's1')]
+
+        refs = idx._find_all_contract_refs(_T(), token_ref)
+        # GEN:1 and GEN:2 kept; token ref and the other-txid covenant excluded.
+        assert refs == {c1, c2}

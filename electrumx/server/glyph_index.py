@@ -57,7 +57,9 @@ class GlyphDBKeys:
     SCHEMA_VERSION = b'GVER'   # GVER -> uint8 schema version (R21)
 
 
-CURRENT_SCHEMA_VERSION = 2
+# v3: per-dMint-contract liveness (`live_contracts`) for correct burn detection.
+# Requires a full reindex to backfill the live-contract set for existing tokens.
+CURRENT_SCHEMA_VERSION = 3
 
 
 # History event types
@@ -168,6 +170,7 @@ class GlyphTokenInfo:
         # dMint specific
         'contract_ref', 'algorithm', 'start_difficulty', 'current_difficulty',
         'reward', 'halving_interval', 'daa_mode', 'mint_count', 'num_contracts',
+        'live_contracts',  # unspent contract singletons; None = untracked (pre-v3 reindex)
         # Relationships
         'container_ref', 'authority_ref', 'parent_ref',
         # NFT specific
@@ -216,7 +219,13 @@ class GlyphTokenInfo:
         self.halving_interval = 0  # Blocks between halvings
         self.daa_mode = 0  # Difficulty adjustment algorithm
         self.mint_count = 0  # Number of mint transactions
-        self.num_contracts = 0  # Number of parallel mining contracts
+        self.num_contracts = 0  # Number of parallel mining contracts (at deploy)
+        # Count of contract singletons still live (unspent). Starts at
+        # num_contracts on deploy and decrements as contracts terminate
+        # (mined out at maxHeight) or are burned. None = not yet tracked
+        # (records written before the v3 reindex) — consumers must treat None
+        # as "unknown" and fall back to supply-only mineability.
+        self.live_contracts = None
         # Relationships
         self.container_ref = None  # Parent container (if contained)
         self.authority_ref = None  # Authority token reference
@@ -299,6 +308,11 @@ class GlyphTokenInfo:
         }
         # Remove None values to save space
         data = {k: v for k, v in data.items() if v is not None and v != 0 and v != b''}
+        # live_contracts: preserve an explicit 0 (= no live contracts / burned or
+        # fully mined), which the zero-strip above would drop. None = untracked
+        # (pre-v3) → omit so it reads back as None.
+        if self.live_contracts is not None:
+            data['lc'] = self.live_contracts
         return cbor2.dumps(data)
     
     @classmethod
@@ -346,6 +360,7 @@ class GlyphTokenInfo:
         info.daa_mode = d.get('da', 0)
         info.mint_count = d.get('mc', 0)
         info.num_contracts = d.get('nc', 0)
+        info.live_contracts = d.get('lc')  # None if absent (untracked / pre-v3)
         # Relationships
         info.container_ref = d.get('co')
         info.authority_ref = d.get('ar')
@@ -372,6 +387,26 @@ class GlyphTokenInfo:
         if self.total_supply == 0:
             return 0.0
         return (self.mined_supply / self.total_supply) * 100.0
+
+    def is_fully_mined(self) -> bool:
+        """All supply mined out (the legitimate 'done' state)."""
+        return self.total_supply > 0 and self.mined_supply >= self.total_supply
+
+    def dmint_mineable(self) -> Optional[bool]:
+        """Whether this dMint token can still be mined.
+
+        Returns:
+            True  — supply remains AND >= 1 live contract singleton.
+            False — fully mined, OR all contracts gone with supply remaining
+                    (burned/terminated early).
+            None  — liveness not tracked (record predates the v3 reindex);
+                    callers should fall back to supply-only mineability.
+        """
+        if self.is_fully_mined():
+            return False
+        if self.live_contracts is None:
+            return None
+        return self.live_contracts > 0
 
 
 class GlyphIndex:
@@ -825,7 +860,31 @@ class GlyphIndex:
                     # Found a singleton ref that is not the token ref — contract ref
                     return ref_bytes.hex()
         return None
-    
+
+    def _find_all_contract_refs(self, tx: 'Tx', token_ref: bytes) -> set:
+        """
+        Find ALL per-contract singleton refs in a dMint deploy.
+
+        Each parallel mining contract output carries a distinct singleton
+        (OP_PUSHINPUTREFSINGLETON 0xd8).  The genuine per-contract singletons
+        share the TOKEN ref's txid (token ref = `GEN:0`, contracts = `GEN:1..N`);
+        the contract covenant also pushes unrelated state singletons at *other*
+        txids, which must be excluded (verified on-chain — see
+        docs/DMINT_BURN_DETECTION_SCOPE.md). Filter:
+            singleton AND ref != token_ref AND ref.txid == token_ref.txid.
+
+        Returns a set of 36-byte contract refs (may be empty).
+        """
+        token_txid = token_ref[:32]
+        found = set()
+        for output in tx.outputs:
+            for ref_bytes, ref_type in self._extract_refs_from_script(output.pk_script):
+                if (ref_type == 1
+                        and ref_bytes != token_ref
+                        and ref_bytes[:32] == token_txid):
+                    found.add(ref_bytes)
+        return found
+
     def _parse_deploy_contract_state(self, token: 'GlyphTokenInfo', tx: 'Tx'):
         """
         Parse initial contract state from the deploy transaction's outputs.
@@ -988,12 +1047,18 @@ class GlyphIndex:
                                tx_idx: int, singleton_ref: bytes):
         """
         Handle a destroyed dMint contract singleton.
-        
+
         Called when a singleton ref was spent in inputs but NOT recreated in
-        any output — the contract UTXO is permanently destroyed.
-        
-        Finds the dMint token that owns this contract ref and marks it as
-        burned (is_spent=True), records a BURN event in history.
+        any output — that one contract UTXO is permanently gone, either because
+        it was mined out at maxHeight (normal completion) or burned (e.g. to an
+        OP_RETURN output).
+
+        Decrements the owning token's `live_contracts` count. It does NOT mark
+        the whole token `is_spent`: a dMint token has `num_contracts` parallel
+        contracts and the others may still be mineable. (The previous behaviour
+        — marking the whole token spent on the first destroyed singleton — hid
+        partially-mined tokens like GRASS, which was 75.9% mined with ~5 live
+        contracts when its first contract completed.)
         """
         token_ref = None
         token = None
@@ -1009,25 +1074,32 @@ class GlyphIndex:
             token_ref = self.contract_to_token_cache.get(singleton_ref)
             if token_ref:
                 token = self.token_cache.get(token_ref) or self.get_token(token_ref)
-        
+
         if token is None or token_ref is None:
             return  # Singleton doesn't belong to a known dMint token
-        
-        if token.is_spent:
-            return  # Already marked
-        
-        token.is_spent = True
+
+        if token.live_contracts is None:
+            # Record predates the v3 reindex — liveness untracked; can't safely
+            # decrement. (A reindex registers every contract and re-runs this.)
+            return
+        if token.live_contracts <= 0:
+            return  # Already fully accounted for
+
+        token.live_contracts -= 1
         self.token_cache[token_ref] = token
         self.token_height[token_ref] = height
-        
-        # Record BURN event in history
+
+        # Record contract-BURN event in history (one per destroyed contract)
         history_key = pack_history_key(token_ref, height, tx_idx)
         history_value = struct.pack('<B', GlyphEventType.BURN) + tx_hash
         self.history_cache.append((height, history_key, history_value))
-        
+
+        remaining = token.live_contracts
+        terminated = remaining == 0 and not token.is_fully_mined()
         self.logger.info(
-            f'dMint CONTRACT BURNED: token={hash_to_hex_str(token_ref[:32])} '
-            f'contract={singleton_ref.hex()[:32]}... height={height}'
+            f'dMint contract gone: token={hash_to_hex_str(token_ref[:32])} '
+            f'contract={singleton_ref.hex()[:32]}... live_contracts={remaining}'
+            f'{" (token TERMINATED early)" if terminated else ""} height={height}'
         )
     
     def _index_token_reveal(self, ref: bytes, tx_hash: bytes, vout_or_vin,
@@ -1089,19 +1161,21 @@ class GlyphIndex:
                 token.reward = dmint_info.get('reward', 0) or 0
                 token.daa_mode = dmint_info.get('daa_mode', 0) or 0
                 token.halving_interval = dmint_info.get('halflife', 0) or 0
-                # Find the contract ref from the deploy tx outputs.
-                # The contract UTXO uses OP_PUSHINPUTREFSINGLETON (0xd8) with a
-                # ref that is different from the token ref (which uses 0xd0).
-                contract_ref_hex = self._find_contract_ref(tx, ref)
-                token.contract_ref = contract_ref_hex
-                # R6: write GC reverse index (contract_ref -> token_ref)
-                if contract_ref_hex:
-                    try:
-                        contract_ref_bytes = bytes.fromhex(contract_ref_hex)
-                        self.contract_to_token_cache[contract_ref_bytes] = ref
-                        self.contract_to_token_height[contract_ref_bytes] = height
-                    except ValueError:
-                        pass
+                # Find ALL per-contract singleton refs from the deploy tx.
+                # Each parallel mining contract is a distinct singleton (0xd8)
+                # sharing the token ref's txid. We register every one so burn
+                # detection can track them individually (live_contracts), rather
+                # than collapsing a multi-contract token to a single ref.
+                contract_refs = self._find_all_contract_refs(tx, ref)
+                # contract_ref keeps the first (sorted, for deterministic display)
+                token.contract_ref = (
+                    sorted(contract_refs)[0].hex() if contract_refs else None
+                )
+                token.live_contracts = len(contract_refs)
+                # R6: write GC reverse index (contract_ref -> token_ref) for each
+                for contract_ref_bytes in contract_refs:
+                    self.contract_to_token_cache[contract_ref_bytes] = ref
+                    self.contract_to_token_height[contract_ref_bytes] = height
                 # Also try to parse initial state from the contract output
                 self._parse_deploy_contract_state(token, tx)
             else:
@@ -2089,6 +2163,12 @@ class GlyphIndex:
             'deploy_txid': hash_to_hex_str(token.deploy_txid) if token.deploy_txid else None,
             'metadata_hash': hash_to_hex_str(token.metadata_hash) if token.metadata_hash else None,
             'is_spent': token.is_spent,
+            # dMint liveness — `mineable` is the authoritative signal the dMint
+            # contracts manager gates on (None = untracked pre-v3 → fall back to
+            # supply). live_contracts = unspent contract singletons.
+            'live_contracts': token.live_contracts,
+            'mineable': (token.dmint_mineable()
+                         if GlyphProtocol.GLYPH_DMINT in token.protocols else None),
             # Supply tracking
             'total_supply': token.total_supply,
             'current_supply': token.current_supply,
@@ -2160,6 +2240,7 @@ class GlyphIndex:
                 'daa_mode_name': self._daa_mode_name(token.daa_mode),
                 'mint_count': token.mint_count,
                 'num_contracts': token.num_contracts,
+                'live_contracts': token.live_contracts,
             }
         
         # Include NFT attributes

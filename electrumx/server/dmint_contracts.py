@@ -447,7 +447,20 @@ class DMintContractsManager:
                     or (total_supply > 0 and mined_supply >= total_supply)
                 )
 
-                desired_active = not supply_exhausted
+                # Track per-contract liveness for the API (mineable_remaining).
+                live = token.get('live_contracts')
+                if live is not None and live != existing.get('live_contracts'):
+                    existing['live_contracts'] = live
+                    changed = True
+
+                # Prefer the indexer's authoritative mineability signal (v3:
+                # supply remaining AND >=1 live contract singleton). Fall back to
+                # supply-only when it's None (records predating the v3 reindex)
+                # so pre-v3 data never regresses. This is what re-hides genuinely
+                # burned tokens (all contracts gone, supply remaining) that the
+                # supply-only rule would wrongly show as mineable.
+                mineable = token.get('mineable')
+                desired_active = (not supply_exhausted) if mineable is None else bool(mineable)
                 reactivated = False
                 if bool(existing.get('active', True)) != desired_active:
                     existing['active'] = desired_active
@@ -496,16 +509,20 @@ class DMintContractsManager:
                     deploy_height=token.get('deploy_height', 0),
                 )
                 if added:
-                    # Initial active state from supply (mirrors the existing-
-                    # contract path): a newly-seen fully-mined token is inactive.
+                    # Initial active state: prefer the indexer's authoritative
+                    # mineability (per-contract liveness); fall back to supply
+                    # when untracked (None), mirroring the existing-contract path.
                     n_pct = token.get('percent_mined') or 0
                     n_total = token.get('total_supply') or 0
                     n_mined = token.get('mined_supply') or 0
                     n_exhausted = n_pct >= 100 or (n_total > 0 and n_mined >= n_total)
+                    mineable = token.get('mineable')
+                    n_active = (not n_exhausted) if mineable is None else bool(mineable)
                     # Set extra fields on the newly added contract
                     self.update_contract(
                         ref,
-                        active=not n_exhausted,
+                        active=n_active,
+                        live_contracts=token.get('live_contracts'),
                         daa_mode=dmint.get('daa_mode', 0),
                         daa_mode_name=dmint.get('daa_mode_name', 'Fixed'),
                         icon_type=icon_fields.get('icon_type'),
@@ -616,7 +633,16 @@ class DMintContractsManager:
 
         active = bool(contract.get('active', True))
         fully_mined = (not active) or percent_mined >= 100.0
-        mineable_contracts_remaining = 0 if fully_mined else None
+        # Authoritative live-contract count from the indexer (v3+). Surfaces a
+        # real `mineable_remaining` instead of the legacy null; falls back to
+        # null when untracked (pre-v3 records).
+        live_contracts = contract.get('live_contracts')
+        if fully_mined:
+            mineable_contracts_remaining = 0
+        elif isinstance(live_contracts, int):
+            mineable_contracts_remaining = live_contracts
+        else:
+            mineable_contracts_remaining = None
 
         algorithm_id = self._to_int(contract.get('algorithm'), self.ALGO_SHA256D)
         daa_mode_id = self._to_int(contract.get('daa_mode'), 0)
