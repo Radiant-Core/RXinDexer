@@ -349,3 +349,41 @@ def test_schema_version_mismatch_raises():
     # not in __init__.
     with pytest.raises(RuntimeError, match='reindex'):
         idx.post_open_init()
+
+
+def test_live_contracts_reorg_roundtrip():
+    """A live_contracts decrement (contract destroyed) must be undone on reorg —
+    the whole token record is snapshotted, so backup restores the prior count."""
+    from electrumx.server.glyph_index import GlyphIndex, GlyphTokenInfo, pack_token_key
+    from electrumx.lib.glyph import GlyphProtocol, GlyphTokenType
+
+    db = FakeDB()
+    env = FakeEnv()
+    idx = GlyphIndex(db, env)
+    ref = b"\x33" * 36
+    key = pack_token_key(ref)
+
+    # Height 100: deploy with 3 live contracts
+    t = GlyphTokenInfo()
+    t.ref = ref
+    t.protocols = [GlyphProtocol.GLYPH_FT, GlyphProtocol.GLYPH_DMINT]
+    t.token_type = GlyphTokenType.DMINT
+    t.total_supply = 1000
+    t.mined_supply = 400
+    t.live_contracts = 3
+    idx.token_cache[ref] = t
+    idx.token_height[ref] = 100
+    idx.flush(FakeBatch(db.utxo_db._store))
+    assert GlyphTokenInfo.from_bytes(db.utxo_db.get(key)).live_contracts == 3
+
+    # Height 101: one contract destroyed → decrement to 2 and re-flush
+    t2 = GlyphTokenInfo.from_bytes(db.utxo_db.get(key))
+    t2.live_contracts -= 1
+    idx.token_cache[ref] = t2
+    idx.token_height[ref] = 101
+    idx.flush(FakeBatch(db.utxo_db._store))
+    assert GlyphTokenInfo.from_bytes(db.utxo_db.get(key)).live_contracts == 2
+
+    # Reorg unwinds height 101 → live_contracts restored to 3
+    idx.backup(FakeBatch(db.utxo_db._store), 101)
+    assert GlyphTokenInfo.from_bytes(db.utxo_db.get(key)).live_contracts == 3
