@@ -1089,18 +1089,28 @@ class GlyphIndex:
         self.token_cache[token_ref] = token
         self.token_height[token_ref] = height
 
-        # Record contract-BURN event in history (one per destroyed contract)
-        history_key = pack_history_key(token_ref, height, tx_idx)
-        history_value = struct.pack('<B', GlyphEventType.BURN) + tx_hash
-        self.history_cache.append((height, history_key, history_value))
-
         remaining = token.live_contracts
-        terminated = remaining == 0 and not token.is_fully_mined()
-        self.logger.info(
-            f'dMint contract gone: token={hash_to_hex_str(token_ref[:32])} '
-            f'contract={singleton_ref.hex()[:32]}... live_contracts={remaining}'
-            f'{" (token TERMINATED early)" if terminated else ""} height={height}'
-        )
+        # Emit a single token-level BURN history event ONLY when the token is
+        # genuinely terminated early — all contracts gone with supply still
+        # unmined. Normal per-contract completion (other contracts remain, or
+        # the token ends fully mined) is NOT a burn; emitting one event per
+        # destroyed contract would inflate burned_count / get_token_burns for
+        # healthy fully-mined tokens. This preserves the prior 0/1 semantics
+        # (1 = the token was abandoned/terminated early).
+        if remaining == 0 and not token.is_fully_mined():
+            history_key = pack_history_key(token_ref, height, tx_idx)
+            history_value = struct.pack('<B', GlyphEventType.BURN) + tx_hash
+            self.history_cache.append((height, history_key, history_value))
+            self.logger.info(
+                f'dMint token TERMINATED early (all contracts gone, '
+                f'{token.mined_supply}/{token.total_supply} mined): '
+                f'token={hash_to_hex_str(token_ref[:32])} height={height}'
+            )
+        else:
+            self.logger.debug(
+                f'dMint contract gone: token={hash_to_hex_str(token_ref[:32])} '
+                f'live_contracts={remaining} height={height}'
+            )
     
     def _index_token_reveal(self, ref: bytes, tx_hash: bytes, vout_or_vin,
                             height: int, tx_idx: int, envelope: Dict,
@@ -2039,8 +2049,14 @@ class GlyphIndex:
             token = self.get_token(ref)
             if not token:
                 continue
-            if active_only and token.is_spent:
-                continue
+            if active_only:
+                # Exclude not-mineable tokens (fully mined OR burned). For
+                # records predating the v3 reindex, dmint_mineable() is None —
+                # fall back to the is_spent flag so behaviour is unchanged until
+                # the reindex backfills live_contracts.
+                m = token.dmint_mineable()
+                if m is False or (m is None and token.is_spent):
+                    continue
             if len(tokens) >= limit:
                 next_cursor = self._encode_cursor(key)
                 break
