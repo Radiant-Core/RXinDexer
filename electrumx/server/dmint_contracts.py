@@ -610,7 +610,16 @@ class DMintContractsManager:
     @staticmethod
     def _normalize_ref(ref: str) -> str:
         """Convert stored ref (txid_BE 64 hex + decimal vout) to 72-char hex ref
-        (txid_BE 64 hex + zero-padded 8-char hex vout) expected by the frontend."""
+        (txid_BE 64 hex + zero-padded 8-char hex vout) expected by the frontend.
+
+        Note on byte order: this method preserves the txid in **BE-display**
+        order (the form historically emitted by the ``token_ref`` field of
+        ``/dmint/contracts`` and accepted by ``get_contract``). The rest of the
+        REST API's 72-hex token routes (``/glyphs/{ref}``, ``/tokens/{ref}/*``)
+        expect the **LE-internal** form. Use :meth:`_normalize_ref_internal`
+        to emit the LE-internal form for cross-endpoint chaining, and prefer
+        emitting both forms on the wire (``token_ref`` + ``ref_hex``).
+        """
         if not ref or len(ref) < 64:
             return ref or ''
         txid = ref[:64]
@@ -620,6 +629,47 @@ class DMintContractsManager:
             return txid + format(vout_int, '08x')
         except (ValueError, TypeError):
             return ref
+
+    @staticmethod
+    def _normalize_ref_internal(ref: str) -> str:
+        """Same as :meth:`_normalize_ref` but emits the outpoint in
+        **LE-internal** raw-bytes order — the form accepted by
+        ``/glyphs/{ref}`` and ``/tokens/{ref}/*`` and the form returned as
+        ``ref_hex`` by ``/glyphs/by-type/N``.
+
+        Two byte-order conversions vs. ``_normalize_ref``:
+
+        * **txid** — reverse the 32 bytes so the txid bytes are in internal
+          (transaction-serialization) order rather than display order.
+        * **vout** — emit as the 4 raw LE bytes (``struct.pack('<I', vout)``)
+          rather than the big-endian hex of the integer. For ``vout=0`` both
+          forms are identical, which masked this divergence in casual testing;
+          for ``vout>=1`` the two forms differ (e.g. vout=1 → ``01000000`` LE
+          vs. ``00000001`` int-BE-hex).
+
+        Use this for the ``ref_hex`` field of dmint summary items so clients
+        can chain ``/dmint/contracts → /tokens/{ref_hex}/*`` directly.
+        """
+        if not ref or len(ref) < 64:
+            return ref or ''
+        txid_be = ref[:64]
+        vout_str = ref[64:]
+        try:
+            vout_int = int(vout_str, 10) if vout_str else 0
+        except (ValueError, TypeError):
+            return ref
+        try:
+            txid_le_hex = bytes.fromhex(txid_be)[::-1].hex()
+        except ValueError:
+            # Non-hex txid (e.g. test fixture with placeholder chars). Fall
+            # back to the BE form rather than raising; production refs come
+            # from on-chain txid bytes and always parse cleanly.
+            txid_le_hex = txid_be
+        try:
+            vout_le_hex = struct.pack('<I', vout_int).hex()
+        except (struct.error, OverflowError):
+            return ref
+        return txid_le_hex + vout_le_hex
 
     def _to_token_summary_item(self, contract: Dict[str, Any]) -> Dict[str, Any]:
         total_contracts = max(self._to_int(contract.get('outputs'), 0), 0)
@@ -647,8 +697,13 @@ class DMintContractsManager:
         algorithm_id = self._to_int(contract.get('algorithm'), self.ALGO_SHA256D)
         daa_mode_id = self._to_int(contract.get('daa_mode'), 0)
 
+        raw_ref = contract.get('ref') or ''
         return {
-            'token_ref': self._normalize_ref(contract.get('ref') or ''),
+            'token_ref': self._normalize_ref(raw_ref),
+            # ref_hex emits the same outpoint with the txid in LE-internal order
+            # so callers can chain to /tokens/{ref_hex}/* and /glyphs/{ref_hex}
+            # without manually reversing. Matches /glyphs/by-type/N `ref_hex`.
+            'ref_hex': self._normalize_ref_internal(raw_ref),
             'ticker': contract.get('ticker') or '???',
             'name': contract.get('name') or '',
             'algorithm': {

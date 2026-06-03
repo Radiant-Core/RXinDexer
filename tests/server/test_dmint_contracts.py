@@ -500,3 +500,99 @@ def test_manager_reactivates_then_burn_hides_on_mineable_flip(tmp_path):
     mgr.sync_from_index(434000)
     assert mgr.contracts[0]["active"] is False
     assert mgr.contracts[0]["live_contracts"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Ref byte-order regression — /dmint/contracts must emit both BE-display
+# (`token_ref`, legacy) and LE-internal (`ref_hex`, new) forms so clients can
+# chain to /tokens/{ref}/* and /glyphs/{ref} without manually reversing.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_ref_internal_flips_both_txid_and_vout(dmint_manager):
+    """``_normalize_ref_internal`` flips BOTH byte orders relative to
+    ``_normalize_ref``:
+
+    * txid: BE-display ↔ LE-internal (32 bytes reversed)
+    * vout: int-BE-hex (``"00000007"``) ↔ LE-bytes-hex (``"07000000"``)
+
+    The vout discrepancy was historically masked because vout=0 produces
+    ``"00000000"`` in BOTH encodings. Non-zero vouts (e.g. multi-output
+    deploy transactions) need the LE-bytes form to chain into
+    ``/glyphs/{ref}`` / ``/tokens/{ref}/*``.
+    """
+    # Non-palindromic txid so reversal is obvious; non-zero vout so the
+    # two encodings are visibly different.
+    txid_be = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    txid_le = bytes.fromhex(txid_be)[::-1].hex()
+    raw = txid_be + "7"  # internal stored form: BE-txid + decimal vout (=7)
+
+    be = dmint_manager._normalize_ref(raw)
+    le = dmint_manager._normalize_ref_internal(raw)
+
+    # Existing behavior: txid stays BE, vout emitted as int-BE-hex.
+    assert be == txid_be + "00000007"
+    # New behavior: txid flipped to LE, vout emitted as 4 raw LE bytes hex.
+    assert le == txid_le + "07000000"
+    # The internal form round-trips via parse_ref_any.
+    from electrumx.server.glyph_index import parse_ref_any
+    parsed = parse_ref_any(le)
+    assert len(parsed) == 36
+    assert parsed[:32] == bytes.fromhex(txid_le)
+    assert parsed[32:] == b"\x07\x00\x00\x00"
+
+
+def test_normalize_ref_internal_vout_zero_matches_legacy(dmint_manager):
+    """For the common case of vout=0, both encodings emit the same trailing
+    ``"00000000"`` — only the txid bytes differ."""
+    txid_be = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    txid_le = bytes.fromhex(txid_be)[::-1].hex()
+    raw = txid_be + "0"
+
+    be = dmint_manager._normalize_ref(raw)
+    le = dmint_manager._normalize_ref_internal(raw)
+
+    assert be == txid_be + "00000000"
+    assert le == txid_le + "00000000"
+    assert be[64:] == le[64:]  # vout tail identical when vout=0
+
+
+def test_token_summary_emits_token_ref_and_ref_hex(tmp_path):
+    """get_contracts_v2 token_summary items must include BOTH ``token_ref``
+    (BE-display, backward compat) and ``ref_hex`` (LE-internal, for chaining
+    to /tokens/{ref}/* and /glyphs/{ref})."""
+    mgr = DMintContractsManager(str(tmp_path))
+    txid_be = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    mgr.contracts = [_make_contract(txid_be + "0", "TKN", algorithm=1,
+                                    reward=100, deploy_height=10, outputs=1)]
+
+    resp = mgr.get_contracts_v2({"version": 2, "view": "token_summary"})
+
+    assert resp["count"] == 1
+    item = resp["items"][0]
+    assert item["token_ref"] == txid_be + "00000000"
+    # ref_hex must be the LE-internal twin of token_ref.
+    assert "ref_hex" in item, "new ref_hex field missing"
+    txid_le = bytes.fromhex(txid_be)[::-1].hex()
+    assert item["ref_hex"] == txid_le + "00000000"
+    # ref_hex must be the 72-hex form parse_ref_any accepts as internal.
+    assert len(item["ref_hex"]) == 72
+    assert bytes.fromhex(item["ref_hex"])  # parseable as raw bytes
+
+
+def test_get_contract_resolves_be_form(tmp_path):
+    """``get_contract`` accepts the BE-display 72-hex form historically emitted
+    by ``token_ref`` (LE-form dual-accept happens at the REST layer via
+    ``_resolve_dmint_ref`` — this test documents that get_contract itself only
+    normalizes BE)."""
+    mgr = DMintContractsManager(str(tmp_path))
+    txid_be = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    mgr.contracts = [_make_contract(txid_be + "0", "TKN", algorithm=1,
+                                    reward=100, deploy_height=10, outputs=1)]
+
+    # BE-display 72-hex form — historically worked.
+    assert mgr.get_contract(txid_be + "00000000") is not None
+    # txid_vout form — also accepted (separator triggers normalization branch).
+    # Direct LE 72-hex lookup misses here; REST layer adds dual-accept.
+    txid_le = bytes.fromhex(txid_be)[::-1].hex()
+    assert mgr.get_contract(txid_le + "00000000") is None
