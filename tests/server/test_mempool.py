@@ -20,7 +20,7 @@ from electrumx.lib.util import make_logger
 
 coin = Radiant
 # Change seed daily
-seed(datetime.date.today().toordinal)
+seed(datetime.date.today().toordinal())
 
 
 def random_tx(hash160s, utxos):
