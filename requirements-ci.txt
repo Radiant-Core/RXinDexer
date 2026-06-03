@@ -15,7 +15,7 @@ pydantic>=2.5.0
 
 # Test-only: starlette's TestClient (used by tests/server/test_rest_api.py)
 # imports httpx at module load; without it that test module fails to collect.
-httpx>=0.27.0
+httpx>=0.28.1
 
 # python-rocksdb with GIL fix - install from source with patch
 # This works around the Cython GIL issue in python-rocksdb
