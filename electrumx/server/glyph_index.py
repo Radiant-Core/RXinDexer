@@ -118,6 +118,38 @@ def parse_ref_any(ref_str: str) -> bytes:
     return b
 
 
+def parse_ref_candidates(ref_str: str) -> List[bytes]:
+    """Parse a ref and return all byte-order candidates worth a DB lookup.
+
+    Background — historical inconsistency: ``/dmint/contracts`` emits
+    ``token_ref`` as **BE-display** 72-hex (txid in block-explorer order
+    followed by an 8-hex LE vout), whereas every other 72-hex API
+    (``/glyphs/{ref}``, ``/tokens/{ref}/*``, ``/dmint/contracts/{ref}/*``
+    on input) expects the **internal-LE** 72-hex form. A naive client
+    that chains ``/dmint/contracts → /tokens/{token_ref}/holders`` 404s
+    silently.
+
+    This helper preserves backward compatibility: callers iterate the
+    returned candidates in order and use the first that hits the DB.
+
+      * ``txid_vout`` form: unambiguous (BE txid + decimal vout) →
+        one candidate.
+      * 72-hex form: try internal-LE as-given **and** the BE-display
+        fallback (first 32 bytes reversed) → up to two candidates.
+
+    Returns at least one element. Raises ``ValueError`` on malformed input.
+    """
+    primary = parse_ref_any(ref_str)
+    if '_' in ref_str or ':' in ref_str:
+        return [primary]
+    # 72-hex form — also try with the txid portion reversed, to accept the
+    # legacy BE-display hex form that ``/dmint/contracts`` returns.
+    reversed_txid = primary[:32][::-1] + primary[32:]
+    if reversed_txid == primary:
+        return [primary]
+    return [primary, reversed_txid]
+
+
 def pack_balance_key(scripthash: bytes, ref: bytes) -> bytes:
     """Pack a balance key."""
     return GlyphDBKeys.BALANCE + scripthash + ref

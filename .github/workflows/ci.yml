@@ -66,8 +66,11 @@ jobs:
           pip install "Cython==0.29.34"
           pip install pytest pytest-asyncio
           pip install -r requirements-ci.txt
-          # Install package in development mode to ensure imports work
-          pip install -e .
+          # Install package in development mode to ensure imports work.
+          # --no-deps: requirements-ci.txt already provides the full dependency
+          # set; this avoids re-resolving requirements.txt (which pins
+          # python-rocksdb, whose source build fails under CI build isolation).
+          pip install -e . --no-deps
 
       - name: Verify critical dependencies
         run: |
@@ -79,15 +82,20 @@ jobs:
       - name: Verify test environment
         run: |
           if [ -d "tests" ]; then
-            cd tests && python -c "import sys; print('Python path:'); [print(f'  {p}') for p in sys.path[:5]]"
-            cd tests && python -c "import electrumx.lib; print('✅ Test environment can import electrumx.lib')"
+            # Run each check in a subshell so the cd doesn't accumulate
+            # (a second `cd tests` from inside tests/ would fail under `set -e`).
+            (cd tests && python -c "import sys; print('Python path:'); [print(f'  {p}') for p in sys.path[:5]]")
+            (cd tests && python -c "import electrumx.lib; print('✅ Test environment can import electrumx.lib')")
           fi
 
       - name: Run tests
         run: |
           if [ -d "tests" ]; then
             export PYTHONPATH=$PYTHONPATH:$(pwd)
-            pytest tests/ -v
+            # tests/integration/* drive a live ElectrumX/REST stack (localhost
+            # ports 8000/50010) and are exercised by the separate, non-blocking
+            # integration-test job. Exclude them from the unit test job.
+            pytest tests/ --ignore=tests/integration -v
           else
             echo "No tests directory found"
           fi

@@ -11,7 +11,7 @@ from electrumx.lib.hash import sha256, HASHX_LEN, Base58
 from electrumx.lib.script import ScriptPubKey
 from electrumx.server.glyph_index import (
     GlyphIndex, GlyphDBKeys, pack_holder_key, pack_owner_key,
-    parse_ref_any, ref_to_display,
+    parse_ref_any, parse_ref_candidates, ref_to_display,
 )
 
 
@@ -81,6 +81,44 @@ def test_parse_ref_any_rejects_garbage():
         except (ValueError, Exception):
             raised = True
         assert raised, f"expected ValueError for {bad!r}"
+
+
+def test_parse_ref_candidates_72hex_returns_both_orders():
+    """The 72-hex form is ambiguous w.r.t. txid byte order; candidates must
+    include both the as-given (internal-LE primary) and the txid-reversed
+    (BE-display fallback) forms so REST handlers can dual-accept."""
+    txid_be = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    txid_le = bytes.fromhex(txid_be)[::-1].hex()
+
+    # Input as LE-internal 72-hex (the canonical 72-hex form).
+    cands_le = parse_ref_candidates(txid_le + "00000000")
+    assert len(cands_le) == 2
+    assert cands_le[0].hex() == txid_le + "00000000"
+    assert cands_le[1].hex() == txid_be + "00000000"
+
+    # Input as BE-display 72-hex (the /dmint/contracts.token_ref form).
+    cands_be = parse_ref_candidates(txid_be + "00000000")
+    assert len(cands_be) == 2
+    assert cands_be[0].hex() == txid_be + "00000000"
+    assert cands_be[1].hex() == txid_le + "00000000"
+
+
+def test_parse_ref_candidates_txid_vout_is_unambiguous():
+    """The ``txid_vout`` form encodes byte order explicitly (BE txid +
+    decimal vout) so there is exactly one candidate — no fallback retry."""
+    txid_be = "b3d8a9b16e36161f994a83492931140e279b076a0556eab260439a02e25ccf06"
+    cands = parse_ref_candidates(txid_be + "_0")
+    assert len(cands) == 1
+    # Matches the canonical parse: BE txid → LE bytes + LE vout
+    assert cands[0] == parse_ref_any(txid_be + "_0")
+
+
+def test_parse_ref_candidates_palindromic_txid_collapses_to_one():
+    """If the txid is its own reverse (e.g. all-zero or all-same byte), the
+    two candidate forms are bit-identical and we return only one."""
+    txid = "00" * 32  # palindrome
+    cands = parse_ref_candidates(txid + "00000000")
+    assert len(cands) == 1
 
 
 def test_script_to_address_p2pkh():

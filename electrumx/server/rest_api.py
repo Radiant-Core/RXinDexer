@@ -134,6 +134,67 @@ def _parse_ref(ref: str) -> bytes:
         raise HTTPException(status_code=400, detail="Invalid ref format")
 
 
+def _resolve_ref(ref: str) -> bytes:
+    """Resolve a path ref to the canonical 36 raw key bytes for index lookups.
+
+    Accepts both supported forms (``txid_vout`` and 72-hex) and, for the
+    72-hex case, transparently retries with the txid portion reversed if the
+    primary form does not match a stored token. This patches the
+    backward-compat hazard where ``/dmint/contracts.token_ref`` emits the
+    72-hex form with the **BE-display** txid order, while the rest of the
+    72-hex API expects **internal-LE** order — naive clients chaining the two
+    used to 404 silently.
+
+    If no candidate matches a token, returns the primary parsed bytes so the
+    caller's "not found" / "empty list" path runs as it did before.
+    """
+    from electrumx.server.glyph_index import parse_ref_candidates
+    try:
+        candidates = parse_ref_candidates(ref)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+    # Single candidate (e.g. txid_vout form) — no probe needed.
+    if len(candidates) == 1:
+        return candidates[0]
+    # Probe the token index to pick the candidate that actually exists.
+    try:
+        for cand in candidates:
+            if _glyph_index.get_token(cand) is not None:
+                return cand
+    except Exception:
+        # Probe failure should not break the request — fall through to primary.
+        pass
+    return candidates[0]
+
+
+def _resolve_dmint_ref(ref: str) -> str:
+    """Resolve a path ref to the 72-hex form expected by the dmint contract store.
+
+    The dmint store stores refs with the txid in **BE-display** order (the form
+    that the ``token_ref`` field of ``/dmint/contracts`` emits). Clients that
+    fetch a glyph ref from the wider API (LE-internal 72-hex) and then chain
+    to ``/dmint/contracts/{ref}/...`` would otherwise 404 on a byte-order
+    mismatch. Probe both byte orders and return whichever resolves to a real
+    contract; on miss, return the primary form so existing 404 paths still
+    fire as before.
+    """
+    from electrumx.server.glyph_index import parse_ref_candidates
+    try:
+        candidates = parse_ref_candidates(ref)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+    if _dmint_contracts is None or len(candidates) == 1:
+        return candidates[0].hex()
+    try:
+        for cand in candidates:
+            if _dmint_contracts.get_contract(cand.hex()) is not None:
+                return cand.hex()
+    except Exception:
+        # Probe failure should not break the request — fall through to primary.
+        pass
+    return candidates[0].hex()
+
+
 def _resolve_scripthash(ident: str) -> bytes:
     """Resolve an ownership identifier to a 32-byte Electrum scripthash.
 
@@ -518,7 +579,7 @@ async def get_dmint_contract_icon_debug(ref: str = _REF_PATH):
     _ensure_dmint()
 
     try:
-        ref = _parse_ref(ref).hex()  # accept 72-hex or txid_vout; normalize
+        ref = _resolve_dmint_ref(ref)  # accept BE-display or LE-internal; pick the matching form
         contract = _dmint_contracts.get_contract(ref)
         if not contract:
             raise HTTPException(status_code=404, detail="Contract not found")
@@ -629,7 +690,7 @@ async def get_glyph(ref: str = _REF_PATH):
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         token = _glyph_index.get_token(ref_bytes)
         if not token:
             raise HTTPException(status_code=404, detail="Token not found")
@@ -653,7 +714,7 @@ async def get_token_holders(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         return _glyph_index.get_token_holders(ref_bytes, limit=limit, cursor=cursor)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -692,7 +753,7 @@ async def get_token_supply(ref: str = _REF_PATH):
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         result = _glyph_index.get_token_supply(ref_bytes)
         if not result:
             raise HTTPException(status_code=404, detail="Token not found")
@@ -715,7 +776,7 @@ async def get_token_burns(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         return _glyph_index.get_token_burns(ref_bytes, limit=limit, offset=offset)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -733,7 +794,7 @@ async def get_token_trades(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         return _glyph_index.get_token_trades(ref_bytes, limit=limit, offset=offset)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -750,7 +811,7 @@ async def get_top_token_holders(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         return _glyph_index.get_top_holders(ref_bytes, limit=limit)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -775,7 +836,7 @@ async def get_token_history(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         if cursor is None:
             return _glyph_index.get_token_history(ref_bytes, limit=limit, offset=offset)
         return _glyph_index.get_token_history(
@@ -811,7 +872,7 @@ async def get_token_metadata(ref: str = _REF_PATH):
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         token = _glyph_index.get_token(ref_bytes)
         if not token:
             raise HTTPException(status_code=404, detail="Token not found")
@@ -865,7 +926,7 @@ async def get_key_reveal(ref: str = _REF_PATH):
     """
     _ensure_glyph_index()
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         result = _glyph_index.get_key_reveal(ref_bytes)
         if result is None:
             return {"revealed": False}
@@ -894,7 +955,7 @@ async def record_key_reveal(
         import hashlib
         import time as _time
 
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         cek_bytes = bytes.fromhex(revealed_key)
 
         # Verify CEK hash matches on-chain commitment
@@ -1001,7 +1062,7 @@ async def get_dmint_contract(ref: str = _REF_PATH):
     _ensure_dmint()
 
     try:
-        ref = _parse_ref(ref).hex()  # accept 72-hex or txid_vout; normalize
+        ref = _resolve_dmint_ref(ref)  # accept BE-display or LE-internal; pick the matching form
         contract = _dmint_contracts.get_contract(ref)
         if not contract:
             raise HTTPException(status_code=404, detail="Contract not found")
@@ -1104,7 +1165,7 @@ async def get_dmint_contract_daa(
     _ensure_dmint()
 
     try:
-        ref = _parse_ref(ref).hex()  # accept 72-hex or txid_vout; normalize
+        ref = _resolve_dmint_ref(ref)  # accept BE-display or LE-internal; pick the matching form
         contract = _dmint_contracts.get_contract(ref)
         if not contract:
             raise HTTPException(status_code=404, detail="Contract not found")
@@ -1160,7 +1221,7 @@ async def get_dmint_mint_history(
     _ensure_glyph_index()
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         return _glyph_index.get_mint_history(ref_bytes, limit=limit, offset=offset)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
@@ -1544,7 +1605,7 @@ async def mempool_glyph_balance(
 
     try:
         sh_bytes = bytes.fromhex(scripthash)
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         delta = mp.get_unconfirmed_glyph_balance(sh_bytes, ref_bytes)
         return {"scripthash": scripthash, "ref": ref, "unconfirmed_delta": delta}
     except ValueError:
@@ -1582,7 +1643,7 @@ async def mempool_token_txs(
         raise HTTPException(status_code=503, detail="Mempool Glyph indexing not available")
 
     try:
-        ref_bytes = _parse_ref(ref)
+        ref_bytes = _resolve_ref(ref)
         txs = mp.get_unconfirmed_token_txs(ref_bytes)
         return {"ref": ref, "txs": txs, "count": len(txs)}
     except ValueError:
