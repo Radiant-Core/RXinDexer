@@ -20,7 +20,7 @@ for klass in subclasses(Storage):
 def db(tmpdir, request):
     cwd = os.getcwd()
     os.chdir(str(tmpdir))
-    if request.param is 'skip':
+    if request.param == 'skip':
         raise pytest.skip()
     db = db_class(request.param)("db", False)
     yield db
