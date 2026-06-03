@@ -5,19 +5,24 @@ pylru
 aiohttp>=3.3,<4.0
 websockets>=10.0,<16.0
 psutil
-python-rocksdb<=0.7.0
 cbor2>=5.4.0
 
 # REST API dependencies
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.5.0
+prometheus-client>=0.20.0
 
 # Test-only: starlette's TestClient (used by tests/server/test_rest_api.py)
 # imports httpx at module load; without it that test module fails to collect.
 httpx>=0.27.0
 
-# python-rocksdb with GIL fix - install from source with patch
-# This works around the Cython GIL issue in python-rocksdb
-# Use older version that doesn't have GIL issues or install with CFLAGS
-# CFLAGS="-DCYTHON_WITHOUT_GIL=0" pip install python-rocksdb
+# NOTE: python-rocksdb is intentionally NOT installed for the unit/lint jobs.
+# python-rocksdb 0.7.0 only builds under Cython<3, but `pip install` uses build
+# isolation by default and pulls Cython 3.x, which fails to compile its .pyx
+# ("'Slice' is not a type identifier", etc). The unit tests never need the real
+# module: storage.py imports it lazily, and tests either mock RocksDB or
+# pytest.importorskip('rocksdb'). The native rocksdb build is still exercised by
+# the `docker` CI job (Dockerfile installs it with --no-build-isolation under
+# Cython<3). The `test` job runs `pip install -e . --no-deps` so this manifest —
+# not requirements.txt — drives the CI dependency set.
