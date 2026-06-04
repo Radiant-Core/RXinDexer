@@ -58,6 +58,7 @@ from electrumx.server import metrics as _metrics
 
 from fastapi import FastAPI, HTTPException, Query, Path, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response as _Response
 from pydantic import BaseModel
 import time as _time
@@ -113,6 +114,11 @@ app.add_middleware(
     allow_methods=['GET', 'POST'],
     allow_headers=['*'],
 )
+
+# Response compression — dMint/glyph JSON (and any inline hex icon data) is highly
+# compressible; gzip typically shrinks the contracts list by several-fold at the
+# wire. minimum_size skips the overhead on tiny responses.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 # --- Ref / scripthash helpers (defined before any endpoint that references them
@@ -597,6 +603,44 @@ async def get_dmint_contract_icon_debug(ref: str = _REF_PATH):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/dmint/contracts/{ref}/icon", tags=["dMint"])
+async def get_dmint_contract_icon(ref: str = _REF_PATH):
+    """Serve a contract's embedded icon as raw image bytes.
+
+    Lets clients lazily fetch icons per-token (and lets the browser HTTP-cache
+    them) instead of inlining every icon as hex in the contracts list response.
+    Returns 404 when the contract has no embedded icon (use icon_url instead).
+    """
+    _ensure_dmint()
+
+    try:
+        ref = _resolve_dmint_ref(ref)  # accept BE-display or LE-internal
+        contract = _dmint_contracts.get_contract(ref)
+        if not contract:
+            raise HTTPException(status_code=404, detail="Contract not found")
+
+        icon_data = contract.get("icon_data")
+        if not icon_data:
+            raise HTTPException(status_code=404, detail="Contract has no embedded icon")
+
+        try:
+            raw = bytes.fromhex(icon_data)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="Icon data is not valid hex")
+
+        media_type = contract.get("icon_type") or "application/octet-stream"
+        # Icons are immutable per ref — cache hard so a token's icon is fetched once.
+        return _Response(
+            content=raw,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=604800, immutable"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/tx/{txid}", tags=["Transactions"])
 @app.get("/transaction/{txid}", tags=["Transactions"])
 async def get_transaction(txid: str = Path(..., min_length=64, max_length=64)):
@@ -1044,9 +1088,18 @@ async def get_dmint_contracts(
             }
             result = _dmint_contracts.get_contracts_v2(params)
             if not include_icon_data and isinstance(result, dict):
+                # Strip heavy inline icon hex from the list. For embedded icons
+                # (no remote url), redirect the client to the lazy /icon route so
+                # the icon still renders but is fetched/cached per-token on demand.
                 for item in result.get('items', []):
-                    if isinstance(item.get('icon'), dict):
-                        item['icon']['data_hex'] = None
+                    icon = item.get('icon')
+                    if not isinstance(icon, dict):
+                        continue
+                    if icon.get('data_hex') and not icon.get('url'):
+                        ref = item.get('token_ref')
+                        if ref:
+                            icon['url'] = f"/dmint/contracts/{ref}/icon"
+                    icon['data_hex'] = None
             return result
 
         return _dmint_contracts.get_contracts_extended(active_only=active_only)

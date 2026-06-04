@@ -1,5 +1,8 @@
+import json
+import os
+
 import pytest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from electrumx.server.dmint_contracts import DMintContractsManager
 
@@ -151,6 +154,90 @@ def test_get_contracts_v2_rejects_invalid_status_filter(dmint_manager):
                 "filters": {"status": "invalid"},
             }
         )
+
+
+def test_get_contracts_v2_memoizes_token_summary_at_same_height(dmint_manager):
+    """The expensive per-contract _to_token_summary_item build is reused across
+    requests at the same height, and rebuilt only after last_updated_height
+    changes. Per-request filter/sort/pagination vary freely without a rebuild."""
+    all_params = {
+        "version": 2,
+        "view": "token_summary",
+        "filters": {"status": "all"},
+        "pagination": {"limit": 10},
+    }
+
+    with patch.object(
+        dmint_manager,
+        "_to_token_summary_item",
+        wraps=dmint_manager._to_token_summary_item,
+    ) as build:
+        # First call builds one summary item per contract and caches the base.
+        dmint_manager.get_contracts_v2(all_params)
+        first_calls = build.call_count
+        assert first_calls == len(dmint_manager.contracts)
+        cached_base = dmint_manager._token_summary_cache
+        assert cached_base is not None
+
+        # Second call at the same height — even with different filter/sort/page
+        # params — reuses the cached base: no extra build calls, same instance.
+        dmint_manager.get_contracts_v2(
+            {
+                "version": 2,
+                "view": "token_summary",
+                "filters": {"status": "mineable", "algorithm_ids": [1]},
+                "sort": {"field": "ticker", "dir": "asc"},
+                "pagination": {"limit": 2},
+            }
+        )
+        assert build.call_count == first_calls
+        assert dmint_manager._token_summary_cache is cached_base
+
+        # Advancing the indexed height invalidates the cache → full rebuild.
+        dmint_manager.last_updated_height += 1
+        dmint_manager.get_contracts_v2(all_params)
+        assert build.call_count == first_calls + len(dmint_manager.contracts)
+        assert dmint_manager._token_summary_cache is not cached_base
+
+
+def test_get_contracts_v2_cache_invalidated_when_denylist_changes(dmint_manager):
+    """Editing the denylist (new file mtime) rebuilds the memoized base so a
+    newly-denied contract drops out of the listing without a height change."""
+    denylist_path = dmint_manager.denylist_path
+
+    with patch.object(
+        dmint_manager,
+        "_to_token_summary_item",
+        wraps=dmint_manager._to_token_summary_item,
+    ) as build:
+        baseline = dmint_manager.get_contracts_v2(
+            {
+                "version": 2,
+                "view": "token_summary",
+                "filters": {"status": "all"},
+                "pagination": {"limit": 10},
+            }
+        )
+        assert baseline["total_estimate"] == 4
+        assert build.call_count == 4
+
+        # Deny one contract and stamp a distinct mtime so the hot-reload fires.
+        with open(denylist_path, "w") as f:
+            json.dump({"refs": ["a" * 72]}, f)
+        os.utime(denylist_path, (1_000_000, 1_000_000))
+
+        after = dmint_manager.get_contracts_v2(
+            {
+                "version": 2,
+                "view": "token_summary",
+                "filters": {"status": "all"},
+                "pagination": {"limit": 10},
+            }
+        )
+        # Denylist mtime changed → rebuild over the 3 surviving contracts.
+        assert build.call_count == 4 + 3
+        assert after["total_estimate"] == 3
+        assert ("a" * 72) not in {item["token_ref"] for item in after["items"]}
 
 
 def _index_token(ref_internal: str, *, total_supply: int, mined_supply: int,

@@ -123,6 +123,15 @@ class DMintContractsManager:
         self._denylist: Set[str] = set()
         self._denylist_mtime: float = -1.0
 
+        # Memoized unfiltered/unsorted v2 token-summary items. Building these
+        # (one _to_token_summary_item per contract) is the expensive part of
+        # get_contracts_v2, and the underlying contract set only changes when a
+        # new block is indexed (last_updated_height advances) or the denylist is
+        # reloaded (_denylist_mtime changes). Cache keyed on that pair so
+        # repeated /dmint/contracts hits at the same height reuse the build.
+        self._token_summary_cache: Optional[List[Dict[str, Any]]] = None
+        self._token_summary_cache_key: Optional[Tuple[int, float]] = None
+
         # Load existing contracts, then strip anything already on the denylist
         self._load_contracts()
         self._load_denylist()
@@ -740,6 +749,30 @@ class DMintContractsManager:
             'updated_at': datetime.now(timezone.utc).isoformat(),
         }
 
+    def _token_summary_items(self) -> List[Dict[str, Any]]:
+        """Return the memoized unfiltered/unsorted v2 token-summary items.
+
+        The per-contract _to_token_summary_item build is the costly part of
+        get_contracts_v2; the underlying contract set only changes when a new
+        block is indexed (last_updated_height advances) or the denylist is
+        reloaded (_denylist_mtime changes). Memoize keyed on that pair so
+        repeated /dmint/contracts hits at the same height skip the rebuild and
+        only pay for the cheap per-request filter/sort/pagination.
+
+        Callers must treat the returned list as read-only (copy it before any
+        in-place sort) — the same instance is shared across requests.
+        """
+        cache_key = (self.last_updated_height, self._denylist_mtime)
+        cached = self._token_summary_cache
+        if cached is not None and self._token_summary_cache_key == cache_key:
+            return cached
+
+        items = [self._to_token_summary_item(c) for c in self.contracts
+                 if not self._is_denied(c.get('ref'))]
+        self._token_summary_cache = items
+        self._token_summary_cache_key = cache_key
+        return items
+
     def get_contracts_v2(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Get contracts using the v2 token summary schema."""
         params = params or {}
@@ -769,8 +802,10 @@ class DMintContractsManager:
         if self._load_denylist():
             self._purge_denied()
 
-        items = [self._to_token_summary_item(c) for c in self.contracts
-                 if not self._is_denied(c.get('ref'))]
+        # Reuse the memoized base list across requests at the same height; copy
+        # it so the per-request filtering/sort/pagination below never mutate the
+        # shared cache.
+        items = list(self._token_summary_items())
 
         if status == 'mineable':
             items = [i for i in items if not i.get('is_fully_mined')]

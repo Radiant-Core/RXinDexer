@@ -412,6 +412,64 @@ class TestDMintEndpoints:
         assert data['icon_ref'] == 'ipfs://bafybeigdyrzt'
         assert data['icon_data'] == 'aabbccdd'
 
+    def test_get_contract_icon_serves_bytes(self, client, mock_dmint_contracts):
+        ref = _make_ref()
+        mock_dmint_contracts.get_contract.return_value = {
+            'ref': ref,
+            'icon_type': 'image/png',
+            'icon_data': 'aabbccdd',
+        }
+        resp = client.get(f'/dmint/contracts/{ref}/icon')
+        assert resp.status_code == 200
+        assert resp.headers['content-type'] == 'image/png'
+        assert resp.content == bytes.fromhex('aabbccdd')
+        assert 'max-age' in resp.headers.get('cache-control', '')
+
+    def test_get_contract_icon_404_when_no_embedded(self, client, mock_dmint_contracts):
+        ref = _make_ref()
+        mock_dmint_contracts.get_contract.return_value = {
+            'ref': ref,
+            'icon_url': 'https://example.com/icon.png',
+        }
+        resp = client.get(f'/dmint/contracts/{ref}/icon')
+        assert resp.status_code == 404
+
+    def test_get_contract_icon_404_when_contract_missing(self, client, mock_dmint_contracts):
+        ref = _make_ref()
+        mock_dmint_contracts.get_contract.return_value = None
+        resp = client.get(f'/dmint/contracts/{ref}/icon')
+        assert resp.status_code == 404
+
+    def test_contracts_list_strips_icon_hex_and_redirects_embedded(self, client, mock_dmint_contracts):
+        ref = 'a' * 72
+        mock_dmint_contracts.get_contracts_v2.return_value = {
+            'items': [{
+                'token_ref': ref,
+                'icon': {'type': 'image/png', 'url': None, 'data_hex': 'aabbcc'},
+            }],
+            'cursor_next': None,
+        }
+        # Default (include_icon_data=false): hex stripped, embedded icon -> lazy URL.
+        resp = client.get('/dmint/contracts')
+        assert resp.status_code == 200
+        icon = resp.json()['items'][0]['icon']
+        assert icon['data_hex'] is None
+        assert icon['url'] == f'/dmint/contracts/{ref}/icon'
+
+    def test_contracts_list_keeps_icon_hex_when_requested(self, client, mock_dmint_contracts):
+        ref = 'a' * 72
+        mock_dmint_contracts.get_contracts_v2.return_value = {
+            'items': [{
+                'token_ref': ref,
+                'icon': {'type': 'image/png', 'url': None, 'data_hex': 'aabbcc'},
+            }],
+            'cursor_next': None,
+        }
+        resp = client.get('/dmint/contracts?include_icon_data=true')
+        assert resp.status_code == 200
+        icon = resp.json()['items'][0]['icon']
+        assert icon['data_hex'] == 'aabbcc'
+
     def test_get_algorithms(self, client):
         resp = client.get('/dmint/algorithms')
         assert resp.status_code == 200
