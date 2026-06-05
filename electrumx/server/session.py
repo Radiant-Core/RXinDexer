@@ -151,6 +151,17 @@ class SessionManager:
         self._history_cache = pylru.lrucache(1000)
         self._history_lookups = 0
         self._history_hits = 0
+        # Confirmed-only address-status cache (hashX -> status hex | None).
+        # blockchain.scripthash.subscribe hashes a scripthash's ENTIRE confirmed
+        # history. For scripthashes with very large histories (e.g. an active
+        # FT-by-owner address) that is many seconds of CPU, and it was recomputed
+        # on every subscribe/notify, pegging the server. The confirmed-only
+        # status is stable until the hashX is touched by a new block, so cache it
+        # and invalidate on the same touched set as _history_cache (see
+        # _notify_sessions). The mempool portion is recomputed every call.
+        self._status_cache = pylru.lrucache(4096)
+        self._status_lookups = 0
+        self._status_hits = 0
         self._ref_get_cache = pylru.lrucache(1000)
         self._ref_get_lookups = 0
         self._ref_get_hits = 0
@@ -343,6 +354,8 @@ class SessionManager:
             'groups': len(self.session_groups),
             'history cache': cache_fmt.format(
                 self._history_lookups, self._history_hits, len(self._history_cache)),
+            'status cache': cache_fmt.format(
+                self._status_lookups, self._status_hits, len(self._status_cache)),
             'merkle cache': cache_fmt.format(
                 self._merkle_lookups, self._merkle_hits, len(self._merkle_cache)),
             'pid': os.getpid(),
@@ -885,6 +898,21 @@ class SessionManager:
             raise result
         return result, cost
 
+    def cached_status(self, hashX):
+        '''Return the cached confirmed-only address status (hex str or None).
+
+        Raises KeyError on a miss so callers can branch like the other caches.
+        The cached value is the status with NO mempool entries; it is valid only
+        while the caller has no mempool summaries for the hashX.'''
+        self._status_lookups += 1
+        status = self._status_cache[hashX]
+        self._status_hits += 1
+        return status
+
+    def cache_status(self, hashX, status):
+        '''Cache the confirmed-only address status for a hashX.'''
+        self._status_cache[hashX] = status
+
     async def ref_get_db(self, ref):
         '''Returns the mint and location for a ref'''
         cost = 0.1
@@ -913,6 +941,12 @@ class SessionManager:
             for hashX in set(cache).intersection(touched):
                 del cache[hashX]
             cache = self._ref_get_cache
+            for hashX in set(cache).intersection(touched):
+                del cache[hashX]
+            # The confirmed-only status changes only when the hashX's confirmed
+            # history changes (a new block touching it), so invalidate it on the
+            # same touched set.
+            cache = self._status_cache
             for hashX in set(cache).intersection(touched):
                 del cache[hashX]
 
@@ -1236,6 +1270,23 @@ class ElectrumX(SessionBase):
         '''
         # Note history is ordered and mempool unordered in electrum-server
         # For mempool, height is -1 if it has unconfirmed inputs, otherwise 0
+        mempool = await self.mempool.transaction_summaries(hashX)
+
+        # Fast path: with no mempool entries the status depends only on the
+        # confirmed history, which is stable until the hashX is touched by a new
+        # block (see _notify_sessions, which invalidates _status_cache on the
+        # touched set). Returning the cached status avoids re-hashing the full
+        # history every call — the CPU-peg / "continuous sync error" path for
+        # scripthashes with very large histories.
+        if not mempool:
+            try:
+                status = self.session_mgr.cached_status(hashX)
+                self.bump_cost(0.1)
+                self.mempool_statuses.pop(hashX, None)
+                return status
+            except KeyError:
+                pass
+
         try:
             db_history, cost = await self.session_mgr.limited_history(hashX)
         except RPCError:
@@ -1244,7 +1295,6 @@ class ElectrumX(SessionBase):
             # Fetch unlimited history directly from DB.
             db_history = await self.db.limited_history(hashX, limit=None)
             cost = 0.1 + len(db_history) * 0.001
-        mempool = await self.mempool.transaction_summaries(hashX)
 
         status = ''.join(f'{hash_to_hex_str(tx_hash)}:'
                          f'{height:d}:'
@@ -1265,6 +1315,8 @@ class ElectrumX(SessionBase):
             self.mempool_statuses[hashX] = status
         else:
             self.mempool_statuses.pop(hashX, None)
+            # Cache the confirmed-only status for the fast path above.
+            self.session_mgr.cache_status(hashX, status)
 
         return status
 
