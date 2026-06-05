@@ -11,6 +11,7 @@ Tests for the RSWP swap protocol parsing and indexing functionality including:
 import pytest
 from unittest.mock import Mock, MagicMock
 import struct
+import hashlib
 
 
 # RSWP Protocol constants
@@ -364,6 +365,171 @@ class TestSwapIndexOrdering:
         assert swap_index._format_ref(None) is None
         assert swap_index._format_ref(b'') is None
         assert swap_index._format_ref(bytes(10)) is None  # Too short
+
+
+def _sha256(b):
+    return hashlib.sha256(b).digest()
+
+
+def _ri_record(*refs_with_type):
+    """Build a b'ri' record: concatenated 37-byte (36-byte ref + 1 type) entries."""
+    out = b''
+    for ref36, t in refs_with_type:
+        assert len(ref36) == 36
+        out += ref36 + bytes([t])
+    return out
+
+
+def _advertised_base_ref_for_ref(ref36):
+    """Given an on-disk 36-byte ref, return the base_ref the RSWP parser would
+    produce for an order offering that token.
+
+    Photonic ``assetToSwapTokenId`` = sha256(ref36), pushed byte-REVERSED into
+    the OP_RETURN; the parser stores that reversed value verbatim as
+    base_ref[:32], then appends LE(0).
+    """
+    token_hash = _sha256(ref36)
+    return token_hash[::-1] + struct.pack('<I', 0)
+
+
+class TestBackingUtxoOfferedRefCheck:
+    """Part A (C3-auth): reject orders whose backing UTXO demonstrably does not
+    carry the offered token (present-but-mismatched b'ri' record)."""
+
+    @pytest.fixture
+    def mock_env(self):
+        env = Mock()
+        env.swap_index = True
+        env.reorg_limit = 10
+        return env
+
+    def _swap_index(self, mock_env, ri_store):
+        from electrumx.server.swap_index import SwapIndex
+        db = Mock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(side_effect=lambda k: ri_store.get(k))
+        db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
+        return SwapIndex(db, mock_env)
+
+    def _order(self, order_id, base_ref):
+        from electrumx.server.swap_index import SwapOrderInfo, OrderStatus, OrderSide
+        o = SwapOrderInfo()
+        o.order_id = order_id
+        o.base_ref = base_ref
+        o.side = OrderSide.SELL
+        o.status = OrderStatus.OPEN
+        return o
+
+    def test_absent_record_is_accepted(self, mock_env):
+        """No b'ri' record -> accept (may be same-block, not yet flushed)."""
+        si = self._swap_index(mock_env, {})
+        order_id = b'\xbb' * 32 + struct.pack('<I', 1)
+        ref36 = b'\xaa' * 32 + struct.pack('<I', 0)
+        order = self._order(order_id, _advertised_base_ref_for_ref(ref36))
+        assert si._backing_utxo_offers_token(order) is True
+
+    def test_present_and_matching_is_accepted(self, mock_env):
+        ref36 = b'\xaa' * 32 + struct.pack('<I', 0)
+        order_id = b'\xbb' * 32 + struct.pack('<I', 1)
+        ri_store = {b'ri' + order_id: _ri_record((ref36, 0))}
+        si = self._swap_index(mock_env, ri_store)
+        order = self._order(order_id, _advertised_base_ref_for_ref(ref36))
+        assert si._backing_utxo_offers_token(order) is True
+
+    def test_present_and_matching_among_multiple_refs(self, mock_env):
+        """Match must succeed even when the backing UTXO carries several refs."""
+        wanted = b'\xaa' * 32 + struct.pack('<I', 0)
+        other1 = b'\xcc' * 32 + struct.pack('<I', 2)
+        other2 = b'\xdd' * 32 + struct.pack('<I', 7)
+        order_id = b'\xbb' * 32 + struct.pack('<I', 1)
+        ri_store = {b'ri' + order_id: _ri_record((other1, 0), (wanted, 1), (other2, 0))}
+        si = self._swap_index(mock_env, ri_store)
+        order = self._order(order_id, _advertised_base_ref_for_ref(wanted))
+        assert si._backing_utxo_offers_token(order) is True
+
+    def test_present_but_mismatched_is_rejected(self, mock_env):
+        """Record exists but holds a different token -> REJECT."""
+        on_disk = b'\xcc' * 32 + struct.pack('<I', 3)
+        offered = b'\xaa' * 32 + struct.pack('<I', 0)
+        order_id = b'\xbb' * 32 + struct.pack('<I', 1)
+        ri_store = {b'ri' + order_id: _ri_record((on_disk, 0))}
+        si = self._swap_index(mock_env, ri_store)
+        order = self._order(order_id, _advertised_base_ref_for_ref(offered))
+        assert si._backing_utxo_offers_token(order) is False
+
+    def test_rxd_offer_zero_token_is_accepted(self, mock_env):
+        """RXD offer (token id == 32 zero bytes) -> nothing to check, accept,
+        even if a b'ri' record happens to exist."""
+        order_id = b'\xbb' * 32 + struct.pack('<I', 1)
+        some_ref = b'\xcc' * 32 + struct.pack('<I', 0)
+        ri_store = {b'ri' + order_id: _ri_record((some_ref, 0))}
+        si = self._swap_index(mock_env, ri_store)
+        base_ref = (b'\x00' * 32) + struct.pack('<I', 0)
+        order = self._order(order_id, base_ref)
+        assert si._backing_utxo_offers_token(order) is True
+
+    def test_malformed_short_base_ref_is_accepted(self, mock_env):
+        """A short/empty base_ref can't be checked -> accept (no false reject)."""
+        order_id = b'\xbb' * 32 + struct.pack('<I', 1)
+        si = self._swap_index(mock_env, {b'ri' + order_id: _ri_record(
+            (b'\xcc' * 32 + struct.pack('<I', 0), 0))})
+        order = self._order(order_id, b'\x01\x02')
+        assert si._backing_utxo_offers_token(order) is True
+
+    def test_process_tx_skips_caching_on_mismatch(self, mock_env):
+        """End-to-end: a parsed order whose backing UTXO mismatches is never
+        admitted to order_cache."""
+        on_disk = b'\xcc' * 32 + struct.pack('<I', 3)
+        offered = b'\xaa' * 32 + struct.pack('<I', 0)
+        utxo_hash = b'\xbb' * 32
+        utxo_index = 1
+        order_id = utxo_hash + struct.pack('<I', utxo_index)
+        ri_store = {b'ri' + order_id: _ri_record((on_disk, 0))}
+        si = self._swap_index(mock_env, ri_store)
+
+        token_id = _sha256(offered)[::-1]  # advertised (reversed) token id
+        # priceTerms: single RXD payout to a P2PKH (so amount > 0, in range)
+        p2pkh = bytes([0x76, 0xa9, 0x14]) + bytes(20) + bytes([0x88, 0xac])
+        price_terms = bytes([1]) + struct.pack('<Q', 10000) + bytes([len(p2pkh)]) + p2pkh
+        script = build_rswp_v2_script(
+            token_id, utxo_hash, utxo_index, price_terms, b'\x05\x06\x07\x08',
+            flags=0, offered_type=1)
+
+        class _Out:
+            def __init__(self, s):
+                self.pk_script = s
+
+        class _Tx:
+            outputs = [_Out(script)]
+
+        si.process_tx(b'\x99' * 32, _Tx(), 200, 0)
+        assert order_id not in si.order_cache
+
+    def test_process_tx_caches_on_match(self, mock_env):
+        on_disk = b'\xaa' * 32 + struct.pack('<I', 0)
+        utxo_hash = b'\xbb' * 32
+        utxo_index = 1
+        order_id = utxo_hash + struct.pack('<I', utxo_index)
+        ri_store = {b'ri' + order_id: _ri_record((on_disk, 1))}
+        si = self._swap_index(mock_env, ri_store)
+
+        token_id = _sha256(on_disk)[::-1]
+        p2pkh = bytes([0x76, 0xa9, 0x14]) + bytes(20) + bytes([0x88, 0xac])
+        price_terms = bytes([1]) + struct.pack('<Q', 10000) + bytes([len(p2pkh)]) + p2pkh
+        script = build_rswp_v2_script(
+            token_id, utxo_hash, utxo_index, price_terms, b'\x05\x06\x07\x08',
+            flags=0, offered_type=1)
+
+        class _Out:
+            def __init__(self, s):
+                self.pk_script = s
+
+        class _Tx:
+            outputs = [_Out(script)]
+
+        si.process_tx(b'\x99' * 32, _Tx(), 200, 0)
+        assert order_id in si.order_cache
 
 
 class TestMempoolSwapParsing:

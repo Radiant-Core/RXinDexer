@@ -709,27 +709,68 @@ class BlockProcessor:
 
             # Process transaction for Glyph tokens
             if self.glyph_index:
-                glyph_envelope = self.glyph_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, output_refs_by_vout, spent_singleton_refs)
-                
+                # Best-effort token/swap/name overlays.  These parse adversarial
+                # on-chain payloads (CBOR metadata, RSWP/WAVE OP_RETURNs, dMint
+                # contract scripts), so a single malformed tx must never abort the
+                # block — that would halt every node at the same height.  Each
+                # overlay is isolated in its own guard so one bad tx (or one
+                # failing overlay) is logged and skipped while the core UTXO/ref
+                # accounting above always commits.
+                glyph_envelope = None
+                try:
+                    glyph_envelope = self.glyph_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, output_refs_by_vout, spent_singleton_refs)
+                except MemoryError:
+                    raise  # resource pressure, not a parse bug — fail loudly
+                except Exception:
+                    self.logger.exception(
+                        'glyph_index.process_tx failed for tx %s at height %d; '
+                        'skipping glyph overlay for this tx',
+                        hash_to_hex_str(tx_hash), self.height + 1
+                    )
+
                 # Process for WAVE naming if this is a Glyph tx
                 if self.wave_index and glyph_envelope:
-                    protocols = glyph_envelope.get('protocols', [])
-                    if GlyphProtocol.GLYPH_WAVE in protocols:
-                        self.logger.info(
-                            f'Passing WAVE envelope to wave_index: '
-                            f'tx={hash_to_hex_str(tx_hash)} protocols={protocols}'
+                    try:
+                        protocols = glyph_envelope.get('protocols', [])
+                        if GlyphProtocol.GLYPH_WAVE in protocols:
+                            self.logger.info(
+                                f'Passing WAVE envelope to wave_index: '
+                                f'tx={hash_to_hex_str(tx_hash)} protocols={protocols}'
+                            )
+                        self.wave_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, output_refs_by_vout, spent_singleton_refs)
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        self.logger.exception(
+                            'wave_index.process_tx failed for tx %s at height %d; skipping',
+                            hash_to_hex_str(tx_hash), self.height + 1
                         )
-                    self.wave_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, output_refs_by_vout, spent_singleton_refs)
-                
+
                 # Process for Swap orders unconditionally (R3: RSWP may have no Glyph envelope)
                 if self.swap_index:
-                    self.swap_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope)
+                    try:
+                        self.swap_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, spent_outpoints)
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        self.logger.exception(
+                            'swap_index.process_tx failed for tx %s at height %d; skipping',
+                            hash_to_hex_str(tx_hash), self.height + 1
+                        )
 
                 # Update token holder balances (debits from spent inputs, credits from new outputs)
                 if balance_debits or balance_credits:
-                    self.glyph_index.process_balance_changes(
-                        self.height + 1, balance_debits, balance_credits
-                    )
+                    try:
+                        self.glyph_index.process_balance_changes(
+                            self.height + 1, balance_debits, balance_credits
+                        )
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        self.logger.exception(
+                            'process_balance_changes failed for tx %s at height %d; skipping',
+                            hash_to_hex_str(tx_hash), self.height + 1
+                        )
 
             tx_num += 1
 

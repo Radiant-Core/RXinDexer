@@ -236,6 +236,37 @@ def validate_wave_name(name: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+# Maximum accepted length (chars) for a WAVE mutable-target payment address.
+# Base58 P2PKH/P2SH addresses are ~34 chars; this is a generous upper bound that
+# rejects pathological multi-kilobyte "target" payloads before they hit the
+# coin's address decoder.
+WAVE_MAX_TARGET_LEN = 90
+
+
+def validate_target_address(coin, target) -> bool:
+    """Return True iff ``target`` is a sane base58 payment address for ``coin``.
+
+    A mutable "mod" update carries an attacker-influenced ``attrs.target`` that
+    is otherwise stored verbatim and served to wallets. The on-chain covenant
+    only proves the singleton holder produced the spend — it does NOT constrain
+    the bytes of this field, so we validate before persisting:
+
+    - must be a non-empty ``str`` no longer than ``WAVE_MAX_TARGET_LEN``
+    - must base58-decode to a valid address for this coin (correct checksum and
+      a recognised P2PKH/P2SH version byte); ``coin.address_to_hashX`` raises
+      otherwise.
+    """
+    if not isinstance(target, str):
+        return False
+    if not (1 <= len(target) <= WAVE_MAX_TARGET_LEN):
+        return False
+    try:
+        coin.address_to_hashX(target)
+    except Exception:
+        return False
+    return True
+
+
 def normalize_name(name: str) -> str:
     """Normalize a WAVE name (lowercase, strip whitespace)."""
     return name.lower().strip()
@@ -418,19 +449,47 @@ class WaveIndex:
             self.name_cache[name_hash] = claim_ref
             self.name_height[name_hash] = height
 
-            # Record the NFT singleton ref(s) this registration creates so a
-            # later mutable target update (which co-spends the singleton) can be
-            # mapped back to this canonical name. Singleton refs are a stable
-            # identity, so this mapping survives moves with no re-recording.
+            # Record the NFT singleton this registration creates so a later
+            # mutable target update (which co-spends the singleton) can be mapped
+            # back to this canonical name. Singleton refs are a stable identity,
+            # so this mapping survives moves with no re-recording.
+            #
+            # Scope this to the CLAIM output (vout 0) only. The other 37 branch
+            # outputs may legitimately carry unrelated singletons; recording them
+            # all would let a spend of any of those branch singletons hijack this
+            # name's target update. Only the claim-output singleton is the name's
+            # own NFT.
             if output_refs_by_vout:
-                for ref_list in output_refs_by_vout.values():
-                    for ref_bytes, ref_type in ref_list:
-                        if ref_type == 1:  # singleton (NFT)
-                            self.singleton_cache[ref_bytes] = name_hash
-                            self.singleton_height[ref_bytes] = height
+                for ref_bytes, ref_type in output_refs_by_vout.get(0, ()):
+                    if ref_type != 1:  # only singletons (NFTs)
+                        continue
+                    # First-writer guard: never overwrite an existing
+                    # singleton->name mapping. A singleton can only ever belong
+                    # to one canonical name; silently re-pointing it would let a
+                    # second registration steal control of the first's updates.
+                    if (ref_bytes in self.singleton_cache
+                            or self.db.utxo_db.get(
+                                WaveDBKeys.SINGLETON + ref_bytes) is not None):
+                        self.logger.warning(
+                            f'WAVE singleton {ref_bytes.hex()[:16]}.. already '
+                            f'mapped; refusing to remap to "{name}"'
+                        )
+                        continue
+                    self.singleton_cache[ref_bytes] = name_hash
+                    self.singleton_height[ref_bytes] = height
         
         # Store zone records (for both canonical and duplicates)
         zone = WaveZoneRecords.from_metadata(metadata)
+        # The genesis target is attacker-controlled; null it out if it isn't a
+        # valid payment address so an invalid genesis target never enters
+        # zone_cache and gets served to wallets. Other zone fields are untouched.
+        if zone.address is not None and not validate_target_address(
+                self.env.coin, zone.address):
+            self.logger.warning(
+                f'WAVE genesis target rejected for "{name}": '
+                f'invalid address {zone.address!r} at height {height}'
+            )
+            zone.address = None
         if HAS_CBOR:
             self.zone_cache[claim_ref] = cbor2.dumps(zone.to_dict())
             self.zone_height[claim_ref] = height
@@ -552,6 +611,16 @@ class WaveIndex:
         if not new_target:
             return
 
+        # The covenant proves WHO spent the singleton, not WHAT the target is.
+        # Reject malformed/oversized/non-address targets before they enter the
+        # zone cache and get served to wallets as a resolved payment address.
+        if not validate_target_address(self.env.coin, new_target):
+            self.logger.warning(
+                f'WAVE target update rejected: invalid target {new_target!r} '
+                f'at height {height} (tx {hash_to_hex_str(tx_hash)})'
+            )
+            return
+
         for singleton_ref in spent_singleton_refs:
             name_hash = self._resolve_singleton_to_name(singleton_ref)
             if not name_hash:
@@ -567,6 +636,18 @@ class WaveIndex:
                 continue  # already current
             zone.address = new_target
             if HAS_CBOR:
+                zone_key = WaveDBKeys.ZONE + claim_ref
+                # Record undo EAGERLY, keyed at THIS update's height, snapshotting
+                # the prior value from cache-then-DB — BEFORE we overwrite the
+                # cache. The flush-time undo only snapshots the on-disk value and
+                # records once per ref, so two updates to one ref in a single
+                # flush (H1->A then H2->B) would otherwise collapse into a single
+                # undo entry at H2 and lose the intermediate A state. Per-height
+                # eager undo gives backup(H2) -> A and backup(H1) -> original.
+                # _record_undo_from_cache dedups per (height, key), so the later
+                # flush-time _record_undo(H2, ...) becomes a no-op and never
+                # clobbers the snapshot taken here.
+                self._record_undo_from_cache(height, zone_key, claim_ref)
                 self.zone_cache[claim_ref] = cbor2.dumps(zone.to_dict())
                 self.zone_height[claim_ref] = height
                 self._pending_heights[claim_ref.hex()] = height
@@ -587,6 +668,29 @@ class WaveIndex:
             return
         self._undo_seen[height].add(key)
         prev_value = self.db.utxo_db.get(key)
+        self._undo_cache[height].append((key, prev_value))
+
+    def _record_undo_from_cache(self, height: int, key: bytes,
+                                cache_ref: bytes):
+        """Like ``_record_undo`` but snapshots the prior value from the in-memory
+        zone cache first, falling back to the on-disk value.
+
+        Used for eager per-update undo of zone targets: when several updates to
+        the same ref land in one flush, each must capture the value as it stood
+        *immediately before that update* (which, for the 2nd+ update, lives only
+        in ``zone_cache`` and has not yet been flushed to disk). Dedups per
+        (height, key) so a later flush-time ``_record_undo`` for the same key at
+        the same height is a no-op and cannot overwrite this snapshot.
+        """
+        if not self.enabled:
+            return
+        if key in self._undo_seen[height]:
+            return
+        self._undo_seen[height].add(key)
+        if cache_ref in self.zone_cache:
+            prev_value = self.zone_cache[cache_ref]
+        else:
+            prev_value = self.db.utxo_db.get(key)
         self._undo_cache[height].append((key, prev_value))
 
     def backup(self, batch, height: int):

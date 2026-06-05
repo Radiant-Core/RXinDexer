@@ -735,3 +735,155 @@ class TestEdgeCases:
     def test_offset_negative(self, client, mock_glyph_index):
         resp = client.get('/glyphs?offset=-1')
         assert resp.status_code == 422  # below ge=0
+
+
+# ===========================================================================
+# M2 — Internal error leakage (info disclosure)
+# ===========================================================================
+
+class TestErrorSanitization:
+    """M2: 500/raw-exception paths must return a generic message, never leak
+    the underlying DB/daemon exception string to the client."""
+
+    _SECRET = 'SECRET_DB_PATH /var/lib/rxindexer/rocksdb corrupted at offset 0xdeadbeef'
+
+    def test_500_returns_generic_detail_not_internal_string(self, client, mock_glyph_index):
+        # Force the handler's inner call to raise with a sensitive message.
+        mock_glyph_index.get_all_tokens_summary.side_effect = RuntimeError(self._SECRET)
+        resp = client.get('/glyphs')
+        assert resp.status_code == 500
+        detail = resp.json()['detail']
+        assert detail == 'Internal error'
+        # The leaked internals must NOT appear anywhere in the response body.
+        assert 'SECRET_DB_PATH' not in resp.text
+        assert 'rocksdb' not in resp.text
+        assert 'deadbeef' not in resp.text
+
+    def test_transaction_error_does_not_leak_daemon_string(self, client, mock_daemon):
+        # The daemon raises with a sensitive internal message.
+        async def _boom(*a, **k):
+            raise RuntimeError(self._SECRET)
+        mock_daemon.getrawtransaction = _boom
+        resp = client.get('/transaction/' + 'ab' * 32)
+        assert resp.status_code == 404
+        detail = resp.json()['detail']
+        assert detail == 'Transaction not found'
+        assert 'SECRET_DB_PATH' not in resp.text
+        assert 'rocksdb' not in resp.text
+
+    def test_analytics_500_returns_generic_detail(self, client, mock_analytics_index):
+        mock_analytics_index.get_top_addresses.side_effect = RuntimeError(self._SECRET)
+        resp = client.get('/analytics/top-addresses?limit=10&offset=0')
+        assert resp.status_code == 500
+        assert resp.json()['detail'] == 'Internal error'
+        assert 'SECRET_DB_PATH' not in resp.text
+
+
+# ===========================================================================
+# M1 — Analytics rich-list offset cap (DoS)
+# ===========================================================================
+
+class TestTopAddressesOffsetCap:
+    """M1: `offset` on the public /analytics/top-addresses path must be bounded
+    so an attacker can't rotate it to bust the cache and force full scans."""
+
+    def test_oversized_offset_rejected(self, client, mock_analytics_index):
+        from electrumx.server.rest_api import _TOP_ADDRESSES_MAX_OFFSET
+        too_big = _TOP_ADDRESSES_MAX_OFFSET + 1
+        resp = client.get(f'/analytics/top-addresses?limit=10&offset={too_big}')
+        assert resp.status_code == 422  # exceeds le bound
+        # The expensive index method must never be invoked for a rejected request.
+        mock_analytics_index.get_top_addresses.assert_not_called()
+
+    def test_max_offset_accepted(self, client, mock_analytics_index):
+        from electrumx.server.rest_api import _TOP_ADDRESSES_MAX_OFFSET
+        resp = client.get(
+            f'/analytics/top-addresses?limit=10&offset={_TOP_ADDRESSES_MAX_OFFSET}'
+        )
+        assert resp.status_code == 200
+
+    def test_scan_cached_across_offset_rotation(self, client):
+        """End-to-end: rotating offset hits the cached scan, not a fresh scan.
+
+        Drives a real AnalyticsIndex with an iterator that counts BALANCE-prefix
+        scans, then rotates offset across several requests.
+        """
+        import struct as _struct
+        from electrumx.server import rest_api
+        from electrumx.server.analytics_index import AnalyticsIndex, AnalyticsDBKeys
+
+        scan_count = {'n': 0}
+
+        class _CountingDB:
+            def __init__(self):
+                self._store = {}
+
+            def get(self, key):
+                return self._store.get(key)
+
+            def iterator(self, prefix=b'', reverse=False, include_value=True):
+                if prefix == AnalyticsDBKeys.BALANCE:
+                    scan_count['n'] += 1
+                items = [(k, v) for k, v in self._store.items() if k.startswith(prefix)]
+                items.sort(key=lambda kv: kv[0], reverse=reverse)
+                return iter(items)
+
+        class _Coin:
+            VALUE_PER_COIN = 100_000_000
+            P2PKH_VERBYTE = b'\x00'
+            P2SH_VERBYTES = [b'\x05']
+
+        class _Env:
+            analytics_index = True
+            reorg_limit = 10
+            coin = _Coin()
+
+        class _DB:
+            def __init__(self):
+                self.utxo_db = _CountingDB()
+                self.db_height = 100
+
+        db = _DB()
+        for i in range(40):
+            hashX = bytes([i % 256]) * 11 + i.to_bytes(2, 'big')
+            db.utxo_db._store[AnalyticsDBKeys.BALANCE + hashX] = _struct.pack(
+                '<Q', (i + 1) * _Coin.VALUE_PER_COIN
+            )
+        real_idx = AnalyticsIndex(db, _Env())
+
+        # Swap the real analytics index in for this test only.
+        prev = rest_api._analytics_index
+        prev_cache = rest_api._cache
+        try:
+            rest_api._analytics_index = real_idx
+            # Fresh REST TTL cache so prior tests' entries don't interfere.
+            rest_api._cache = type(prev_cache)()
+            for off in range(0, 25, 5):
+                r = client.get(f'/analytics/top-addresses?limit=5&offset={off}')
+                assert r.status_code == 200
+            # 5 distinct offsets => 5 REST cache misses, but only ONE keyspace scan.
+            assert scan_count['n'] == 1
+        finally:
+            rest_api._analytics_index = prev
+            rest_api._cache = prev_cache
+
+
+# ===========================================================================
+# LOW — Unbounded query params (protocols / algorithm_ids)
+# ===========================================================================
+
+class TestQueryParamLengthBounds:
+
+    def test_protocols_too_long_rejected(self, client, mock_glyph_index):
+        long_val = '1,' * 200  # 400 chars > max_length 256
+        resp = client.get(f'/glyphs/search?q=x&protocols={long_val}')
+        assert resp.status_code == 422
+
+    def test_algorithm_ids_too_long_rejected(self, client, mock_dmint_contracts):
+        long_val = '1,' * 200  # > max_length 256
+        resp = client.get(f'/dmint/contracts?algorithm_ids={long_val}')
+        assert resp.status_code == 422
+
+    def test_protocols_within_bound_accepted(self, client, mock_glyph_index):
+        resp = client.get('/glyphs/search?q=x&protocols=1,2,3')
+        assert resp.status_code == 200

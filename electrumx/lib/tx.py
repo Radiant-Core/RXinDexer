@@ -174,7 +174,20 @@ class Deserializer(object):
             ref_dict[ref] = True 
         push_input_refs_hash = None
         if len(ref_dict) > 0:
-            push_input_refs_hash = double_sha256(b''.join(sorted(ref_dict.keys())))
+            # Order refs exactly as Radiant Core does.  Core collects them in a
+            # std::set<uint288> and hashes them in set order; uint288 ordering is
+            # base_blob::Compare, which compares the 36 bytes MSB-first IN REVERSE
+            # ("the data is little endian" — src/uint256.h), i.e. it treats each
+            # ref as a little-endian 288-bit integer (last script byte is most
+            # significant).  Python's default bytes sort is big-endian (first byte
+            # most significant), so for any output carrying >=2 distinct push-refs
+            # it would order them differently and compute a DIFFERENT v3 txid than
+            # the node.  Reverse each ref for the sort key only; the bytes joined
+            # into the hash stay in script order, matching Core's uint288 Serialize.
+            # (For 0 or 1 ref this is a no-op, so single-ref outputs are unchanged.)
+            push_input_refs_hash = double_sha256(
+                b''.join(sorted(ref_dict.keys(), key=lambda ref: ref[::-1]))
+            )
         else:
             push_input_refs_hash = zeroRef
         

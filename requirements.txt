@@ -1,3 +1,28 @@
+# ============================================================================
+# SUPPLY-CHAIN HARDENING (recommended — not yet applied)
+# ----------------------------------------------------------------------------
+# The dependencies below use floating version ranges and carry NO hashes, so a
+# compromised or yanked release on PyPI could be pulled into a build. For
+# reproducible, tamper-evident deploys, generate a fully-pinned + hashed
+# lockfile and install from it instead of from these ranges:
+#
+#   pip install pip-tools
+#   pip-compile --generate-hashes --output-file requirements.lock requirements.txt
+#   pip install --require-hashes -r requirements.lock
+#
+# Regenerate the lockfile whenever a range here changes, and commit it.
+# (These ranges are intentionally left in place: blindly hard-pinning untested
+#  versions can break deploys — pin via the generated lockfile, build-tested.)
+#
+# Base-image hardening (Dockerfile / docker/full-stack/Dockerfile): the images
+# use moving tags (ubuntu:22.04, python:3.11-slim) which can change underfoot.
+# Digest-pin them so a build is byte-reproducible, e.g.:
+#   FROM ubuntu:22.04@sha256:<digest>
+# Resolve the current digest with (requires registry/network access):
+#   docker pull ubuntu:22.04 && \
+#     docker inspect --format='{{index .RepoDigests 0}}' ubuntu:22.04
+# ============================================================================
+
 aiorpcx[ws]>=0.22,<0.26
 attrs
 plyvel
@@ -13,3 +38,9 @@ fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.5.0
 prometheus-client>=0.20.0
+
+# OPTIONAL: RSWP swap-order signature verification (C3-auth, Part B).
+# Only needed when SWAP_VERIFY_SIGNATURES is enabled — the indexer runs fine
+# without it (verification stays default-off, see electrumx/lib/rswp_verify.py).
+# Install explicitly to opt in to ECDSA verification of swap advertisements.
+coincurve>=18,<22

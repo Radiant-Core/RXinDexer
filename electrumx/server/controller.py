@@ -15,6 +15,7 @@ from electrumx.lib.server_base import ServerBase
 from electrumx.lib.util import version_string
 from electrumx.server.db import DB
 from electrumx.server.mempool import MemPool, MemPoolAPI
+from electrumx.server.rate_limiter import init_rate_limiters
 from electrumx.server.session import SessionManager
 
 
@@ -97,6 +98,12 @@ class Controller(ServerBase):
         self.logger.info(f'supported protocol versions: {min_str}-{max_str}')
         self.logger.info(f'event loop policy: {env.loop_policy}')
         self.logger.info(f'reorg limit is {env.reorg_limit:,d} blocks')
+
+        # Install the process-global IP-persistent, proxy-aware rate limiter
+        # (H3 follow-up) before any sessions can be created.  SessionManager
+        # also calls this; doing it here makes the install order explicit and
+        # ensures the global exists for the whole serve lifetime.
+        init_rate_limiters(env)
 
         notifications = Notifications()
         Daemon = env.coin.DAEMON

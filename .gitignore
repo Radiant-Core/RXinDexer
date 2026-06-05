@@ -29,6 +29,7 @@ env/
 
 # Database files (runtime data — never commit)
 electrumdb/
+electrumdb.bak*/
 electrumx-db/
 electrumx-db-*/
 *.ldb

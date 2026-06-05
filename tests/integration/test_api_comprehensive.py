@@ -9,7 +9,9 @@ Can be run with pytest: pytest test_api_comprehensive.py -v
 import asyncio
 import json
 import os
+import socket
 import pytest
+import pytest_asyncio
 from typing import Any, Dict, List
 
 # Configuration
@@ -50,9 +52,36 @@ class AsyncElectrumClient:
         return json.loads(response.decode())
 
 
-@pytest.fixture
+@pytest.fixture(scope="module", autouse=True)
+def _require_electrumx_server():
+    """Skip (don't error) the whole module when no live ElectrumX backend is up.
+
+    These are live integration tests against a running ElectrumX TCP server.
+    Without this guard, a missing backend (e.g. CI with no stack provisioned)
+    surfaces as connection-refused *errors* on every test. Skipping instead lets
+    the suite gate on real contract failures while staying green where there is
+    nothing to talk to.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
+    try:
+        s.connect((HOST, PORT))
+    except OSError as e:
+        pytest.skip(f"ElectrumX TCP server not reachable at {HOST}:{PORT}: {e}")
+    finally:
+        s.close()
+
+
+@pytest_asyncio.fixture
 async def client():
-    """Create client fixture."""
+    """Create client fixture.
+
+    Decorated with @pytest_asyncio.fixture (not @pytest.fixture): under
+    pytest-asyncio's default ``strict`` mode a plain @pytest.fixture on an async
+    generator is never awaited, so each test receives the raw async_generator
+    object — hence the "'async_generator' object has no attribute 'call'" error.
+    The dedicated decorator resolves the generator into the yielded client.
+    """
     async with AsyncElectrumClient(HOST, PORT) as c:
         yield c
 
@@ -115,8 +144,13 @@ async def test_glyph_get_balance(client):
 
 @pytest.mark.asyncio
 async def test_glyph_list_tokens(client):
-    """Test glyph.list_tokens returns list."""
-    response = await client.call("glyph.list_tokens", [10, 0])
+    """Test glyph.list_tokens returns list.
+
+    list_tokens(scripthash, limit) lists the tokens held by an address; the
+    first param is a 64-hex scripthash (not a limit/offset pair). With the
+    cursor omitted it returns the legacy plain-list shape.
+    """
+    response = await client.call("glyph.list_tokens", ["0" * 64, 10])
     assert "result" in response or "error" in response
     if "result" in response:
         assert isinstance(response["result"], list)

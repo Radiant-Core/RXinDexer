@@ -131,3 +131,97 @@ def test_analytics_process_block_updates_summaries():
     assert stats["enabled"] is True
     assert stats["last_processed_height"] == 144
     assert stats["rich_list_entries"] == 2
+
+
+# ---------------------------------------------------------------------------
+# M1 (DoS): the rich-list / get_stats full keyspace scan must be cached so an
+# attacker rotating `offset` cannot force a fresh scan on every request.
+# ---------------------------------------------------------------------------
+
+class _CountingUtxoDB(FakeUtxoDB):
+    """FakeUtxoDB that counts how many times the BALANCE prefix is scanned."""
+
+    def __init__(self):
+        super().__init__()
+        self.balance_scan_count = 0
+
+    def iterator(self, prefix=b"", reverse=False, include_value=True):
+        from electrumx.server.analytics_index import AnalyticsDBKeys
+        if prefix == AnalyticsDBKeys.BALANCE:
+            self.balance_scan_count += 1
+        return super().iterator(prefix=prefix, reverse=reverse, include_value=include_value)
+
+
+def _seed_balances(db, env, n=50):
+    from electrumx.server.analytics_index import AnalyticsDBKeys
+    for i in range(n):
+        hashX = bytes([i % 256]) * 11
+        key = AnalyticsDBKeys.BALANCE + hashX + i.to_bytes(2, "big")
+        db.utxo_db._store[key] = struct.pack("<Q", (i + 1) * env.coin.VALUE_PER_COIN)
+
+
+def test_top_addresses_scan_cached_across_offset_rotation():
+    """Rotating `offset` must reuse the cached scan, not re-scan the keyspace."""
+    from electrumx.server.analytics_index import AnalyticsIndex
+
+    db = FakeDB()
+    db.utxo_db = _CountingUtxoDB()
+    env = FakeEnv()
+    _seed_balances(db, env, n=50)
+
+    idx = AnalyticsIndex(db, env)
+
+    # Rotate offset across many requests (the attacker pattern).
+    for off in range(0, 30, 5):
+        idx.get_top_addresses(limit=10, offset=off)
+
+    # get_stats() reuses the same cached pool — still no extra scan.
+    idx.get_stats()
+
+    # Despite 6 paginated calls + get_stats, the BALANCE keyspace is scanned once.
+    assert db.utxo_db.balance_scan_count == 1
+
+
+def test_top_addresses_offset_clamped_to_pool():
+    """An over-cap offset is clamped at the index layer (defence in depth)."""
+    from electrumx.server import analytics_index as ai
+
+    db = FakeDB()
+    db.utxo_db = _CountingUtxoDB()
+    env = FakeEnv()
+    _seed_balances(db, env, n=10)
+
+    idx = ai.AnalyticsIndex(db, env)
+    huge = ai.TOP_ADDRESSES_MAX_OFFSET + 1_000_000
+    result = idx.get_top_addresses(limit=10, offset=huge)
+    # Clamped offset never exceeds the cap and never triggers a second scan.
+    assert result["offset"] == ai.TOP_ADDRESSES_MAX_OFFSET
+    assert db.utxo_db.balance_scan_count == 1
+
+
+def test_movement_stops_scanning_past_window():
+    """get_movement must not read day-keys beyond current_day (bounded scan)."""
+    from electrumx.server.analytics_index import AnalyticsDBKeys, AnalyticsIndex
+    import json as _json
+
+    db = FakeDB()
+    env = FakeEnv()
+    idx = AnalyticsIndex(db, env)
+
+    # last_processed_height=144 -> current_day = 1. Seed days 0..5; days 2..5
+    # are "future" relative to the window and must not be decoded.
+    idx._set_summary(0, b"last_processed_height", 144)
+    idx.flush(FakeBatch(db.utxo_db._store))
+    for day in range(0, 6):
+        key = AnalyticsDBKeys.DAILY + day.to_bytes(4, "big")
+        db.utxo_db._store[key] = _json.dumps(
+            {"coins_moved": day, "active_addresses": day, "new_addresses": day}
+        ).encode()
+
+    # Sentinel: a non-JSON value on a future day would raise if it were read.
+    db.utxo_db._store[AnalyticsDBKeys.DAILY + (5).to_bytes(4, "big")] = b"NOT_JSON"
+
+    result = idx.get_movement(days=2)  # window = days [0, 1]
+    assert result["days"] == 2
+    returned_days = {item["day"] for item in result["series"]}
+    assert returned_days == {0, 1}

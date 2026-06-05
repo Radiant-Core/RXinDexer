@@ -16,7 +16,7 @@ import ssl
 import time
 from collections import defaultdict
 from functools import partial
-from ipaddress import IPv4Address, IPv6Address
+from ipaddress import IPv4Address, IPv6Address, ip_address
 
 import attr
 from aiorpcx import (
@@ -39,6 +39,7 @@ from electrumx.lib.hash import (sha256, hash_to_hex_str, hex_str_to_hash, HASHX_
 from electrumx.lib.util import hex_to_bytes
 from electrumx.server.daemon import DaemonError
 from electrumx.server.peers import PeerManager
+from electrumx.server.rate_limiter import init_rate_limiters
 
 
 BAD_REQUEST = 1
@@ -137,6 +138,11 @@ class SessionManager:
         self.daemon = daemon
         self.mempool = mempool
         self.peer_mgr = PeerManager(env, db)
+        # IP-persistent, proxy-aware rate limiter (H3 follow-up).  Installed as
+        # the process-global instance and also held here for the session layer.
+        # State persists across reconnects so a many-connection / reconnect-loop
+        # bypass of the per-session subscription cap is closed.
+        self.ip_rate_limiter = init_rate_limiters(env)
         self.shutdown_event = shutdown_event
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.servers = {}           # service->server
@@ -309,11 +315,19 @@ class SessionManager:
         '''Clear caches on chain reorgs.'''
         while True:
             await self.bp.backed_up_event.wait()
-            self.logger.info('reorg signalled; clearing tx_hashes, merkle and ref_get caches')
+            self.logger.info('reorg signalled; clearing tx_hashes, merkle, '
+                             'ref_get, status and history caches')
             self._reorg_count += 1
             self._tx_hashes_cache.clear()
             self._merkle_cache.clear()
             self._ref_get_cache.clear()
+            # Defense-in-depth: a deep reorg can change confirmed history for
+            # hashXs that are not in the reorg's touched set, leaving a stale
+            # confirmed-status / history entry cached.  These caches (added in
+            # a8c788f) are normally invalidated per-touched-hashX by
+            # _notify_sessions, but clear them wholesale on reorg too.
+            self._status_cache.clear()
+            self._history_cache.clear()
 
     async def _recalc_concurrency(self):
         '''Periodically recalculate session concurrency.'''
@@ -955,7 +969,22 @@ class SessionManager:
                 await group.spawn(session.notify, touched, height_changed)
 
     def _ip_addr_group_name(self, session):
-        host = session.remote_address().host
+        limiter = self.ip_rate_limiter
+        # Proxy-aware grouping: when a trusted proxy is configured the socket
+        # peer is the proxy (loopback), so group on the real forwarded client
+        # IP and do NOT exempt the private/loopback proxy peer.  When no
+        # trusted proxy is configured, behaviour is unchanged (socket peer,
+        # private addresses exempt).
+        if limiter is not None and getattr(limiter, 'trust_proxy', False):
+            client_ip = limiter.client_ip(session)
+            if client_ip is None:
+                return 'unknown_addr'
+            try:
+                host = ip_address(client_ip)
+            except ValueError:
+                return 'unknown_addr'
+        else:
+            host = session.remote_address().host
         if isinstance(host, IPv4Address):
             if host.is_private:  # exempt private addresses
                 return None
@@ -965,6 +994,45 @@ class SessionManager:
                 return None
             return ':'.join(host.exploded.split(':')[:3])  # /48
         return 'unknown_addr'
+
+    def client_ip(self, session):
+        '''Resolve the real client IP for a session (proxy-aware).
+
+        Delegates to the IP rate limiter so the proxy-trust model is defined in
+        one place.  Returns None if no limiter is installed.
+        '''
+        limiter = self.ip_rate_limiter
+        if limiter is None:
+            return None
+        return limiter.client_ip(session)
+
+    def ip_glyph_sub_count(self, ip):
+        '''Live aggregate glyph/swap/wave/dmint subscription count for an IP.
+
+        Sums the per-session subscription counts (held authoritatively by the
+        GlyphSubscriptionManager) across every live session whose resolved
+        client IP matches.  This is the value enforced against the aggregate
+        per-IP subscription cap; it is computed on demand so it never drifts
+        from the real subscription maps.
+        '''
+        if ip is None:
+            return 0
+        bp = getattr(self, 'bp', None)
+        subs = getattr(bp, 'subscriptions', None) if bp is not None else None
+        if subs is None:
+            return 0
+        session_subs = getattr(subs, 'session_subs', None)
+        if not session_subs:
+            return 0
+        total = 0
+        for session in self.sessions:
+            if getattr(session, 'client_ip', None) != ip:
+                continue
+            sid = session.session_id
+            entry = session_subs.get(sid)
+            if entry:
+                total += len(entry)
+        return total
 
     def _timeslice_name(self, session):
         return f't{int(session.start_time - self.start_time) // 300}'
@@ -980,6 +1048,11 @@ class SessionManager:
 
     def add_session(self, session):
         self.session_event.set()
+        # Register the session against its (proxy-aware) client IP and carry any
+        # PERSISTED per-IP cost into this session's starting cost, so a client
+        # that drops and reconnects does not reset its throttle.  Done before
+        # building groups so the session's cached client_ip is available.
+        self._register_session_ip(session)
         # Return the session groups
         groups = (
             self._session_group(self._timeslice_name(session), 0.03),
@@ -992,9 +1065,48 @@ class SessionManager:
         for group in groups:
             group.sessions.add(session)
 
+    def _register_session_ip(self, session):
+        '''Register the session with the IP rate limiter and seed its cost.'''
+        limiter = self.ip_rate_limiter
+        if limiter is None:
+            return
+        try:
+            client_ip = limiter.client_ip(session)
+            session.client_ip = client_ip
+            persisted_cost = limiter.register_session(client_ip, session.session_id)
+            # Seed the aiorpcx session cost from the persisted IP cost so the
+            # throttle survives reconnects, but never lower the session's own
+            # base connection cost.  Remember the seed so connection_lost folds
+            # back only the EXTRA cost this session incurred (no double count).
+            if persisted_cost and persisted_cost > getattr(session, 'cost', 0.0):
+                session.cost = persisted_cost
+            session._ip_seed_cost = getattr(session, 'cost', 0.0)
+        except Exception:
+            self.logger.debug('IP rate-limit registration failed', exc_info=True)
+
     def remove_session(self, session):
         '''Remove a session from our sessions list if there.'''
         self.session_event.set()
+        # Detach from the IP rate limiter WITHOUT dropping the per-IP state:
+        # write back this session's accumulated cost so sequential abuse keeps
+        # building up, release its share of the aggregate sub count, and start
+        # the idle-TTL clock.  State is retained for reconnects until the TTL.
+        limiter = self.ip_rate_limiter
+        if limiter is not None:
+            try:
+                # Fold back only the cost this session incurred BEYOND the seed
+                # it inherited from the IP state, so seeding-on-connect plus
+                # write-back-on-disconnect does not double count.
+                seed = getattr(session, '_ip_seed_cost', 0.0)
+                extra = max(0.0, getattr(session, 'cost', 0.0) - seed)
+                limiter.release_session(
+                    getattr(session, 'client_ip', None),
+                    session.session_id,
+                    session_cost=extra,
+                    sub_count=session.sub_count(),
+                )
+            except Exception:
+                self.logger.debug('IP rate-limit release failed', exc_info=True)
         groups = self.sessions.pop(session)
         if session.session_id is not None:
             self.sessions_by_id.pop(session.session_id, None)
@@ -1051,6 +1163,12 @@ class SessionBase(RPCSession):
         self.txs_sent = 0
         self.log_me = SessionBase.log_new
         self.session_id = None
+        # Resolved client IP for per-IP rate limiting (proxy-aware); set in
+        # SessionManager.add_session.  Default None so the limiter degrades
+        # gracefully if registration is skipped.
+        self.client_ip = None
+        # Cost the session inherited from persisted per-IP state on connect.
+        self._ip_seed_cost = 0.0
         self.daemon_request = self.session_mgr.daemon_request
         self.session_id = next(self.session_counter)
         context = {'conn_id': f'{self.session_id}'}
@@ -1111,6 +1229,52 @@ class SessionBase(RPCSession):
     def sub_count(self):
         return 0
 
+    # Method-name prefixes whose acceptance grows process-global subscription
+    # state; these consult the AGGREGATE per-IP subscription cap before the
+    # handler runs (the per-session cap lives in GlyphSubscriptionManager).
+    _SUBSCRIBE_PREFIXES = ('glyph.subscribe', 'swap.subscribe',
+                           'wave.subscribe', 'dmint.subscribe')
+
+    def _ip_rate_check(self, method):
+        '''Consult the per-IP rate limiter for an incoming request method.
+
+        Returns an RPCError to raise (rejecting the request) or None to allow.
+        Degrades to None (allow) whenever no limiter is installed or the
+        session has no resolved client IP, so the live path never breaks.
+        '''
+        limiter = getattr(self.session_mgr, 'ip_rate_limiter', None)
+        if limiter is None or not getattr(limiter, 'enabled', False):
+            return None
+        ip = getattr(self, 'client_ip', None)
+        if ip is None:
+            return None
+        # Keep the per-IP aggregate cost in step with this session's current
+        # aiorpcx cost (which the bump_cost path maintains), then enforce the
+        # per-IP hard ceiling.  add_cost folds in the delta beyond the seed.
+        try:
+            seed = getattr(self, '_ip_seed_cost', 0.0)
+            delta = max(0.0, getattr(self, 'cost', 0.0) - seed)
+            if delta:
+                limiter.add_cost(ip, delta)
+                # Move the seed forward so we add only NEW cost next time.
+                self._ip_seed_cost = self.cost
+            allowed, reason = limiter.check_cost(ip)
+            if not allowed:
+                return RPCError(BAD_REQUEST, reason)
+            if method and method.startswith(self._SUBSCRIBE_PREFIXES):
+                # Use the authoritative live aggregate count across this IP's
+                # sessions (from the GlyphSubscriptionManager), so the cap holds
+                # even across many concurrent connections from one IP.
+                current = self.session_mgr.ip_glyph_sub_count(ip)
+                allowed, reason = limiter.check_can_subscribe(ip, current=current)
+                if not allowed:
+                    return RPCError(BAD_REQUEST, reason)
+        except Exception:
+            # Never let the rate limiter break request handling.
+            self.logger.debug('IP rate-limit check failed', exc_info=True)
+            return None
+        return None
+
     async def handle_request(self, request):
         '''Handle an incoming request.  ElectrumX doesn't receive
         notifications from client sessions.
@@ -1121,6 +1285,10 @@ class SessionBase(RPCSession):
             handler = None
         method = 'invalid method' if handler is None else request.method
         self.session_mgr._method_counts[method] += 1
+        # Per-IP rate limit (aggregate across this IP's sessions / reconnects).
+        rate_error = self._ip_rate_check(request.method if handler is not None else None)
+        if rate_error is not None:
+            raise rate_error
         coro = handler_invocation(handler, request)()
         return await coro
 
@@ -1141,7 +1309,14 @@ class ElectrumX(SessionBase):
         self.mempool_statuses = {}
         self.set_request_handlers(self.PROTOCOL_MIN)
         self.is_peer = False
-        self.cost = 5.0   # Connection cost
+        # Base connection cost.  add_session() (run in super().__init__) may
+        # already have seeded a HIGHER cost from the persisted per-IP state so a
+        # reconnect stays throttled; never lower it back to the base here.
+        if getattr(self, 'cost', 0.0) < 5.0:
+            self.cost = 5.0   # Connection cost
+        # Keep the IP seed in sync with the (possibly raised) base cost so
+        # connection_lost folds back only the extra cost this session incurred.
+        self._ip_seed_cost = self.cost
 
     @classmethod
     def protocol_min_max_strings(cls):

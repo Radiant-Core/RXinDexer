@@ -640,7 +640,8 @@ class TestWaveTargetUpdate:
 
     OLD_TARGET = '1BLZiLHCV17EqLWA9S42aFZScCnF1zbnPE'
     NEW_TARGET = '1489r9fYzC9VgueuT16CPWiRRx4HKacYbB'
-    SINGLETON_REF = bytes.fromhex('22' * 32) + struct.pack('<I', 1)  # 36 bytes
+    # The name's own NFT singleton lives on the CLAIM output (vout 0).
+    SINGLETON_REF = bytes.fromhex('22' * 32) + struct.pack('<I', 0)  # 36 bytes
 
     @pytest.fixture
     def mock_db(self):
@@ -653,12 +654,14 @@ class TestWaveTargetUpdate:
 
     @pytest.fixture
     def mock_env(self):
+        from electrumx.lib.coins import Radiant
         env = Mock()
         env.wave_index = True
         env.wave_genesis_ref = 'a' * 64 + '_0'
         env.wave_hot_names = 1000
         env.reorg_limit = 10
-        env.coin.hashX_from_script = Mock(return_value=b'\x00' * 11)
+        # Use the real coin so target-address base58 validation is exercised.
+        env.coin = Radiant
         env.glyph_index = None
         return env
 
@@ -680,7 +683,7 @@ class TestWaveTargetUpdate:
         }
         wave_index.process_tx(
             bytes.fromhex('e5' * 32), self._tx(), 410000, 0, envelope,
-            output_refs_by_vout={1: [(self.SINGLETON_REF, 1)]},
+            output_refs_by_vout={0: [(self.SINGLETON_REF, 1)]},
             spent_singleton_refs=set(),
         )
 
@@ -694,7 +697,7 @@ class TestWaveTargetUpdate:
         }
         wave_index.process_tx(
             bytes.fromhex('f7' * 32), self._tx(), 435095, 0, envelope,
-            output_refs_by_vout={1: [(self.SINGLETON_REF, 1)]},
+            output_refs_by_vout={0: [(self.SINGLETON_REF, 1)]},
             spent_singleton_refs={self.SINGLETON_REF},
         )
 
@@ -722,9 +725,13 @@ class TestWaveTargetUpdate:
     def test_mod_update_unknown_singleton_ignored(self, wave_index):
         self._register(wave_index)
         # A mod that spends some OTHER singleton must not touch this name.
+        # Use a VALID target so we're exercising the unknown-singleton path,
+        # not target-validation rejection.
         envelope = {
             'protocols': [],
-            'metadata': {'attrs': {'target': 'HIJACK', 'target_type': 'address'}},
+            'metadata': {'attrs': {
+                'target': self.NEW_TARGET, 'target_type': 'address',
+            }},
         }
         wave_index.process_tx(
             bytes.fromhex('cc' * 32), self._tx(), 435100, 0, envelope,

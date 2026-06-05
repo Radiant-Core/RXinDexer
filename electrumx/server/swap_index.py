@@ -72,6 +72,75 @@ class OrderSide:
     SELL = 1
 
 
+# Maximum value representable in the on-disk uint64 price/amount keys.  Order
+# amounts are parsed from attacker-controlled OP_RETURN payloads, so any value
+# outside this range is rejected before it can reach struct.pack('>Q', ...) in
+# flush() — an out-of-range value there raises struct.error and would abort the
+# entire shared write batch (UTXO + glyph + wave + state), wedging the indexer.
+MAX_UINT64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _order_amounts_in_range(order) -> bool:
+    """True iff every numeric field that is packed or keyed fits a uint64.
+
+    Guards the flush-time ``struct.pack('>Q', price)`` and ``bytes([side])``
+    calls against negative/oversized values decoded from untrusted scriptnums.
+    """
+    for value in (order.price, order.amount, order.remaining_amount,
+                  order.filled_amount, order.min_fill):
+        if not isinstance(value, int) or value < 0 or value > MAX_UINT64:
+            return False
+    return isinstance(order.side, int) and 0 <= order.side <= 255
+
+
+# Length of one ref entry in a b'ri' record: 36-byte ref (txid_internal + LE
+# vout) + 1 type byte (0=normal/FT, 1=singleton/NFT).  block_processor writes
+# the b'ri'+outpoint value as a flat concatenation of these entries.
+REF_ENTRY_LEN = 37
+REF_LEN = 36
+
+
+def _advertised_token_hash(order) -> Optional[bytes]:
+    """Return the 32-byte SHA-256 token identifier the order advertises, or None.
+
+    The RSWP advertisement does NOT carry the offered token's raw 36-byte ref;
+    it carries ``offeredTokenId = sha256(ref_36)`` pushed byte-REVERSED (Photonic
+    ``assetToSwapTokenId`` in swapBroadcast.ts + ``buildSwapAdvertisementScript``
+    in Swap.tsx, which ``.reverse()``-es the 32-byte hash before the push).  The
+    parser stores that on-script (reversed) value verbatim as ``base_ref[:32]``,
+    so to recover the canonical ``sha256(ref_36)`` we reverse it back.
+
+    Returns None for an RXD-offered order (token id == 32 zero bytes), which has
+    no token ref to back-check, and for a malformed/short base_ref.
+    """
+    base_ref = order.base_ref
+    if not base_ref or len(base_ref) < 32:
+        return None
+    token_hash = base_ref[:32][::-1]
+    if token_hash == b'\x00' * 32:
+        return None  # RXD offer — nothing to verify on-chain.
+    return token_hash
+
+
+def _backing_utxo_carries_token(ri_record: bytes, token_hash: bytes) -> bool:
+    """True iff a b'ri' record contains a ref whose sha256 == ``token_hash``.
+
+    ``ri_record`` is the on-disk ``b'ri'+outpoint`` value: a flat concatenation
+    of 37-byte entries (36-byte ref + 1 type byte).  The advertised token id is
+    ``sha256(ref_36)`` (see :func:`_advertised_token_hash`), so we hash each raw
+    ref entry and compare.  This is the only deterministic bridge between the
+    two representations — the indexer never persists ``sha256(ref)`` keyed data.
+    """
+    n = len(ri_record)
+    off = 0
+    while off + REF_ENTRY_LEN <= n:
+        ref_36 = ri_record[off:off + REF_LEN]
+        if sha256(ref_36) == token_hash:
+            return True
+        off += REF_ENTRY_LEN
+    return False
+
+
 class SwapOrderInfo:
     """
     Represents an indexed swap order.
@@ -160,6 +229,14 @@ class SwapOrderInfo:
             'afp': self.avg_fill_price,
         }
         data = {k: v for k, v in data.items() if v is not None and v != 0 and v != b''}
+        # 'sd' (side) MUST always persist: OrderSide.BUY == 0 would otherwise be
+        # stripped and read back as the SELL default, flipping the order side.
+        # That side byte is part of the OPEN_BY_PAIR key, so a dropped BUY would
+        # make the close path reconstruct a SELL key and leak a phantom orderbook
+        # entry on close.  Likewise 'st' (status): OrderStatus.OPEN == 0 happens
+        # to round-trip via the from_bytes default, but pin it for clarity.
+        data['sd'] = self.side
+        data['st'] = self.status
         return cbor2.dumps(data)
     
     @classmethod
@@ -272,18 +349,53 @@ class SwapIndex:
             self.logger.info('Swap order indexing enabled')
     
     def process_tx(self, tx_hash: bytes, tx, height: int, tx_idx: int,
-                   glyph_envelope: Dict[str, Any] = None):
+                   glyph_envelope: Dict[str, Any] = None,
+                   spent_outpoints: set = None):
         """
         Process a transaction for swap orders.
-        
+
         Detects RSWP protocol advertisements in OP_RETURN outputs.
         Format based on Radiant-Core swapindex.cpp implementation.
+
+        Lifecycle (close-on-spend): an order's ``order_id`` is byte-for-byte the
+        backing outpoint it advertises (``utxoHash + <utxoIndex LE u32>``).  When
+        that outpoint is spent, the order can no longer be filled, so we close it.
+        ``spent_outpoints`` is the per-tx set of spent outpoints already computed
+        by the block processor in the identical ``prev_hash + LE(prev_idx)`` form,
+        so a spent outpoint equals an order_id under an O(1) lookup with no
+        transform.  Reorg unwinding reopens closed orders via the undo machinery.
+
+        Authorization (C3-auth): before an order is admitted to
+        ``order_cache`` we run :meth:`_backing_utxo_offers_token` (Part A), which
+        rejects orders whose advertised backing UTXO demonstrably does not carry
+        the offered token (present-but-mismatched ``b'ri'`` record; absent
+        records are accepted to avoid same-block false positives).
+
+        RSWP *signature* verification (Part B) lives in
+        ``electrumx.lib.rswp_verify`` and is intentionally NOT wired into this
+        block-processing path: sourcing the backing scriptPubKey here is
+        unresolved (it is not persisted, and a daemon RPC inside the sync loop is
+        an anti-pattern), and the ECDSA step cannot be validated without an
+        optional ``coincurve`` build.  It is exposed as an opt-in hook
+        (``SWAP_VERIFY_SIGNATURES`` env flag, default off) so it can never reject
+        legitimate orders until validated in a crypto-capable environment.  See
+        that module's docstring for the two integration options.
         """
         if not self.enabled:
             return
-        
+
         timestamp = int(time.time())
-        
+
+        # Close-on-spend: walk every outpoint this tx consumed.  Any one that is
+        # an open order's backing UTXO closes that order.  Done BEFORE the output
+        # scan so a same-block create+spend (order minted then immediately spent
+        # in a later tx of the same block) is closed from the cache and never
+        # leaks into the OPEN_BY_* indexes.
+        if spent_outpoints:
+            for outpoint in spent_outpoints:
+                self._close_order_if_open(outpoint, tx_hash, height, tx_idx,
+                                          timestamp)
+
         for vout_idx, txout in enumerate(tx.outputs):
             script = txout.pk_script
             
@@ -294,9 +406,133 @@ class SwapIndex:
             # Parse RSWP advertisement
             order = self._parse_rswp_advertisement(script, tx_hash, vout_idx, height, timestamp)
             if order:
+                if not _order_amounts_in_range(order):
+                    self.logger.warning(
+                        'Rejecting swap order %s: price/amount out of uint64 range '
+                        '(price=%r amount=%r side=%r)',
+                        hash_to_hex_str(order.order_id), order.price, order.amount,
+                        order.side
+                    )
+                    continue
+                if not self._backing_utxo_offers_token(order):
+                    continue
                 self.order_cache[order.order_id] = order
                 self.order_height[order.order_id] = height
                 self.logger.debug(f'Indexed swap order: {hash_to_hex_str(order.order_id)}')
+
+    def _close_order_if_open(self, order_id: bytes, tx_hash: bytes,
+                             height: int, tx_idx: int, timestamp: int):
+        """Close the order whose backing outpoint == ``order_id``, if any.
+
+        Resolves the order from the in-memory cache first (covers same-block
+        create+spend) and falls back to the on-disk ORDER record.  Spending an
+        outpoint that is not a known order is a no-op: we deliberately write NO
+        tombstone, because ``order_id`` here is an attacker-controlled spent
+        outpoint and recording one record per spend would be unbounded state.
+
+        Idempotent: an order already in a terminal status (FILLED/CANCELLED/
+        EXPIRED) is left untouched, which is required for reorg replay and for a
+        tx that lists the same outpoint twice / two txs spending sibling outputs.
+        """
+        # Same-block create+spend: the freshly minted order lives in the cache.
+        order = self.order_cache.get(order_id)
+        if order is None:
+            order = self.get_order(order_id)
+        if order is None:
+            return  # Unknown outpoint — never create a record for it.
+
+        if order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED,
+                            OrderStatus.EXPIRED):
+            return  # Already closed — idempotent.
+
+        order.status = OrderStatus.FILLED
+        order.cancel_height = height
+        order.cancel_txid = tx_hash
+        # Re-stage into the flush caches so flush() rewrites the ORDER record
+        # with terminal status and removes the OPEN_BY_* index keys.  Record the
+        # close at THIS height so reorg backup() at this height reopens it.
+        self.order_cache[order_id] = order
+        self.order_height[order_id] = height
+
+    def _backing_utxo_offers_token(self, order: SwapOrderInfo) -> bool:
+        """Authorization (C3-auth, Part A): does the backing UTXO carry the
+        offered token?
+
+        An order's ``order_id`` IS the backing outpoint it advertises
+        (``utxoHash + LE(utxoIndex)``), which is exactly the key shape
+        block_processor uses for its ref side table (``b'ri' + outpoint`` ->
+        concatenated 37-byte ``ref(36)+type(1)`` entries).  We look that record
+        up and require it to contain a ref whose ``sha256`` equals the offered
+        token id (see :func:`_advertised_token_hash` /
+        :func:`_backing_utxo_carries_token`).
+
+        Decision rule (MUST stay deterministic + false-positive-free, because a
+        wrong reject would silently diverge nodes at different flush boundaries):
+
+          * record ABSENT  -> ACCEPT.  The backing UTXO may have been created in
+            this same block and not yet flushed to ``b'ri'``; rejecting here
+            would be a false positive.  (It would also reject RXD-only backing
+            UTXOs, which legitimately have no ref record.)
+          * token id is RXD/zero or base_ref malformed -> ACCEPT (nothing to
+            check on-chain).
+          * record PRESENT but contains no ref hashing to the offered token id
+            -> REJECT: the advertised UTXO demonstrably does not carry the
+            offered token.
+
+        Returns True to admit the order, False to skip it.
+        """
+        token_hash = _advertised_token_hash(order)
+        if token_hash is None:
+            return True  # RXD offer / malformed base_ref — nothing to verify.
+
+        ri_record = self.db.utxo_db.get(b'ri' + order.order_id)
+        if not ri_record:
+            return True  # Absent (possibly same-block, not yet flushed) — accept.
+
+        if _backing_utxo_carries_token(ri_record, token_hash):
+            return True
+
+        self.logger.warning(
+            'Rejecting swap order %s: backing UTXO does not carry offered token '
+            '(token_hash=%s, ri entries=%d)',
+            hash_to_hex_str(order.order_id), token_hash.hex(),
+            len(ri_record) // REF_ENTRY_LEN,
+        )
+        return False
+
+    def _pair_key(self, order: SwapOrderInfo) -> Optional[bytes]:
+        """Build the OPEN_BY_PAIR orderbook key for ``order``, or None.
+
+        Returns None when the order lacks base_ref/quote_ref.  Used by BOTH the
+        open path (put b'') and the close path (delete) so the exact same bytes
+        are reconstructed and the index key can never drift / leak.  BUY orders
+        invert the price (MAX_UINT64 - price) so higher bids sort first; SELL
+        orders key on price directly.  May raise on an out-of-range price; the
+        caller computes it inside the flush guard before mutating the batch.
+        """
+        if not (order.base_ref and order.quote_ref):
+            return None
+        if order.side == OrderSide.BUY:
+            price_key = struct.pack('>Q', MAX_UINT64 - order.price)
+        else:
+            price_key = struct.pack('>Q', order.price)
+        return (
+            SwapDBKeys.OPEN_BY_PAIR
+            + order.base_ref
+            + order.quote_ref
+            + bytes([order.side])
+            + price_key
+            + order.order_id
+        )
+
+    def _maker_key(self, order: SwapOrderInfo) -> Optional[bytes]:
+        """Build the OPEN_BY_MAKER key for ``order``, or None if no maker.
+
+        Used by BOTH open (put) and close (delete) paths so the bytes match.
+        """
+        if not order.maker_scripthash:
+            return None
+        return SwapDBKeys.OPEN_BY_MAKER + order.maker_scripthash + order.order_id
 
     def _undo_key(self, height: int) -> bytes:
         return SwapDBKeys.UNDO + pack_be_uint32(height)
@@ -805,33 +1041,61 @@ class SwapIndex:
             if height is None:
                 continue
 
-            order_key = SwapDBKeys.ORDER + order_id
-            self._record_undo(height, order_key)
-            batch.put(order_key, order.to_bytes())
-
-            # OPEN_BY_PAIR orderbook index
-            if order.base_ref and order.quote_ref and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
-                if order.side == OrderSide.BUY:
-                    price_key = struct.pack('>Q', 0xFFFFFFFFFFFFFFFF - order.price)
-                else:
-                    price_key = struct.pack('>Q', order.price)
-
-                pair_key = (
-                    SwapDBKeys.OPEN_BY_PAIR
-                    + order.base_ref
-                    + order.quote_ref
-                    + bytes([order.side])
-                    + price_key
-                    + order_id
+            # Build every value that can raise on a malformed order BEFORE
+            # touching the batch.  order.price/side come from attacker-controlled
+            # OP_RETURN payloads; an out-of-range price makes struct.pack('>Q')
+            # raise struct.error, which inside the shared write_batch would abort
+            # the entire flush (UTXO + glyph + wave + state).  Compute keys first,
+            # then commit — so a bad order is logged and skipped, not fatal, and
+            # leaves no partial writes.  (Orders are already bounds-checked at
+            # ingest in process_tx; this is defense-in-depth.)
+            #
+            # A closed order reconstructs the SAME pair_key/maker_key it was
+            # written with (same base_ref/quote_ref/side/price/maker), so the
+            # delete targets exactly the bytes the open path put — the bounds
+            # invariant still holds and no phantom index key can be left behind.
+            terminal = order.status in (OrderStatus.FILLED,
+                                        OrderStatus.CANCELLED,
+                                        OrderStatus.EXPIRED)
+            try:
+                order_bytes = order.to_bytes()
+                # The orderbook key is only valid for live orders; for a closed
+                # order we still need the exact same key to delete it.
+                pair_key = self._pair_key(order)
+                maker_key = self._maker_key(order)
+            except Exception:
+                self.logger.warning(
+                    'Skipping malformed swap order %s during flush',
+                    hash_to_hex_str(order_id), exc_info=True
                 )
-                self._record_undo(height, pair_key)
-                batch.put(pair_key, b'')
+                continue
 
-            # OPEN_BY_MAKER user orders index
-            if order.maker_scripthash:
-                maker_key = SwapDBKeys.OPEN_BY_MAKER + order.maker_scripthash + order_id
-                self._record_undo(height, maker_key)
-                batch.put(maker_key, b'')
+            order_key = SwapDBKeys.ORDER + order_id
+            # Always rewrite the ORDER record (open/partial -> live row; terminal
+            # -> closed row).  Record undo first so reorg backup() restores the
+            # previous on-disk ORDER value (e.g. the OPEN cbor) at this height.
+            self._record_undo(height, order_key)
+            batch.put(order_key, order_bytes)
+
+            if terminal:
+                # Close path: remove the orderbook + maker index entries so the
+                # order stops appearing as open.  Every key goes through
+                # _record_undo at the CLOSE height so backup() restores the
+                # OPEN_BY_* entry (its prior b'' value) and reopens the order.
+                if pair_key is not None:
+                    self._record_undo(height, pair_key)
+                    batch.delete(pair_key)
+                if maker_key is not None:
+                    self._record_undo(height, maker_key)
+                    batch.delete(maker_key)
+            else:
+                # Open/partial path: (re)publish the orderbook + maker indexes.
+                if pair_key is not None:
+                    self._record_undo(height, pair_key)
+                    batch.put(pair_key, b'')
+                if maker_key is not None:
+                    self._record_undo(height, maker_key)
+                    batch.put(maker_key, b'')
 
         # Flush history
         for height, key, value in self.history_cache:

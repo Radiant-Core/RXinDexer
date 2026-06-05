@@ -397,3 +397,40 @@ def test_ban_versions():
 def test_coin_class_provided():
     e = Env(lib_coins.Radiant)
     assert e.coin == lib_coins.Radiant
+
+
+# --- IP-persistent, proxy-aware rate limiter knobs (H3 follow-up) ---
+
+def test_RATE_LIMIT_ENABLED():
+    setup_base_env()
+    assert_boolean('RATE_LIMIT_ENABLED', 'rate_limit_enabled', True)
+
+
+def test_TRUST_PROXY():
+    setup_base_env()
+    assert_boolean('TRUST_PROXY', 'trust_proxy', False)
+
+
+def test_TRUST_PROXY_HOPS():
+    setup_base_env()
+    assert_integer('TRUST_PROXY_HOPS', 'trust_proxy_hops', 1)
+
+
+def test_MAX_SUBS_PER_IP():
+    setup_base_env()
+    assert_integer('MAX_SUBS_PER_IP', 'max_subs_per_ip', 50000)
+
+
+def test_IP_COST_HARD_LIMIT():
+    setup_base_env()
+    assert_integer('IP_COST_HARD_LIMIT', 'ip_cost_hard_limit', 1_000_000)
+
+
+def test_RATE_BLOCK_DURATION():
+    setup_base_env()
+    assert_integer('RATE_BLOCK_DURATION', 'rate_block_duration', 300)
+
+
+def test_IP_STATE_TTL():
+    setup_base_env()
+    assert_integer('IP_STATE_TTL', 'ip_state_ttl', 3600)

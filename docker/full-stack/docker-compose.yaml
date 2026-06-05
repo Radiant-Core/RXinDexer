@@ -21,14 +21,14 @@ services:
       -server=1
       -printtoconsole
       -rpcuser=${RPC_USER:-radiant}
-      -rpcpassword=${RPC_PASS:-radiant}
+      -rpcpassword=${RPC_PASS:?RPC_PASS must be set}
       -rpcallowip=0.0.0.0/0
       -rpcbind=0.0.0.0
       -txindex=1
       -swapindex=1
       -zmqpubhashblock=tcp://0.0.0.0:28332
     healthcheck:
-      test: ["CMD", "radiant-cli", "-rpcuser=${RPC_USER:-radiant}", "-rpcpassword=${RPC_PASS:-radiant}", "getblockchaininfo"]
+      test: ["CMD", "radiant-cli", "-rpcuser=${RPC_USER:-radiant}", "-rpcpassword=${RPC_PASS:?RPC_PASS must be set}", "getblockchaininfo"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -80,7 +80,7 @@ services:
       - "127.0.0.1:8001:8001"  # Admin RPC (localhost only)
     environment:
       # Core configuration
-      - DAEMON_URL=http://${RPC_USER:-radiant}:${RPC_PASS:-radiant}@radiantd:7332/
+      - DAEMON_URL=http://${RPC_USER:-radiant}:${RPC_PASS:?RPC_PASS must be set}@radiantd:7332/
       - COIN=Radiant
       - NET=mainnet
       - DB_ENGINE=rocksdb
@@ -91,9 +91,12 @@ services:
       - REST_API_ENABLED=1
       - REST_API_HOST=0.0.0.0
       - REST_API_PORT=8000
+      # REST is bound to 0.0.0.0 (public), so the indexer requires a non-empty
+      # REST_API_KEY and explicit ALLOWED_ORIGINS at startup (fail-closed).
+      # Set both in your .env. To run REST unauthenticated on purpose, set
+      # REST_REQUIRE_API_KEY=0 explicitly (not recommended for public nodes).
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - REST_API_KEY=${REST_API_KEY}
-      - REST_REQUIRE_API_KEY_IN_PROD=0
       # Performance tuning
       - CACHE_MB=${CACHE_MB:-2000}
       - MAX_SESSIONS=${MAX_SESSIONS:-10000}

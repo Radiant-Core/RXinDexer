@@ -20,6 +20,7 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 
 from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str
+from electrumx.lib.glyph import DMINT_MAX_TOTAL_SUPPLY
 
 
 _NON_HEX = re.compile(r'[^0-9a-f]')
@@ -682,8 +683,18 @@ class DMintContractsManager:
 
     def _to_token_summary_item(self, contract: Dict[str, Any]) -> Dict[str, Any]:
         total_contracts = max(self._to_int(contract.get('outputs'), 0), 0)
-        total_supply = max(self._to_int(contract.get('total_supply'), 0), 0)
-        mined_supply = max(self._to_int(contract.get('mined_supply'), 0), 0)
+        # H5: clamp supply into [0, int64-max]. The indexer now rejects/clamps
+        # bad on-chain values, but legacy records persisted before that fix
+        # could still hold a negative or absurd total_supply; sanitize at the
+        # API boundary so percent_mined can never go negative or absurd.
+        total_supply = min(
+            max(self._to_int(contract.get('total_supply'), 0), 0),
+            DMINT_MAX_TOTAL_SUPPLY,
+        )
+        mined_supply = min(
+            max(self._to_int(contract.get('mined_supply'), 0), 0),
+            DMINT_MAX_TOTAL_SUPPLY,
+        )
         remaining_supply = max(total_supply - mined_supply, 0)
 
         percent_mined = self._to_float(contract.get('percent_mined'), 0.0)

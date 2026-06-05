@@ -73,6 +73,32 @@ PROTOCOL_NAMES = {
     11: 'WAVE Name',
 }
 
+# ---------------------------------------------------------------------------
+# dMint contract-state bounds (H5)
+#
+# dMint contract state is parsed from attacker-authored on-chain scriptnums,
+# which can be negative (CScriptNum is signed, up to +/-2^63) or absurdly
+# large.  These values feed total_supply = num_contracts * reward * max_height
+# and the difficulty math, so an unbounded/negative value can poison the
+# supply accounting, the /dmint/contracts listing, and percent_mined.
+#
+# Bounds chosen:
+#   * reward / max_height are unsigned-by-nature mining parameters; a negative
+#     value is never valid, so we reject the contract outright.
+#   * max_height must be > 0 (a contract that mines for 0 blocks mints nothing
+#     and would only create divide/clamp hazards downstream).
+#   * DMINT_MAX_SCRIPTNUM is the int64 ceiling (2^63 - 1).  CScriptNum, the
+#     CBOR encoder and the on-disk int packing are all 64-bit signed, so any
+#     individual field above this is malformed/out-of-consensus-range.
+#   * DMINT_MAX_TOTAL_SUPPLY caps the *derived* supply (and each multiplicand)
+#     at the int64 ceiling so num_contracts * reward * max_height can never
+#     overflow or go absurd.  RXD's whole genesis supply is ~2.1e18 photons
+#     (well under 2^63 ~= 9.2e18), so this never rejects a legitimate token.
+# ---------------------------------------------------------------------------
+DMINT_MAX_SCRIPTNUM = (1 << 63) - 1
+DMINT_MAX_TOTAL_SUPPLY = (1 << 63) - 1
+
+
 # Envelope flags
 class EnvelopeFlags:
     HAS_CONTENT_ROOT = 1 << 0
@@ -622,27 +648,39 @@ def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
         token_ref = None
         state_end = len(script)
         pos = 0
-        while pos < len(script):
+        slen = len(script)
+        while pos < slen:
             op = script[pos]
             if op == 0xbd:
                 state_end = pos
                 break
-            elif op == 0xd8 and pos + 37 <= len(script):
+            elif op == 0xd8 and pos + 37 <= slen:
                 contract_ref = script[pos + 1:pos + 37]
                 pos += 37
-            elif op == 0xd0 and pos + 37 <= len(script):
+            elif op == 0xd0 and pos + 37 <= slen:
                 token_ref = script[pos + 1:pos + 37]
                 pos += 37
             elif 1 <= op <= 75:
+                # A fixed-length push whose payload runs off the end of the
+                # script is malformed — bail rather than letting the cursor
+                # jump past the real OP_CHECKTEMPLATEVERIFY boundary (H5).
+                if pos + 1 + op > slen:
+                    return None
                 pos += 1 + op
-            elif op == 0x4c and pos + 1 < len(script):
+            elif op == 0x4c and pos + 1 < slen:
+                if pos + 2 + script[pos + 1] > slen:
+                    return None
                 pos += 2 + script[pos + 1]
-            elif op == 0x4d and pos + 2 < len(script):
+            elif op == 0x4d and pos + 2 < slen:
                 dlen = script[pos + 1] | (script[pos + 2] << 8)
+                if pos + 3 + dlen > slen:
+                    return None
                 pos += 3 + dlen
-            elif op == 0x4e and pos + 4 < len(script):
+            elif op == 0x4e and pos + 4 < slen:
                 dlen = (script[pos + 1] | (script[pos + 2] << 8)
                         | (script[pos + 3] << 16) | (script[pos + 4] << 24))
+                if pos + 5 + dlen > slen:
+                    return None
                 pos += 5 + dlen
             else:
                 pos += 1
@@ -692,6 +730,27 @@ def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
             # V1 layout: height, maxHeight, reward, target
             if len(numeric_pushes) >= 4:
                 result['target'] = _scriptnum_to_int(numeric_pushes[3])
+
+        # H5: validate the supply-relevant numeric fields.  These come from
+        # attacker-authored scriptnums (signed, up to +/-2^63), so reject the
+        # whole contract when a value is negative or out of the int64 range.
+        # We deliberately only validate reward / max_height (the fields that
+        # feed total_supply); target / last_time / target_time are difficulty
+        # and timestamp values that may legitimately be 0 or near-2^63 and are
+        # NOT used in the supply arithmetic, so leaving them untouched keeps
+        # every currently-valid contract parsing identically.
+        max_height = result.get('max_height')
+        if max_height is not None and (
+            max_height <= 0 or max_height > DMINT_MAX_SCRIPTNUM
+        ):
+            # max_height <= 0 means "mines for no blocks" — never a real,
+            # mintable contract; treat as malformed/inert.
+            return None
+        reward = result.get('reward')
+        if reward is not None and (
+            reward < 0 or reward > DMINT_MAX_SCRIPTNUM
+        ):
+            return None
 
         return result
     except Exception:

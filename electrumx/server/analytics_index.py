@@ -1,6 +1,8 @@
 import heapq
 import json
+import os
 import struct
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -8,6 +10,18 @@ from electrumx.lib import util
 from electrumx.lib.hash import Base58
 from electrumx.lib.hash import HASHX_LEN
 from electrumx.lib.util import pack_be_uint32, encode_undo, decode_undo
+
+# M1 (DoS): the rich-list / get_stats endpoints scan the whole AB balance
+# keyspace. To stop an attacker forcing a full scan per request by rotating the
+# pagination ``offset``, we (a) hard-cap the reachable offset and (b) scan at
+# most once per TTL into a bounded "top pool" that all (limit, offset) pages are
+# sliced from. Both are env-overridable for large deployments.
+TOP_ADDRESSES_MAX_OFFSET = int(os.getenv('ANALYTICS_TOP_MAX_OFFSET', '10000'))
+TOP_ADDRESSES_MAX_LIMIT = 500  # mirrors the REST le=500 bound on `limit`
+# Size of the cached pool: enough to satisfy the deepest allowed page.
+TOP_ADDRESSES_POOL_SIZE = TOP_ADDRESSES_MAX_OFFSET + TOP_ADDRESSES_MAX_LIMIT
+# How long a single full keyspace scan result is reused (seconds).
+TOP_ADDRESSES_SCAN_TTL = int(os.getenv('ANALYTICS_TOP_SCAN_TTL', '120'))
 
 
 class AnalyticsDBKeys:
@@ -68,6 +82,12 @@ class AnalyticsIndex:
         self.daily_height: Dict[bytes, int] = {}
         self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
         self._undo_seen: Dict[int, Set[bytes]] = defaultdict(set)
+        # M1: cached result of the (expensive) full AB-keyspace scan that backs
+        # the rich list. Holds the descending-sorted top pool plus the total
+        # address count, refreshed at most once per TOP_ADDRESSES_SCAN_TTL.
+        self._top_pool: Optional[List[Tuple[int, bytes]]] = None
+        self._top_total: int = 0
+        self._top_scan_ts: float = 0.0
         current_height = getattr(db, 'db_height', -1)
         reorg_limit = getattr(env, 'reorg_limit', 0)
         min_keep = max(0, current_height - reorg_limit + 1) if reorg_limit else 0
@@ -492,36 +512,65 @@ class AnalyticsIndex:
     def get_supply_aging(self) -> Dict[str, Any]:
         return self._get_summary(AnalyticsDBKeys.SUMMARY + b'age_distribution', {label: 0 for _, label in AGE_BUCKETS})
 
-    def get_top_addresses(self, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
-        """Rich list (top RXD balances).
+    def _refresh_top_pool(self) -> None:
+        """Scan the AB balance keyspace once into a bounded, cached top pool.
 
-        A global top-N is inherently a scan of the balance keyspace, but we keep
-        it cheap: a single *sequential* iteration feeding a bounded min-heap of
-        size ``offset+limit`` (so memory is O(page), not O(all addresses)), and
-        we resolve the display address only for the returned page rather than
-        doing a random DB read per address (the previous version's timeout
-        cause). Result is cached by the REST layer.
+        M1 (DoS): a global rich list is inherently a scan of the balance
+        keyspace. Rather than re-scan per (limit, offset) — which let an attacker
+        force a full scan every request by rotating ``offset`` — we scan at most
+        once per ``TOP_ADDRESSES_SCAN_TTL`` into the top ``TOP_ADDRESSES_POOL_SIZE``
+        addresses (a bounded min-heap, so memory is O(pool), not O(all
+        addresses)). Every page is then sliced from this cached pool in memory.
+        We also cache the total address count here so ``get_stats`` reuses the
+        same scan instead of running its own ``sum(1 for _ in ...)`` scan.
         """
+        now = time.monotonic()
+        if (
+            self._top_pool is not None
+            and now - self._top_scan_ts < TOP_ADDRESSES_SCAN_TTL
+        ):
+            return
+
         prefix = AnalyticsDBKeys.BALANCE
-        need = offset + limit
-        heap = []  # min-heap of (amount, hashX); smallest of the top-`need` at root
+        need = TOP_ADDRESSES_POOL_SIZE
+        heap: List[Tuple[int, bytes]] = []  # min-heap of (amount, hashX)
         total = 0
         for key, raw in self.db.utxo_db.iterator(prefix=prefix):
             amount = struct.unpack('<Q', raw)[0]
             if amount <= 0:
                 continue
             total += 1
-            if need <= 0:
-                continue
             entry = (amount, key[2:])
             if len(heap) < need:
                 heapq.heappush(heap, entry)
             elif amount > heap[0][0]:
                 heapq.heapreplace(heap, entry)
 
-        top = sorted(heap, key=lambda t: t[0], reverse=True)[offset:offset + limit]
+        self._top_pool = sorted(heap, key=lambda t: t[0], reverse=True)
+        self._top_total = total
+        self._top_scan_ts = now
+
+    def get_top_addresses(self, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+        """Rich list (top RXD balances).
+
+        Pages are sliced from a cached top pool produced by a single scan that
+        runs at most once per TTL (see ``_refresh_top_pool``), so rotating
+        ``offset`` across requests can never force repeated full keyspace scans.
+        ``offset`` is hard-capped at ``TOP_ADDRESSES_MAX_OFFSET`` and ``limit``
+        at ``TOP_ADDRESSES_MAX_LIMIT`` so a request can never reach beyond the
+        cached pool.
+        """
+        # Clamp inputs so a page can never escape the cached pool (defence in
+        # depth — the REST layer rejects oversized offsets before we get here).
+        limit = max(0, min(int(limit), TOP_ADDRESSES_MAX_LIMIT))
+        offset = max(0, min(int(offset), TOP_ADDRESSES_MAX_OFFSET))
+
+        self._refresh_top_pool()
+        pool = self._top_pool or []
+        page = pool[offset:offset + limit]
+
         rows = []
-        for amount, hashX in top:
+        for amount, hashX in page:
             display = self.db.utxo_db.get(self._display_key(hashX))
             rows.append({
                 'hashX': hashX.hex(),
@@ -529,7 +578,7 @@ class AnalyticsIndex:
                 'balance': amount,
             })
         return {
-            'total': total,
+            'total': self._top_total,
             'limit': limit,
             'offset': offset,
             'rows': rows,
@@ -541,19 +590,31 @@ class AnalyticsIndex:
         start = max(0, current_day - days + 1)
         pfx = AnalyticsDBKeys.DAILY
         plen = len(pfx)
+        # M1: bound the AY keyspace scan to the requested [start, current_day]
+        # window instead of reading every day ever recorded. Daily keys are
+        # ``pfx + pack_be_uint32(day)``; big-endian packing makes them sort
+        # ascending by day, so we can stop iterating as soon as we pass
+        # ``current_day``. ``days`` is itself capped by the REST layer
+        # (le=3650), so the retained window is bounded regardless of how many
+        # historical days exist on disk. Cross-backend safe: only uses
+        # ``prefix`` (both LevelDB and RocksDB iterators yield ascending order).
         dd = {}
         for k, v in self.db.utxo_db.iterator(prefix=pfx):
-            d = struct.unpack('>I', k[plen:plen+4])[0]
-            if start <= d <= current_day:
+            d = struct.unpack('>I', k[plen:plen + 4])[0]
+            if d > current_day:
+                break  # keys are day-ascending; nothing past the window remains
+            if d >= start:
                 dd[d] = json.loads(v.decode())
         empty = {'coins_moved': 0, 'active_addresses': 0, 'new_addresses': 0}
         items = [{'day': d, **dd.get(d, empty)} for d in range(start, current_day + 1)]
         return {'days': days, 'series': items}
 
     def get_stats(self) -> Dict[str, Any]:
-        top = {'total': sum(1 for _ in self.db.utxo_db.iterator(prefix=AnalyticsDBKeys.BALANCE))}
+        # M1: reuse the cached rich-list scan instead of running a second full
+        # AB-keyspace scan (sum(1 for _ in iterator(...))) on every cache miss.
+        self._refresh_top_pool()
         return {
             'enabled': self.enabled,
             'last_processed_height': self._get_summary(AnalyticsDBKeys.SUMMARY + b'last_processed_height', 0),
-            'rich_list_entries': top['total'],
+            'rich_list_entries': self._top_total,
         }

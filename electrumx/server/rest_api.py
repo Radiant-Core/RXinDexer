@@ -50,6 +50,7 @@ import asyncio
 import base64
 import hmac
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -62,6 +63,25 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response as _Response
 from pydantic import BaseModel
 import time as _time
+
+_logger = logging.getLogger(__name__)
+
+
+def _internal_error(exc: Exception, context: str = "") -> HTTPException:
+    """Return a generic 500 HTTPException while logging the real cause.
+
+    M2: handlers must not leak DB/daemon internals (exception strings, stack
+    traces, file paths) to clients. The raw exception — with a server-side
+    traceback and the handler context — is logged at ERROR level for operators,
+    and the client receives only ``detail="Internal error"``.
+    """
+    _logger.error(
+        "Unhandled error in REST handler%s: %s",
+        f" ({context})" if context else "",
+        exc,
+        exc_info=True,
+    )
+    return HTTPException(status_code=500, detail="Internal error")
 
 class _TTLCache:
     """TTL cache with bounded max_size (R12: prevents unbounded memory growth)."""
@@ -84,6 +104,13 @@ class _TTLCache:
 
 _cache = _TTLCache()
 
+# M1 (DoS): hard cap on the rich-list pagination offset. Without this, an
+# attacker could rotate `offset` (previously only ge=0) to bust the per-(limit,
+# offset) TTL cache and force a fresh full-keyspace scan every request on a
+# public, no-API-key path. Kept in sync with analytics_index.TOP_ADDRESSES_MAX_OFFSET
+# (same env var, same default) so the REST bound and the index pool size agree.
+_TOP_ADDRESSES_MAX_OFFSET = int(os.getenv('ANALYTICS_TOP_MAX_OFFSET', '10000'))
+
 # App instance
 app = FastAPI(
     title="RXinDexer REST API",
@@ -93,20 +120,50 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-_env_name = os.getenv('ELECTRUMX_ENV', os.getenv('ENV', 'dev')).strip().lower()
-_is_prod = _env_name == 'prod'
+# REST security posture: fail closed by network EXPOSURE, not by a free-text env
+# name.  A REST server bound to a non-loopback interface is internet-facing and
+# MUST require an API key + explicit CORS origins.  Previously this keyed off
+# ELECTRUMX_ENV defaulting to 'dev', so a production node that forgot to set
+# ELECTRUMX_ENV=prod ran fully unauthenticated with wildcard CORS (fail OPEN).
+# Keying on the bind host makes the safe path the default; ELECTRUMX_ENV=dev is
+# the explicit escape hatch for local/regtest setups that bind 0.0.0.0 on purpose.
+_env_name = os.getenv('ELECTRUMX_ENV', os.getenv('ENV', '')).strip().lower()
+_is_dev = _env_name == 'dev'
+
+_rest_host = os.getenv('REST_API_HOST', '127.0.0.1').strip()
+_public_bind = _rest_host not in ('127.0.0.1', 'localhost', '::1', '0', '')
+_enforce_security = _public_bind and not _is_dev
 
 _allowed_origins_raw = os.getenv('ALLOWED_ORIGINS', '').strip()
 _allowed_origins = [o.strip() for o in _allowed_origins_raw.split(',') if o.strip()]
-if _is_prod and not _allowed_origins:
-    raise RuntimeError('ALLOWED_ORIGINS must be set in production (ELECTRUMX_ENV=prod)')
 
-_require_rest_api_key_prod = os.getenv('REST_REQUIRE_API_KEY_IN_PROD', '1').strip() not in ('0', 'false', 'no')
-if _is_prod and _require_rest_api_key_prod and not os.getenv('REST_API_KEY', '').strip():
-    raise RuntimeError('REST_API_KEY must be set in production (or set REST_REQUIRE_API_KEY_IN_PROD=0)')
+# REST_REQUIRE_API_KEY (legacy alias REST_REQUIRE_API_KEY_IN_PROD) — default ON.
+_require_rest_api_key = os.getenv(
+    'REST_REQUIRE_API_KEY',
+    os.getenv('REST_REQUIRE_API_KEY_IN_PROD', '1')
+).strip() not in ('0', 'false', 'no')
 
-# CORS middleware — enabled with explicit origins (R10: fail-closed)
-_cors_origins = _allowed_origins if _allowed_origins else (['*'] if not _is_prod else [])
+if _enforce_security:
+    if not _allowed_origins:
+        raise RuntimeError(
+            f'ALLOWED_ORIGINS must be set for a public REST bind '
+            f'(REST_API_HOST={_rest_host}). Set explicit origins, or '
+            f'ELECTRUMX_ENV=dev for local use.'
+        )
+    if _require_rest_api_key and not os.getenv('REST_API_KEY', '').strip():
+        raise RuntimeError(
+            f'REST_API_KEY must be set for a public REST bind '
+            f'(REST_API_HOST={_rest_host}). Set a key, or REST_REQUIRE_API_KEY=0 '
+            f'to explicitly opt out.'
+        )
+
+# CORS middleware — never wildcard on a public, non-dev bind (R10: fail-closed).
+if _allowed_origins:
+    _cors_origins = _allowed_origins
+elif _enforce_security:
+    _cors_origins = []          # fail closed: no cross-origin access until configured
+else:
+    _cors_origins = ['*']       # loopback or explicit dev only
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -426,7 +483,8 @@ async def health_ready():
     try:
         height = _db.db_height
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
+        _logger.error("health/ready DB error: %s", e, exc_info=True)
+        raise HTTPException(status_code=503, detail="Database error")
     if height is None or height < 1:
         raise HTTPException(status_code=503, detail="Not ready")
     return {"status": "ready", "height": height}
@@ -446,7 +504,8 @@ async def health_db():
             "db_engine": getattr(_db, 'db_engine', 'unknown'),
         }
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database error: {str(e)}")
+        _logger.error("health/db DB error: %s", e, exc_info=True)
+        raise HTTPException(status_code=503, detail="Database error")
 
 
 @app.get("/status", tags=["Health"])
@@ -483,7 +542,10 @@ def get_analytics_stats():
     _ensure_analytics_index()
     c = _cache.get('a_stats', 120)
     if c: return c
-    r = _analytics_index.get_stats()
+    try:
+        r = _analytics_index.get_stats()
+    except Exception as e:
+        raise _internal_error(e, "/analytics/stats")
     _cache.put('a_stats', r)
     return r
 
@@ -493,7 +555,10 @@ def get_balance_distribution():
     _ensure_analytics_index()
     c = _cache.get('a_bdist', 30)
     if c: return c
-    r = _analytics_index.get_balance_distribution()
+    try:
+        r = _analytics_index.get_balance_distribution()
+    except Exception as e:
+        raise _internal_error(e, "/analytics/balance-distribution")
     _cache.put('a_bdist', r)
     return r
 
@@ -503,7 +568,10 @@ def get_supply_aging():
     _ensure_analytics_index()
     c = _cache.get('a_aging', 30)
     if c: return c
-    r = _analytics_index.get_supply_aging()
+    try:
+        r = _analytics_index.get_supply_aging()
+    except Exception as e:
+        raise _internal_error(e, "/analytics/supply-aging")
     _cache.put('a_aging', r)
     return r
 
@@ -511,13 +579,16 @@ def get_supply_aging():
 @app.get("/analytics/top-addresses", tags=["Analytics"])
 def get_top_addresses(
     limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=_TOP_ADDRESSES_MAX_OFFSET),
 ):
     _ensure_analytics_index()
     ck = f'a_top_{limit}_{offset}'
     c = _cache.get(ck, 120)
     if c: return c
-    r = _analytics_index.get_top_addresses(limit=limit, offset=offset)
+    try:
+        r = _analytics_index.get_top_addresses(limit=limit, offset=offset)
+    except Exception as e:
+        raise _internal_error(e, "/analytics/top-addresses")
     _cache.put(ck, r)
     return r
 
@@ -528,7 +599,10 @@ def get_movement(days: int = Query(default=30, ge=1, le=3650)):
     ck = f'a_move_{days}'
     c = _cache.get(ck, 300)
     if c: return c
-    r = _analytics_index.get_movement(days=days)
+    try:
+        r = _analytics_index.get_movement(days=days)
+    except Exception as e:
+        raise _internal_error(e, "/analytics/movement")
     _cache.put(ck, r)
     return r
 
@@ -576,7 +650,7 @@ async def get_block(height: int = Path(..., ge=0)):
             "header_hex": header_data.hex() if header_data and count > 0 else None,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/contracts/{ref}/icon-debug", tags=["dMint"])
@@ -600,7 +674,7 @@ async def get_dmint_contract_icon_debug(ref: str = _REF_PATH):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/contracts/{ref}/icon", tags=["dMint"])
@@ -638,7 +712,7 @@ async def get_dmint_contract_icon(ref: str = _REF_PATH):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/tx/{txid}", tags=["Transactions"])
@@ -652,7 +726,10 @@ async def get_transaction(txid: str = Path(..., min_length=64, max_length=64)):
         raw_tx = await _daemon.getrawtransaction(txid, True)
         return raw_tx
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Transaction not found: {str(e)}")
+        # The daemon raises both for genuinely-missing txs and for internal RPC
+        # failures; either way, never leak the raw exception string to clients.
+        _logger.warning("getrawtransaction failed for %s: %s", txid, e, exc_info=True)
+        raise HTTPException(status_code=404, detail="Transaction not found")
 
 
 # =============================================================================
@@ -679,13 +756,13 @@ async def get_all_glyphs(
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/glyphs/search", tags=["Glyphs"])
 async def search_glyphs(
     q: str = Query(..., min_length=1, max_length=100, description="Search query (name or ticker)"),
-    protocols: Optional[str] = Query(default=None, description="Comma-separated protocol IDs to filter"),
+    protocols: Optional[str] = Query(default=None, max_length=256, description="Comma-separated protocol IDs to filter"),
     limit: int = Query(default=50, le=200),
 ):
     """Search tokens by name or ticker."""
@@ -698,7 +775,7 @@ async def search_glyphs(
         result = _glyph_index.search_tokens(q, protocols=protocol_list, limit=limit)
         return {"query": q, "results": result, "count": len(result)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/glyphs/stats", tags=["Glyphs"])
@@ -725,7 +802,7 @@ async def get_glyphs_by_type(
         result = _glyph_index.get_tokens_by_type(type_id, limit=limit, cursor=cursor)
         return {"type_id": type_id, **result}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/glyphs/{ref}", tags=["Glyphs"])
@@ -745,7 +822,7 @@ async def get_glyph(ref: str = _REF_PATH):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/tokens/{ref}/holders", tags=["Token Analytics"])
@@ -763,7 +840,7 @@ async def get_token_holders(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/addresses/{ident}/glyphs", tags=["Ownership"])
@@ -788,7 +865,7 @@ async def get_address_glyphs(
     try:
         return _glyph_index.get_balances_for_scripthash(sh, limit=limit, cursor=cursor)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/tokens/{ref}/supply", tags=["Token Analytics"])
@@ -807,7 +884,7 @@ async def get_token_supply(ref: str = _REF_PATH):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/tokens/{ref}/burns", tags=["Token Analytics"])
@@ -825,7 +902,7 @@ async def get_token_burns(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/tokens/{ref}/trades", tags=["Token Analytics"])
@@ -843,7 +920,7 @@ async def get_token_trades(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/tokens/{ref}/top-holders", tags=["Token Analytics"])
@@ -860,7 +937,7 @@ async def get_top_token_holders(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/tokens/{ref}/history", tags=["Token Analytics"])
@@ -889,7 +966,7 @@ async def get_token_history(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 def _sanitize_cbor(obj):
@@ -931,7 +1008,7 @@ async def get_token_metadata(ref: str = _REF_PATH):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 # =============================================================================
@@ -957,7 +1034,7 @@ async def list_encrypted_tokens(
         )
         return {**result, "timelocked_only": timelocked_only}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/glyphs/{ref}/key-reveal", tags=["Encrypted"])
@@ -978,7 +1055,7 @@ async def get_key_reveal(ref: str = _REF_PATH):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format (expected 72 hex chars)")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.post("/glyphs/{ref}/key-reveal", tags=["Encrypted"])
@@ -1024,7 +1101,7 @@ async def record_key_reveal(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid hex parameter")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 # =============================================================================
@@ -1042,7 +1119,7 @@ async def get_dmint_contracts(
     version: int = Query(default=2, ge=1, le=2),
     view: str = Query(default="token_summary"),
     status: str = Query(default="mineable", description="mineable | finished | all"),
-    algorithm_ids: Optional[str] = Query(default=None, description="Comma-separated algorithm IDs"),
+    algorithm_ids: Optional[str] = Query(default=None, max_length=256, description="Comma-separated algorithm IDs"),
     sort_field: str = Query(default="deploy_height"),
     sort_dir: str = Query(default="desc"),
     limit: int = Query(default=1000, ge=1, le=5000),
@@ -1106,7 +1183,7 @@ async def get_dmint_contracts(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/contracts/{ref}", tags=["dMint"])
@@ -1123,7 +1200,7 @@ async def get_dmint_contract(ref: str = _REF_PATH):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/algorithms", tags=["dMint"])
@@ -1157,7 +1234,7 @@ async def get_dmint_by_algorithm(
     try:
         return _dmint_contracts.get_contracts_by_algorithm(algorithm)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/profitable", tags=["dMint"])
@@ -1168,7 +1245,7 @@ async def get_dmint_profitable(limit: int = Query(default=10, le=100)):
     try:
         return _dmint_contracts.get_most_profitable(limit=limit)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/stats", tags=["dMint"])
@@ -1207,7 +1284,7 @@ async def get_dmint_stats():
             'updated_height': _dmint_contracts.last_updated_height,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/contracts/{ref}/daa", tags=["dMint"])
@@ -1261,7 +1338,7 @@ async def get_dmint_contract_daa(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/contracts/{ref}/mints", tags=["dMint"])
@@ -1279,7 +1356,7 @@ async def get_dmint_mint_history(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/dmint/tokens", tags=["dMint"])
@@ -1294,7 +1371,7 @@ async def get_dmint_tokens(
     try:
         return _glyph_index.get_dmint_tokens(limit=limit, cursor=cursor, active_only=active_only)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 # =============================================================================
@@ -1387,7 +1464,7 @@ async def wave_resolve(
             return {"name": name, "available": True, "resolved": False}
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/wave/available/{name}", tags=["WAVE"])
@@ -1398,7 +1475,7 @@ async def wave_check_available(name: str = Path(..., min_length=1, max_length=63
     try:
         return _wave_index.check_available(name)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/wave/registrations/{name}", tags=["WAVE"])
@@ -1416,7 +1493,7 @@ async def wave_get_all_registrations(name: str = Path(..., min_length=1, max_len
             return {"name": name, "registered": False, "available": True}
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/wave/{name}/subdomains", tags=["WAVE"])
@@ -1431,7 +1508,7 @@ async def wave_get_subdomains(
     try:
         return _wave_index.get_subdomains(name, limit=limit, offset=offset)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/wave/reverse/{scripthash}", tags=["WAVE"])
@@ -1448,7 +1525,7 @@ async def wave_reverse_lookup(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid scripthash format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/wave/stats", tags=["WAVE"])
@@ -1459,7 +1536,7 @@ async def wave_stats():
     try:
         return _wave_index.stats()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/wave/names", tags=["WAVE"])
@@ -1542,7 +1619,7 @@ async def wave_list_names(
             'next_cursor': result.get('next_cursor') if len(names) >= limit else None,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 # =============================================================================
@@ -1577,7 +1654,7 @@ async def get_swap_orders(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/swaps/orders/{order_id}", tags=["Swaps"])
@@ -1596,7 +1673,7 @@ async def get_swap_order(order_id: str = Path(..., min_length=72, max_length=72)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/swaps/history", tags=["Swaps"])
@@ -1618,7 +1695,7 @@ async def get_swap_history(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/swaps/stats", tags=["Swaps"])
@@ -1632,7 +1709,7 @@ async def get_swap_stats():
             'order_cache_size': len(getattr(_swap_index, 'order_cache', {})),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 # =============================================================================
@@ -1664,7 +1741,7 @@ async def mempool_glyph_balance(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid hex format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/mempool/glyphs/txs/{scripthash}", tags=["Mempool"])
@@ -1683,7 +1760,7 @@ async def mempool_glyph_txs(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid hex format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/mempool/glyphs/token/{ref}", tags=["Mempool"])
@@ -1702,7 +1779,7 @@ async def mempool_token_txs(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid hex format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/mempool/swaps/orders", tags=["Mempool"])
@@ -1723,7 +1800,7 @@ async def mempool_swap_orders(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid hex format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/mempool/swaps/user/{scripthash}", tags=["Mempool"])
@@ -1742,7 +1819,7 @@ async def mempool_user_swap_orders(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid hex format")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _internal_error(e)
 
 
 @app.get("/mempool/info", tags=["Mempool"])
@@ -1755,7 +1832,7 @@ async def mempool_node_info():
         info = await _daemon._send_single('getmempoolinfo')
         return info
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get mempool info: {str(e)}")
+        raise _internal_error(e, "/mempool/info")
 
 
 @app.get("/mempool/stats", tags=["Mempool"])

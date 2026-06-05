@@ -15,6 +15,14 @@ if [ ! -f "$SSL_CERTFILE" ] || [ ! -f "$SSL_KEYFILE" ]; then
         -signkey "$SSL_KEYFILE" -out "$SSL_CERTFILE"
     rm -f "$SSL_DIR/server.csr"
     echo "SSL certificates generated."
+    echo "============================================================================"
+    echo "WARNING: A SELF-SIGNED SSL certificate was generated as a fallback."
+    echo "WARNING: It is NOT suitable for public deployment — clients will reject"
+    echo "WARNING: it and connections over SSL/WSS will fail TLS verification."
+    echo "WARNING: For any public-facing node, mount a CA-signed certificate at"
+    echo "WARNING:   $SSL_CERTFILE / $SSL_KEYFILE"
+    echo "WARNING: (or terminate TLS at a reverse proxy) before going live."
+    echo "============================================================================"
 fi
 
 exec python3 electrumx_server

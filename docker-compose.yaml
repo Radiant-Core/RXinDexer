@@ -19,8 +19,10 @@ services:
       - default
       - radiant-net
     environment:
-      - ALLOW_ROOT=1
-      - DAEMON_URL=http://radiant_user:__ROTATED_SEE_ENV__@radiant-node-mainnet:7332
+      # Credentials come from the environment / .env — never hardcode them here
+      # (a committed password lands in public git history and must be rotated).
+      # Fails closed if RPC_PASS is unset/empty.
+      - DAEMON_URL=http://${RPC_USER:-radiant_user}:${RPC_PASS:?RPC_PASS must be set}@radiant-node-mainnet:7332
       - COIN=${COIN}
       - NET=${NET}
       - REQUEST_TIMEOUT=${REQUEST_TIMEOUT}
@@ -38,7 +40,14 @@ services:
       - MAX_SESSIONS=${MAX_SESSIONS}
       - MAX_SEND=${MAX_SEND}
       - MAX_RECV=${MAX_RECV}
-    user: "0:0"
+    # Run as the unprivileged 'electrumx' user (uid 1000) baked into the image,
+    # matching the full-stack compose. This honours the Dockerfile's
+    # USER electrumx and the app's root-guard (no ALLOW_ROOT escape hatch).
+    # WARNING: the DB_DIRECTORY volume (./electrumdb) must be writable by uid
+    # 1000. If the host directory is owned by root (e.g. created by an earlier
+    # root run), the operator must chown it first, e.g.:
+    #   sudo chown -R 1000:1000 ./electrumdb
+    user: "1000:1000"
     security_opt:
       - no-new-privileges:true
     cap_drop:

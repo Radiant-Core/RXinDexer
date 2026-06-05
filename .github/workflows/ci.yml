@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main, master]
 
+# Least privilege for the automatically-provided GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -107,13 +111,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run integration tests
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        # tests/integration drive a live stack over sockets/HTTP and do not
+        # import the electrumx package, so the heavy rocksdb/leveldb build is
+        # not needed here — only the client libraries the tests use.
         run: |
-          if [ -f "run_integration_tests.sh" ]; then
-            chmod +x run_integration_tests.sh
-            ./run_integration_tests.sh || true
-          fi
-        continue-on-error: true
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio httpx websockets
+
+      - name: Run integration tests
+        # No '|| true' / continue-on-error: real failures now block merges.
+        # The suite self-skips (does not fail) when no live backend is reachable
+        # at RXINDEXER_REST_URL / RXINDEXER_HOST:RXINDEXER_TCP_PORT, so the job is
+        # green on GitHub-hosted runners that don't provision the stack while
+        # still gating genuine contract regressions wherever a backend is wired.
+        # (To actually exercise the API in CI, point those env vars at a running
+        # RXinDexer + Radiant node — e.g. a self-hosted runner or service stack.)
+        run: pytest tests/integration -q -c tests/pytest.ini
 
   docker:
     runs-on: ubuntu-latest

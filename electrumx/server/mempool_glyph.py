@@ -96,8 +96,15 @@ class MempoolGlyphIndex:
         self.glyph_by_ref: Dict[bytes, Set[bytes]] = defaultdict(set)  # ref -> tx_hashes
         self.glyph_by_scripthash: Dict[bytes, Set[bytes]] = defaultdict(set)  # scripthash -> tx_hashes
         
-        # Swap mempool indexes
-        self.swap_orders: Dict[bytes, MempoolSwapOrder] = {}
+        # Swap mempool indexes.
+        # M5 fix (RBF / multi-output order drop): swap_orders is keyed by
+        # order_id, NOT tx_hash.  A single tx can carry several RSWP outputs
+        # (several orders); keying by tx_hash overwrote all but the last and
+        # left orphaned swap_by_pair/swap_by_maker entries when remove_tx popped
+        # by tx_hash on eviction/RBF.  swap_by_tx maps tx_hash -> {order_ids} so
+        # remove_tx can remove EVERY order a tx created.
+        self.swap_orders: Dict[bytes, MempoolSwapOrder] = {}  # order_id -> order
+        self.swap_by_tx: Dict[bytes, Set[bytes]] = defaultdict(set)  # tx_hash -> order_ids
         self.swap_by_pair: Dict[bytes, Set[bytes]] = defaultdict(set)  # pair_key -> order_ids
         self.swap_by_maker: Dict[bytes, Set[bytes]] = defaultdict(set)  # scripthash -> order_ids
         
@@ -308,8 +315,13 @@ class MempoolGlyphIndex:
 
             # Parse for RSWP marker
             order = self._parse_rswp_mempool(script, tx_hash, idx)
-            if order:
-                self.swap_orders[tx_hash] = order
+            if order and order.order_id:
+                # M5 fix: key by order_id so a tx with multiple RSWP outputs
+                # indexes EVERY order (keying by tx_hash overwrote all but the
+                # last).  Track tx_hash -> {order_ids} so remove_tx can remove
+                # them all on eviction/RBF.
+                self.swap_orders[order.order_id] = order
+                self.swap_by_tx[tx_hash].add(order.order_id)
 
                 # Index by pair
                 pair_key = order.base_ref + order.quote_ref
@@ -496,20 +508,31 @@ class MempoolGlyphIndex:
                 # Reversing this movement changes the unconfirmed balance.
                 self.touched_balance.add((hashX, ref))
         
-        # Remove from Swap indexes
-        if tx_hash in self.swap_orders:
-            swap_order = self.swap_orders.pop(tx_hash)
-            
-            pair_key = swap_order.base_ref + swap_order.quote_ref
-            if swap_order.order_id in self.swap_by_pair.get(pair_key, set()):
-                self.swap_by_pair[pair_key].discard(swap_order.order_id)
-                if not self.swap_by_pair[pair_key]:
-                    del self.swap_by_pair[pair_key]
-            
-            if swap_order.order_id in self.swap_by_maker.get(swap_order.maker_scripthash, set()):
-                self.swap_by_maker[swap_order.maker_scripthash].discard(swap_order.order_id)
-                if not self.swap_by_maker[swap_order.maker_scripthash]:
-                    del self.swap_by_maker[swap_order.maker_scripthash]
+        # Remove from Swap indexes.
+        # M5 fix: a tx may have created several orders (swap_orders is keyed by
+        # order_id).  Remove EVERY order this tx created from swap_orders and
+        # their swap_by_pair/swap_by_maker entries; popping by tx_hash alone
+        # orphaned the other orders' index entries (phantom unconfirmed order
+        # that never goes away after eviction/RBF).
+        order_ids = self.swap_by_tx.pop(tx_hash, None)
+        if order_ids:
+            for order_id in order_ids:
+                swap_order = self.swap_orders.pop(order_id, None)
+                if swap_order is None:
+                    continue
+
+                pair_key = swap_order.base_ref + swap_order.quote_ref
+                pair_set = self.swap_by_pair.get(pair_key)
+                if pair_set is not None:
+                    pair_set.discard(order_id)
+                    if not pair_set:
+                        del self.swap_by_pair[pair_key]
+
+                maker_set = self.swap_by_maker.get(swap_order.maker_scripthash)
+                if maker_set is not None:
+                    maker_set.discard(order_id)
+                    if not maker_set:
+                        del self.swap_by_maker[swap_order.maker_scripthash]
     
     def get_touched_and_clear(self) -> Tuple[Set[bytes], Set[bytes]]:
         """Get and clear the touched sets for notification dispatch."""

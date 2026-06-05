@@ -2,6 +2,11 @@
 # https://github.com/Radiant-Core/RXinDexer
 # Build with: `docker build -t rxindexer .`
 
+# TODO digest-pin: pin the base image to an immutable digest for reproducible,
+# tamper-evident builds, e.g. `FROM ubuntu:22.04@sha256:<digest>`.
+# Resolve the current digest (needs registry/network access):
+#   docker pull ubuntu:22.04 && \
+#     docker inspect --format='{{index .RepoDigests 0}}' ubuntu:22.04
 FROM ubuntu:22.04
 
 LABEL maintainer="The Radiant Core devs"

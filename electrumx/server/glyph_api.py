@@ -30,6 +30,7 @@ from electrumx.lib.glyph import (
     to_jsonsafe,
 )
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
+from electrumx.server.glyph_subscriptions import SubscriptionLimitError
 
 
 # Sentinel distinguishing "client did not pass cursor" (legacy list shape)
@@ -1193,6 +1194,8 @@ class GlyphAPIMixin:
             ref_bytes = self._parse_ref(ref)
             session_id = self.session_id
             return self.glyph_subscriptions.subscribe_balance(session_id, scripthash_bytes, ref_bytes)
+        except SubscriptionLimitError as e:
+            return {'error': str(e), 'limit_exceeded': True}
         except Exception as e:
             return {'error': str(e)}
 
@@ -1222,6 +1225,8 @@ class GlyphAPIMixin:
             ref_bytes = self._parse_ref(ref)
             session_id = self.session_id
             return self.glyph_subscriptions.subscribe_token(session_id, ref_bytes)
+        except SubscriptionLimitError as e:
+            return {'error': str(e), 'limit_exceeded': True}
         except Exception as e:
             return {'error': str(e)}
 
@@ -1250,6 +1255,8 @@ class GlyphAPIMixin:
             ref_bytes = self._parse_ref(ref)
             session_id = self.session_id
             return self.glyph_subscriptions.subscribe_transfers(session_id, ref_bytes)
+        except SubscriptionLimitError as e:
+            return {'error': str(e), 'limit_exceeded': True}
         except Exception as e:
             return {'error': str(e)}
 
@@ -1265,6 +1272,8 @@ class GlyphAPIMixin:
             quote_bytes = self._parse_ref(quote_ref)
             session_id = self.session_id
             return self.glyph_subscriptions.subscribe_orderbook(session_id, base_bytes, quote_bytes)
+        except SubscriptionLimitError as e:
+            return {'error': str(e), 'limit_exceeded': True}
         except Exception as e:
             return {'error': str(e)}
 
@@ -1295,6 +1304,8 @@ class GlyphAPIMixin:
             quote_bytes = self._parse_ref(quote_ref)
             session_id = self.session_id
             return self.glyph_subscriptions.subscribe_fills(session_id, base_bytes, quote_bytes)
+        except SubscriptionLimitError as e:
+            return {'error': str(e), 'limit_exceeded': True}
         except Exception as e:
             return {'error': str(e)}
 
@@ -1309,6 +1320,8 @@ class GlyphAPIMixin:
             scripthash_bytes = bytes.fromhex(scripthash)
             session_id = self.session_id
             return self.glyph_subscriptions.subscribe_user_orders(session_id, scripthash_bytes)
+        except SubscriptionLimitError as e:
+            return {'error': str(e), 'limit_exceeded': True}
         except Exception as e:
             return {'error': str(e)}
 
@@ -1322,6 +1335,8 @@ class GlyphAPIMixin:
         try:
             session_id = self.session_id
             return self.glyph_subscriptions.subscribe_wave_name(session_id, name)
+        except SubscriptionLimitError as e:
+            return {'error': str(e), 'limit_exceeded': True}
         except Exception as e:
             return {'error': str(e)}
 
@@ -1336,6 +1351,8 @@ class GlyphAPIMixin:
             ref_bytes = self._parse_ref(ref)
             session_id = self.session_id
             return self.glyph_subscriptions.subscribe_dmint(session_id, ref_bytes)
+        except SubscriptionLimitError as e:
+            return {'error': str(e), 'limit_exceeded': True}
         except Exception as e:
             return {'error': str(e)}
 

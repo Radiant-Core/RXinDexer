@@ -947,20 +947,34 @@ class GlyphIndex:
         if not parsed_state:
             return
         
-        # Override with on-chain state values if present
-        if parsed_state.get('reward'):
+        # Override with on-chain state values if present.
+        # H5: parse_dmint_contract_state already rejects contracts with a
+        # negative/out-of-range reward or max_height, but guard here too so a
+        # negative scriptnum can never reach token.reward / current_difficulty
+        # (defence in depth — these feed the /dmint/contracts listing and the
+        # difficulty math).
+        from electrumx.lib.glyph import DMINT_MAX_TOTAL_SUPPLY
+        if parsed_state.get('reward') and parsed_state['reward'] > 0:
             token.reward = parsed_state['reward']
-        if parsed_state.get('target'):
+        if parsed_state.get('target') and parsed_state['target'] > 0:
             token.current_difficulty = parsed_state['target']
             if not token.start_difficulty:
                 token.start_difficulty = parsed_state['target']
-        if parsed_state.get('max_height'):
+        max_height = parsed_state.get('max_height')
+        if max_height and max_height > 0:
             # Calculate total_supply from on-chain state if CBOR
             # metadata didn't provide it.  Multiply by num_contracts
             # since each parallel contract can mint independently.
             reward = parsed_state.get('reward') or token.reward or 0
-            if reward and not token.total_supply:
-                token.total_supply = num_contracts * reward * parsed_state['max_height']
+            if reward and reward > 0 and not token.total_supply:
+                supply = num_contracts * reward * max_height
+                # Clamp to the int64 ceiling so a maliciously huge reward /
+                # max_height / num_contracts can never produce an absurd or
+                # overflowing supply that poisons percent_mined / is_fully_mined.
+                if 0 < supply <= DMINT_MAX_TOTAL_SUPPLY:
+                    token.total_supply = supply
+                # else: leave total_supply at 0 (treated as "unknown/unbounded"
+                # by percent_mined()/is_fully_mined(), which guard total>0).
         
         # V2-specific fields from on-chain state
         if 'algo_id' in parsed_state:
@@ -1035,11 +1049,14 @@ class GlyphIndex:
         if num_contracts_mined <= 0:
             return  # Not a mint — just a transfer or other operation
         
-        # Update difficulty and reward from the contract state
+        # Update difficulty and reward from the contract state.
+        # H5: parse_dmint_contract_state already rejects negative reward/target
+        # at parse time; the >0 guards here are defence in depth so a bad
+        # scriptnum can never overwrite a good reward/difficulty.
         if latest_state:
-            if latest_state.get('target'):
+            if latest_state.get('target') and latest_state['target'] > 0:
                 token.current_difficulty = latest_state['target']
-            if latest_state.get('reward'):
+            if latest_state.get('reward') and latest_state['reward'] > 0:
                 token.reward = latest_state['reward']
         
         # Calculate minted amount: each contract mined produces `reward` tokens

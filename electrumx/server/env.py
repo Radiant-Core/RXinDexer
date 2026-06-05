@@ -118,6 +118,27 @@ class Env(EnvBase):
         self.request_timeout = self.integer('REQUEST_TIMEOUT', 30)
         self.session_timeout = self.integer('SESSION_TIMEOUT', 600)
 
+        # IP-persistent, proxy-aware rate limiting (H3 follow-up).  These bound
+        # an attacker who opens many connections or reconnect-loops to bypass
+        # the per-session subscription cap.  Defaults are high enough that a
+        # normal client never trips them; the feature degrades gracefully (with
+        # no trusted proxy the socket peer is used).
+        self.rate_limit_enabled = self.boolean('RATE_LIMIT_ENABLED', True)
+        # Proxy trust model (matches REST API: honour X-Forwarded-For ONLY when
+        # explicitly placed behind a trusted reverse proxy).
+        self.trust_proxy = self.boolean('TRUST_PROXY', False)
+        self.trust_proxy_hops = self.integer('TRUST_PROXY_HOPS', 1)
+        # Aggregate subscription cap across all of one IP's sessions.  Reuses
+        # MAX_SUBS_PER_CLIENT semantics but at the IP layer; defaults larger
+        # than the per-session cap so the per-session cap governs single
+        # connections and this only catches the many-connection bypass.
+        self.max_subs_per_ip = self.integer('MAX_SUBS_PER_IP', 50000)
+        # Per-IP cost ceiling and block window.
+        self.ip_cost_hard_limit = self.integer('IP_COST_HARD_LIMIT', 1_000_000)
+        self.rate_block_duration = self.integer('RATE_BLOCK_DURATION', 300)
+        # Idle TTL after which a per-IP state is evicted (memory bound).
+        self.ip_state_ttl = self.integer('IP_STATE_TTL', 3600)
+
         # Services last - uses some env vars above
 
         self.services = self.services_to_run()

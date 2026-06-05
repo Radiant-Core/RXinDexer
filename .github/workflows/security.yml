@@ -8,6 +8,10 @@ on:
   schedule:
     - cron: "0 3 * * 1"  # weekly
 
+# Least privilege for the automatically-provided GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   python-audit:
     runs-on: ubuntu-latest

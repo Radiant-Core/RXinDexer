@@ -1,337 +1,495 @@
+"""IP-persistent, proxy-aware rate limiting for RXinDexer (H3 follow-up).
+
+The per-*session* subscription cap in :mod:`electrumx.server.glyph_subscriptions`
+(``GlyphSubscriptionManager._check_can_subscribe`` / ``MAX_SUBS_PER_CLIENT``)
+bounds a single live connection.  It does NOT bound an attacker who opens many
+connections, or who reconnects after disconnect cleanup, because each new
+session gets a fresh budget and the aiorpcx per-session cost resets to its
+connection base.  Closing that bypass is what this module does: it holds
+**per-IP** state that PERSISTS across reconnects, so accumulated cost,
+violations and the aggregate subscription count are shared across all of an
+IP's concurrent and sequential sessions.
+
+Design:
+
+* ``IPState`` — one record per client IP.  Cost decays over time (same decay
+  model as aiorpcx).  It tracks a violation count, a ``blocked_until`` wall
+  clock, the set of active session ids, and the aggregate live subscription
+  count.
+* ``IPRateLimiter`` — owns the ``ip -> IPState`` map.  Entries are evicted only
+  after ``ip_state_ttl`` seconds of inactivity (last-seen), so a dropped+
+  reopened connection finds its prior state intact, while idle IPs are reaped
+  so memory stays bounded.
+* Proxy trust — when ``TRUST_PROXY`` is on, the real client IP is taken from
+  the proxy-supplied forwarded chain (``TRUST_PROXY_HOPS`` from the right);
+  otherwise the socket peer is used.  When a trusted proxy is configured the
+  socket peer is the proxy (typically loopback), so private/loopback peers are
+  NOT exempted — we throttle on the forwarded client IP instead.
+
+The limiter is intentionally dependency-free and synchronous; callers are
+single-threaded asyncio sessions, so a plain dict + monotonic clock is enough.
 """
-Subscription Rate Limiter for RXinDexer
 
-Implements per-client rate limiting for subscriptions to prevent:
-- Subscription spam attacks
-- Memory exhaustion from excessive subscriptions
-- Notification flooding
-
-Configuration via environment variables:
-- MAX_SUBS_PER_CLIENT: Maximum subscriptions per client session
-- SUB_RATE_LIMIT: Maximum new subscriptions per second per client
-- SUB_BURST_LIMIT: Maximum burst of subscriptions allowed
-"""
-
+import os
 import time
-from typing import Dict, Set, Optional, Tuple
-from collections import defaultdict
-from dataclasses import dataclass, field
-
-from electrumx.lib import util
+from typing import Dict, Optional, Set, Tuple
 
 
-@dataclass
-class ClientRateLimitState:
-    """Rate limiting state for a single client."""
-    # Subscription tracking
-    subscriptions: Set[str] = field(default_factory=set)
-    subscription_count: int = 0
-    
-    # Token bucket for rate limiting
-    tokens: float = 0.0
-    last_update: float = field(default_factory=time.time)
-    
-    # Request tracking
-    request_count: int = 0
-    request_window_start: float = field(default_factory=time.time)
-    
-    # Violation tracking
-    violations: int = 0
-    last_violation: float = 0.0
-    blocked_until: float = 0.0
+# ---------------------------------------------------------------------------
+# Defaults.  Chosen high enough that a normal Electrum/Photonic client never
+# trips them; only abusive aggregate behaviour from one IP does.
+# ---------------------------------------------------------------------------
+
+# Aggregate subscription cap across ALL of one IP's sessions.  Larger than the
+# per-session DEFAULT_MAX_SUBS_PER_CLIENT (10000) so a single well-behaved
+# session is governed by the per-session cap, while the per-IP layer only
+# catches the many-connection / reconnect-loop bypass.
+DEFAULT_MAX_SUBS_PER_IP = 50000
+
+# Hard cost ceiling per IP.  Mirrors the aiorpcx per-session cost scale
+# (cost_hard_limit defaults to 100000 in env.py); the per-IP ceiling is the
+# aggregate budget an IP may accumulate across reconnects before it is blocked.
+DEFAULT_IP_COST_HARD_LIMIT = 1_000_000.0
+
+# How long an IP stays blocked once it trips the hard limit (seconds).
+DEFAULT_RATE_BLOCK_DURATION = 300
+
+# Idle TTL: evict an IP's state this many seconds after its last activity.
+# Long enough that a reconnecting client keeps its throttle, short enough that
+# memory is bounded.
+DEFAULT_IP_STATE_TTL = 3600
+
+# Cost decay per second.  Matches the order of magnitude aiorpcx uses
+# (cost_hard_limit / 10000); applied lazily on each touch.
+_DEFAULT_COST_DECAY_PER_SEC = DEFAULT_IP_COST_HARD_LIMIT / 10000.0
 
 
-class SubscriptionRateLimiter:
-    """
-    Per-client subscription rate limiter.
-    
-    Uses a token bucket algorithm for smooth rate limiting with
-    configurable burst allowance.
-    """
-    
+def _coerce_int(value, default: int) -> int:
+    """Best-effort int coercion that never raises (Mock-safe)."""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value, default: float) -> float:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class IPState:
+    """Per-IP throttle state that survives individual connections."""
+
+    __slots__ = (
+        'ip', 'cost', 'violations', 'blocked_until', 'sessions',
+        'sub_count', 'last_seen', '_cost_time',
+    )
+
+    def __init__(self, ip: str, now: float):
+        self.ip = ip
+        self.cost = 0.0
+        self.violations = 0
+        self.blocked_until = 0.0
+        # Live session ids currently attached to this IP.
+        self.sessions: Set[int] = set()
+        # Aggregate live subscription count across all of this IP's sessions.
+        self.sub_count = 0
+        self.last_seen = now
+        self._cost_time = now
+
+    def decay(self, now: float, decay_per_sec: float) -> None:
+        """Decay accumulated cost proportionally to elapsed time."""
+        if now > self._cost_time and decay_per_sec > 0:
+            self.cost = max(0.0, self.cost - (now - self._cost_time) * decay_per_sec)
+        self._cost_time = now
+
+    def touch(self, now: float) -> None:
+        self.last_seen = now
+
+
+class IPRateLimiter:
+    """Holds per-IP state shared across an IP's sessions and reconnects."""
+
     def __init__(self, env=None):
-        self.logger = util.class_logger(__name__, self.__class__.__name__)
-        
-        # Configuration from environment
-        self.max_subs_per_client = getattr(env, 'max_subs_per_client', 10000) if env else 10000
-        self.sub_rate_limit = getattr(env, 'sub_rate_limit', 100) if env else 100  # subs/sec
-        self.sub_burst_limit = getattr(env, 'sub_burst_limit', 500) if env else 500
-        self.violation_threshold = getattr(env, 'rate_violation_threshold', 10) if env else 10
-        self.block_duration = getattr(env, 'rate_block_duration', 60) if env else 60  # seconds
-        
-        # Per-client state
-        self.clients: Dict[str, ClientRateLimitState] = {}
-        
-        # Global tracking
-        self.total_subscriptions = 0
-        self.total_violations = 0
-        
-        self.logger.info(
-            f'Subscription rate limiter initialized: '
-            f'max_subs={self.max_subs_per_client}, '
-            f'rate={self.sub_rate_limit}/s, '
-            f'burst={self.sub_burst_limit}'
-        )
-    
-    def get_client_state(self, client_id: str) -> ClientRateLimitState:
-        """Get or create rate limit state for a client."""
-        if client_id not in self.clients:
-            self.clients[client_id] = ClientRateLimitState(
-                tokens=float(self.sub_burst_limit)
-            )
-        return self.clients[client_id]
-    
-    def can_subscribe(self, client_id: str, subscription_key: str) -> Tuple[bool, Optional[str]]:
+        self._states: Dict[str, IPState] = {}
+        # ---- config (resolved from env attrs, then process env, then default)
+        self.enabled = self._resolve_bool(
+            env, 'rate_limit_enabled', 'RATE_LIMIT_ENABLED', True)
+        self.trust_proxy = self._resolve_bool(
+            env, 'trust_proxy', 'TRUST_PROXY', False)
+        self.trust_proxy_hops = max(1, self._resolve_int(
+            env, 'trust_proxy_hops', 'TRUST_PROXY_HOPS', 1))
+        self.max_subs_per_ip = self._resolve_int(
+            env, 'max_subs_per_ip', 'MAX_SUBS_PER_IP', DEFAULT_MAX_SUBS_PER_IP)
+        self.ip_cost_hard_limit = self._resolve_float(
+            env, 'ip_cost_hard_limit', 'IP_COST_HARD_LIMIT',
+            DEFAULT_IP_COST_HARD_LIMIT)
+        self.block_duration = self._resolve_int(
+            env, 'rate_block_duration', 'RATE_BLOCK_DURATION',
+            DEFAULT_RATE_BLOCK_DURATION)
+        self.ip_state_ttl = self._resolve_int(
+            env, 'ip_state_ttl', 'IP_STATE_TTL', DEFAULT_IP_STATE_TTL)
+        self.cost_decay_per_sec = self._resolve_float(
+            env, 'ip_cost_decay_per_sec', 'IP_COST_DECAY_PER_SEC',
+            self.ip_cost_hard_limit / 10000.0 if self.ip_cost_hard_limit > 0
+            else _DEFAULT_COST_DECAY_PER_SEC)
+        # Cheap incremental eviction trigger.
+        self._ops_since_evict = 0
+        self._evict_every = 256
+
+    # -- config resolution ---------------------------------------------------
+
+    @staticmethod
+    def _resolve_bool(env, attr, envvar, default) -> bool:
+        val = getattr(env, attr, None) if env is not None else None
+        if isinstance(val, bool):
+            return val
+        raw = os.environ.get(envvar)
+        if raw is None:
+            return default
+        return raw.strip().lower() not in ('0', 'false', 'no', '')
+
+    @staticmethod
+    def _resolve_int(env, attr, envvar, default) -> int:
+        val = getattr(env, attr, None) if env is not None else None
+        out = _coerce_int(val, None) if val is not None else None
+        if out is None:
+            out = _coerce_int(os.environ.get(envvar), None)
+        return default if out is None else out
+
+    @staticmethod
+    def _resolve_float(env, attr, envvar, default) -> float:
+        val = getattr(env, attr, None) if env is not None else None
+        out = _coerce_float(val, None) if val is not None else None
+        if out is None:
+            out = _coerce_float(os.environ.get(envvar), None)
+        return default if out is None else out
+
+    # -- IP derivation -------------------------------------------------------
+
+    def client_ip(self, session) -> Optional[str]:
+        """Resolve a session's real client IP, proxy-aware.
+
+        When ``trust_proxy`` is on and the session/transport exposes a
+        forwarded chain (``X-Forwarded-For`` from the WS handshake, or an
+        ``x-real-ip`` header), the client IP is taken from that chain at
+        ``trust_proxy_hops`` from the right (the trusted hop the proxy added).
+        Crucially, in trusted-proxy mode the socket peer is the proxy itself
+        (often loopback), so we do NOT exempt private/loopback peers here.
+
+        When ``trust_proxy`` is off, the socket peer host is used and private
+        peers behave exactly as before (this layer simply governs them too;
+        the caller decides whether to exempt — see :meth:`is_exempt_peer`).
         """
-        Check if a client can create a new subscription.
-        
-        Returns (allowed, error_message).
+        if self.trust_proxy:
+            forwarded = self._forwarded_for(session)
+            if forwarded:
+                return forwarded
+            real = self._header(session, 'x-real-ip')
+            if real:
+                return real.strip()
+        host = self._peer_host(session)
+        return host
+
+    @staticmethod
+    def _peer_host(session) -> Optional[str]:
+        try:
+            addr = session.remote_address()
+        except Exception:
+            return None
+        if addr is None:
+            return None
+        host = getattr(addr, 'host', None)
+        return str(host) if host is not None else None
+
+    def _forwarded_for(self, session) -> Optional[str]:
+        raw = self._header(session, 'x-forwarded-for')
+        if not raw:
+            return None
+        parts = [p.strip() for p in raw.split(',') if p.strip()]
+        if not parts:
+            return None
+        idx = max(0, len(parts) - self.trust_proxy_hops)
+        return parts[idx]
+
+    @staticmethod
+    def _header(session, name: str) -> Optional[str]:
+        """Best-effort read of a request header from a (WS) session/transport.
+
+        Supports several shapes so tests and the live WS transport both work:
+        ``session.request_headers``, ``session.transport.websocket.request_headers``
+        and a plain ``session.headers`` mapping.  Returns None if unavailable.
         """
-        state = self.get_client_state(client_id)
-        now = time.time()
-        
-        # Check if client is blocked
-        if state.blocked_until > now:
-            remaining = int(state.blocked_until - now)
-            return False, f'Client blocked for {remaining}s due to rate limit violations'
-        
-        # Check subscription limit
-        if state.subscription_count >= self.max_subs_per_client:
-            self._record_violation(client_id, state, 'max_subscriptions')
-            return False, f'Maximum subscriptions ({self.max_subs_per_client}) exceeded'
-        
-        # Check if already subscribed
-        if subscription_key in state.subscriptions:
-            return True, None  # Already subscribed, allow (no new subscription)
-        
-        # Token bucket rate limiting
-        self._refill_tokens(state, now)
-        
-        if state.tokens < 1.0:
-            self._record_violation(client_id, state, 'rate_limit')
-            return False, 'Subscription rate limit exceeded, please slow down'
-        
-        return True, None
-    
-    def record_subscription(self, client_id: str, subscription_key: str):
-        """Record a successful subscription."""
-        state = self.get_client_state(client_id)
-        
-        if subscription_key not in state.subscriptions:
-            state.subscriptions.add(subscription_key)
-            state.subscription_count += 1
-            state.tokens -= 1.0
-            self.total_subscriptions += 1
-    
-    def record_unsubscription(self, client_id: str, subscription_key: str):
-        """Record an unsubscription."""
-        state = self.get_client_state(client_id)
-        
-        if subscription_key in state.subscriptions:
-            state.subscriptions.remove(subscription_key)
-            state.subscription_count -= 1
-            self.total_subscriptions -= 1
-    
-    def remove_client(self, client_id: str):
-        """Remove all state for a disconnected client."""
-        if client_id in self.clients:
-            state = self.clients.pop(client_id)
-            self.total_subscriptions -= state.subscription_count
-    
-    def _refill_tokens(self, state: ClientRateLimitState, now: float):
-        """Refill tokens based on elapsed time."""
-        elapsed = now - state.last_update
-        state.last_update = now
-        
-        # Add tokens based on rate and elapsed time
-        new_tokens = elapsed * self.sub_rate_limit
-        state.tokens = min(state.tokens + new_tokens, float(self.sub_burst_limit))
-    
-    def _record_violation(self, client_id: str, state: ClientRateLimitState, 
-                          violation_type: str):
-        """Record a rate limit violation."""
-        now = time.time()
-        state.violations += 1
-        state.last_violation = now
-        self.total_violations += 1
-        
-        self.logger.warning(
-            f'Rate limit violation for {client_id}: {violation_type} '
-            f'(violation #{state.violations})'
-        )
-        
-        # Block client if too many violations
-        if state.violations >= self.violation_threshold:
-            state.blocked_until = now + self.block_duration
-            self.logger.warning(
-                f'Client {client_id} blocked for {self.block_duration}s '
-                f'due to {state.violations} violations'
-            )
-    
-    def get_client_stats(self, client_id: str) -> Dict[str, any]:
-        """Get rate limiting stats for a client."""
-        if client_id not in self.clients:
-            return {'subscriptions': 0, 'violations': 0, 'blocked': False}
-        
-        state = self.clients[client_id]
-        now = time.time()
-        
+        candidates = []
+        for obj in (session, getattr(session, 'transport', None)):
+            if obj is None:
+                continue
+            ws = getattr(obj, 'websocket', None)
+            if ws is not None:
+                candidates.append(getattr(ws, 'request_headers', None))
+            candidates.append(getattr(obj, 'request_headers', None))
+            candidates.append(getattr(obj, 'headers', None))
+        for headers in candidates:
+            if not headers:
+                continue
+            try:
+                # websockets Headers / dict both support .get (case-insensitive
+                # for websockets.Headers; we lower the key for plain dicts too).
+                val = headers.get(name)
+                if val is None:
+                    val = headers.get(name.title())
+                if val is None and hasattr(headers, 'get'):
+                    # Try a case-insensitive scan as a last resort.
+                    for k in getattr(headers, 'keys', lambda: [])():
+                        if str(k).lower() == name:
+                            val = headers.get(k)
+                            break
+                if val:
+                    return val
+            except Exception:
+                continue
+        return None
+
+    def is_exempt_peer(self, session) -> bool:
+        """Whether the socket peer should be exempted from grouping.
+
+        Mirrors the legacy ``_ip_addr_group_name`` behaviour: a private/loopback
+        peer is exempt — BUT ONLY when no trusted proxy is configured.  When a
+        trusted proxy IS configured the peer is the proxy (loopback) and the
+        real client IP comes from the forwarded chain, so nothing is exempted.
+        """
+        if self.trust_proxy:
+            return False
+        from ipaddress import ip_address
+        host = self._peer_host(session)
+        if host is None:
+            return False
+        try:
+            return ip_address(host).is_private
+        except ValueError:
+            return False
+
+    # -- state access --------------------------------------------------------
+
+    def _state(self, ip: str, now: float) -> IPState:
+        st = self._states.get(ip)
+        if st is None:
+            st = IPState(ip, now)
+            self._states[ip] = st
+        return st
+
+    def get_state(self, ip: str) -> Optional[IPState]:
+        """Return the existing state for an IP, or None.  No side effects."""
+        return self._states.get(ip)
+
+    def _maybe_evict(self, now: float) -> None:
+        self._ops_since_evict += 1
+        if self._ops_since_evict < self._evict_every:
+            return
+        self._ops_since_evict = 0
+        self.evict_stale(now)
+
+    def evict_stale(self, now: Optional[float] = None) -> int:
+        """Evict IP states idle for longer than the TTL.  Returns count removed.
+
+        An IP with live sessions is never evicted regardless of last-seen.
+        """
+        if now is None:
+            now = time.time()
+        ttl = self.ip_state_ttl
+        if ttl <= 0:
+            return 0
+        stale = [
+            ip for ip, st in self._states.items()
+            if not st.sessions and (now - st.last_seen) > ttl
+        ]
+        for ip in stale:
+            del self._states[ip]
+        return len(stale)
+
+    # -- lifecycle hooks (called from session.py) ----------------------------
+
+    def register_session(self, ip: Optional[str], session_id: int,
+                          now: Optional[float] = None) -> float:
+        """Register a new session for an IP and return the PERSISTED cost.
+
+        The returned cost should seed the session's starting aiorpcx ``cost``
+        so a reconnect does NOT reset the throttle.  Idempotent per session_id.
+        """
+        if not self.enabled or ip is None or session_id is None:
+            return 0.0
+        if now is None:
+            now = time.time()
+        st = self._state(ip, now)
+        st.decay(now, self.cost_decay_per_sec)
+        st.sessions.add(session_id)
+        st.touch(now)
+        self._maybe_evict(now)
+        return st.cost
+
+    def release_session(self, ip: Optional[str], session_id: int,
+                        session_cost: float = 0.0,
+                        sub_count: int = 0,
+                        now: Optional[float] = None) -> None:
+        """Detach a session on disconnect WITHOUT dropping the IP state.
+
+        ``session_cost`` is the session's final aiorpcx cost; the portion above
+        what was seeded is written back so sequential abuse accumulates.  The
+        last-seen timestamp is updated so the TTL clock starts now (state is
+        kept for reconnects until the TTL elapses).
+        """
+        if not self.enabled or ip is None:
+            return
+        if now is None:
+            now = time.time()
+        st = self._states.get(ip)
+        if st is None:
+            return
+        st.sessions.discard(session_id)
+        st.decay(now, self.cost_decay_per_sec)
+        # Persist the session's accumulated cost into the IP aggregate.  We add
+        # the (decayed) session cost so repeated short connections still build
+        # up an IP cost that survives reconnect.
+        if session_cost and session_cost > 0:
+            st.cost = min(st.cost + float(session_cost),
+                          self.ip_cost_hard_limit if self.ip_cost_hard_limit > 0
+                          else st.cost + float(session_cost))
+        # Release this session's contribution to the aggregate sub count.
+        if sub_count:
+            st.sub_count = max(0, st.sub_count - int(sub_count))
+        st.touch(now)
+
+    # -- cost accounting -----------------------------------------------------
+
+    def add_cost(self, ip: Optional[str], delta: float,
+                 now: Optional[float] = None) -> None:
+        """Add cost to an IP's running total (decaying first)."""
+        if not self.enabled or ip is None or not delta:
+            return
+        if now is None:
+            now = time.time()
+        st = self._state(ip, now)
+        st.decay(now, self.cost_decay_per_sec)
+        st.cost = max(0.0, st.cost + float(delta))
+        st.touch(now)
+
+    # -- checks --------------------------------------------------------------
+
+    def check_cost(self, ip: Optional[str],
+                   now: Optional[float] = None) -> Tuple[bool, str]:
+        """Return (allowed, reason) for the per-IP cost hard limit.
+
+        When the limit is exceeded the IP is marked blocked for
+        ``block_duration`` seconds; the block (and the underlying cost) persist
+        across reconnects until they decay/expire.
+        """
+        if not self.enabled or ip is None or self.ip_cost_hard_limit <= 0:
+            return True, ''
+        if now is None:
+            now = time.time()
+        st = self._states.get(ip)
+        if st is None:
+            return True, ''
+        if st.blocked_until > now:
+            return False, (f'rate limited: IP blocked for '
+                           f'{int(st.blocked_until - now)}s')
+        st.decay(now, self.cost_decay_per_sec)
+        if st.cost >= self.ip_cost_hard_limit:
+            st.violations += 1
+            st.blocked_until = now + self.block_duration
+            # The timed block IS the penalty; reset the accumulated cost so the
+            # IP gets a clean slate once the block expires (otherwise a
+            # not-yet-decayed cost would re-block it on the very next request).
+            st.cost = 0.0
+            st.touch(now)
+            return False, (f'rate limited: per-IP cost limit '
+                           f'({self.ip_cost_hard_limit:g}) exceeded')
+        return True, ''
+
+    def check_can_subscribe(self, ip: Optional[str], count: int = 1,
+                            now: Optional[float] = None,
+                            current: Optional[int] = None) -> Tuple[bool, str]:
+        """Return (allowed, reason) for adding ``count`` subscriptions on IP.
+
+        Enforces the AGGREGATE cap across all of the IP's sessions.  When
+        ``current`` is given it is used as the authoritative live aggregate
+        count (e.g. summed from the GlyphSubscriptionManager across the IP's
+        live sessions); otherwise the limiter's own ``sub_count`` bookkeeping is
+        used.  Does not mutate state; call :meth:`note_subscribed` to update the
+        limiter's bookkeeping when relying on it.
+        """
+        if not self.enabled or ip is None or self.max_subs_per_ip <= 0:
+            return True, ''
+        if now is None:
+            now = time.time()
+        st = self._states.get(ip)
+        base = current if current is not None else (st.sub_count if st else 0)
+        if st is not None and st.blocked_until > now:
+            return False, (f'rate limited: IP blocked for '
+                           f'{int(st.blocked_until - now)}s')
+        if base + count > self.max_subs_per_ip:
+            return False, (f'subscription limit reached '
+                           f'({self.max_subs_per_ip} per IP)')
+        return True, ''
+
+    def note_subscribed(self, ip: Optional[str], count: int = 1,
+                        now: Optional[float] = None) -> None:
+        """Record that ``count`` subscriptions were accepted for the IP."""
+        if not self.enabled or ip is None or count == 0:
+            return
+        if now is None:
+            now = time.time()
+        st = self._state(ip, now)
+        st.sub_count = max(0, st.sub_count + int(count))
+        st.touch(now)
+
+    def note_unsubscribed(self, ip: Optional[str], count: int = 1,
+                          now: Optional[float] = None) -> None:
+        if not self.enabled or ip is None or count == 0:
+            return
+        st = self._states.get(ip)
+        if st is None:
+            return
+        st.sub_count = max(0, st.sub_count - int(count))
+
+    def stats(self) -> dict:
         return {
-            'subscriptions': state.subscription_count,
-            'max_subscriptions': self.max_subs_per_client,
-            'violations': state.violations,
-            'blocked': state.blocked_until > now,
-            'blocked_until': state.blocked_until if state.blocked_until > now else None,
-            'tokens_available': int(state.tokens),
-            'rate_limit': self.sub_rate_limit,
+            'tracked_ips': len(self._states),
+            'blocked_ips': sum(1 for st in self._states.values()
+                               if st.blocked_until > time.time()),
+            'total_subscriptions': sum(st.sub_count
+                                       for st in self._states.values()),
         }
-    
-    def get_global_stats(self) -> Dict[str, any]:
-        """Get global rate limiting statistics."""
-        now = time.time()
-        blocked_count = sum(
-            1 for state in self.clients.values() 
-            if state.blocked_until > now
-        )
-        
-        return {
-            'total_clients': len(self.clients),
-            'total_subscriptions': self.total_subscriptions,
-            'total_violations': self.total_violations,
-            'blocked_clients': blocked_count,
-            'config': {
-                'max_subs_per_client': self.max_subs_per_client,
-                'sub_rate_limit': self.sub_rate_limit,
-                'sub_burst_limit': self.sub_burst_limit,
-                'violation_threshold': self.violation_threshold,
-                'block_duration': self.block_duration,
-            }
-        }
-    
-    def reset_client(self, client_id: str):
-        """Reset rate limiting state for a client (admin function)."""
-        if client_id in self.clients:
-            state = self.clients[client_id]
-            state.violations = 0
-            state.blocked_until = 0
-            state.tokens = float(self.sub_burst_limit)
-            self.logger.info(f'Reset rate limit state for client {client_id}')
 
 
-class RequestRateLimiter:
+# ---------------------------------------------------------------------------
+# Process-global instance, installed at startup via init_rate_limiters().
+# ---------------------------------------------------------------------------
+
+_ip_rate_limiter: Optional[IPRateLimiter] = None
+
+
+def init_rate_limiters(env=None) -> IPRateLimiter:
+    """Create and install the process-global IP rate limiter.
+
+    Called once from the SessionManager/Controller startup.  Safe to call
+    multiple times (idempotent-ish: re-creates from the given env).
     """
-    Per-client request rate limiter using sliding window.
-    
-    Limits the number of requests per time window to prevent
-    request flooding.
+    global _ip_rate_limiter
+    _ip_rate_limiter = IPRateLimiter(env)
+    return _ip_rate_limiter
+
+
+def get_ip_rate_limiter() -> Optional[IPRateLimiter]:
+    """Return the installed limiter, or None if init was never called.
+
+    Callers MUST degrade gracefully when this is None (feature disabled / not
+    yet wired), so the live session path never breaks if startup skipped init.
     """
-    
-    def __init__(self, env=None):
-        self.logger = util.class_logger(__name__, self.__class__.__name__)
-        
-        # Configuration
-        self.window_seconds = getattr(env, 'rate_window_seconds', 60) if env else 60
-        self.max_requests_per_window = getattr(env, 'max_requests_per_window', 1000) if env else 1000
-        self.cost_soft_limit = getattr(env, 'cost_soft_limit', 1000) if env else 1000
-        self.cost_hard_limit = getattr(env, 'cost_hard_limit', 10000) if env else 10000
-        
-        # Per-client tracking
-        self.clients: Dict[str, Dict[str, any]] = {}
-    
-    def check_request(self, client_id: str, cost: float = 1.0) -> Tuple[bool, Optional[str]]:
-        """
-        Check if a request should be allowed.
-        
-        Returns (allowed, error_message).
-        """
-        now = time.time()
-        
-        if client_id not in self.clients:
-            self.clients[client_id] = {
-                'requests': [],
-                'total_cost': 0.0,
-                'window_start': now,
-            }
-        
-        state = self.clients[client_id]
-        
-        # Clean up old requests outside window
-        cutoff = now - self.window_seconds
-        state['requests'] = [t for t in state['requests'] if t > cutoff]
-        
-        # Reset cost if window has passed
-        if state['window_start'] < cutoff:
-            state['total_cost'] = 0.0
-            state['window_start'] = now
-        
-        # Check request count limit
-        if len(state['requests']) >= self.max_requests_per_window:
-            return False, f'Request limit ({self.max_requests_per_window}/min) exceeded'
-        
-        # Check cost limit
-        if state['total_cost'] + cost > self.cost_hard_limit:
-            return False, 'Request cost limit exceeded'
-        
-        return True, None
-    
-    def record_request(self, client_id: str, cost: float = 1.0):
-        """Record a request."""
-        now = time.time()
-        
-        if client_id not in self.clients:
-            self.clients[client_id] = {
-                'requests': [],
-                'total_cost': 0.0,
-                'window_start': now,
-            }
-        
-        state = self.clients[client_id]
-        state['requests'].append(now)
-        state['total_cost'] += cost
-    
-    def get_cost_remaining(self, client_id: str) -> float:
-        """Get remaining cost budget for a client."""
-        if client_id not in self.clients:
-            return float(self.cost_hard_limit)
-        
-        state = self.clients[client_id]
-        now = time.time()
-        
-        # Reset if window passed
-        if state['window_start'] < now - self.window_seconds:
-            return float(self.cost_hard_limit)
-        
-        return max(0.0, self.cost_hard_limit - state['total_cost'])
-    
-    def remove_client(self, client_id: str):
-        """Remove state for a disconnected client."""
-        self.clients.pop(client_id, None)
-
-
-# Global instances
-_subscription_limiter: Optional[SubscriptionRateLimiter] = None
-_request_limiter: Optional[RequestRateLimiter] = None
-
-
-def get_subscription_limiter() -> SubscriptionRateLimiter:
-    """Get the global subscription rate limiter."""
-    global _subscription_limiter
-    if _subscription_limiter is None:
-        _subscription_limiter = SubscriptionRateLimiter()
-    return _subscription_limiter
-
-
-def get_request_limiter() -> RequestRateLimiter:
-    """Get the global request rate limiter."""
-    global _request_limiter
-    if _request_limiter is None:
-        _request_limiter = RequestRateLimiter()
-    return _request_limiter
-
-
-def init_rate_limiters(env) -> Tuple[SubscriptionRateLimiter, RequestRateLimiter]:
-    """Initialize global rate limiters with environment config."""
-    global _subscription_limiter, _request_limiter
-    _subscription_limiter = SubscriptionRateLimiter(env)
-    _request_limiter = RequestRateLimiter(env)
-    return _subscription_limiter, _request_limiter
+    return _ip_rate_limiter

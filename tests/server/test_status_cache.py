@@ -7,6 +7,7 @@ the confirmed-only status per hashX and invalidates it on the same touched set a
 the history cache. These tests pin that behaviour without standing up a full
 session/db.
 """
+import asyncio
 from unittest import mock
 
 import pylru
@@ -111,3 +112,55 @@ async def test_status_recomputes_after_invalidation():
 
     assert st_a != st_b  # status reflects the new confirmed history
     assert s.db.limited_history.await_count == 2
+
+
+# --- reorg cache clear (LOW fix) -------------------------------------------
+
+class _OnceEvent:
+    """A backed_up_event stand-in: wait() returns once (reorg signalled), then
+    raises CancelledError to break the _handle_chain_reorgs while-loop so the
+    coroutine completes deterministically after exactly one iteration."""
+    def __init__(self):
+        self._calls = 0
+
+    async def wait(self):
+        self._calls += 1
+        if self._calls > 1:
+            raise asyncio.CancelledError()
+        return True
+
+
+@pytest.mark.asyncio
+async def test_reorg_clears_status_and_history_caches():
+    """A signalled reorg must clear _status_cache and _history_cache (added in
+    a8c788f) alongside the tx_hashes/merkle/ref_get caches — defense-in-depth
+    against a stale confirmed-status window after a deep reorg."""
+    sm = SessionManager.__new__(SessionManager)
+    sm._reorg_count = 0
+    sm._tx_hashes_cache = pylru.lrucache(16)
+    sm._merkle_cache = pylru.lrucache(16)
+    sm._ref_get_cache = pylru.lrucache(16)
+    sm._status_cache = pylru.lrucache(16)
+    sm._history_cache = pylru.lrucache(16)
+    sm.logger = mock.Mock()
+    sm.bp = mock.Mock()
+    sm.bp.backed_up_event = _OnceEvent()
+
+    # Seed every cache.
+    sm._tx_hashes_cache[1] = "tx"
+    sm._merkle_cache[1] = "mk"
+    sm._ref_get_cache[1] = "ref"
+    sm._status_cache[HX] = "status"
+    sm._history_cache[HX] = "history"
+
+    with pytest.raises(asyncio.CancelledError):
+        await sm._handle_chain_reorgs()
+
+    # Exactly one reorg was processed.
+    assert sm._reorg_count == 1
+    # All caches — including the two new ones — were cleared.
+    assert len(sm._tx_hashes_cache) == 0
+    assert len(sm._merkle_cache) == 0
+    assert len(sm._ref_get_cache) == 0
+    assert len(sm._status_cache) == 0
+    assert len(sm._history_cache) == 0
