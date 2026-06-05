@@ -719,7 +719,7 @@ class BlockProcessor:
                             f'Passing WAVE envelope to wave_index: '
                             f'tx={hash_to_hex_str(tx_hash)} protocols={protocols}'
                         )
-                    self.wave_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope)
+                    self.wave_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, output_refs_by_vout, spent_singleton_refs)
                 
                 # Process for Swap orders unconditionally (R3: RSWP may have no Glyph envelope)
                 if self.swap_index:

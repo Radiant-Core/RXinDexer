@@ -52,6 +52,7 @@ class WaveDBKeys:
     HEIGHT = b'WH'    # WH + ref -> registration height
     UNDO = b'WVU'      # WVU + height(be) -> repr([(key, prev_value_or_None), ...])
     DUPLICATE = b'WD' # WD + name_hash + height + tx_idx -> ref (duplicate registrations)
+    SINGLETON = b'WSG'  # WSG + singleton_ref(36) -> name_hash (canonical name owning it)
 
 
 class WaveZoneRecords:
@@ -276,11 +277,17 @@ class WaveIndex:
         self.name_cache: Dict[bytes, bytes] = {}  # name_hash -> ref
         self.zone_cache: Dict[bytes, bytes] = {}  # ref -> zone cbor
         self.owner_cache: Dict[bytes, bytes] = {}  # ref -> scripthash
+        # singleton_ref -> name_hash. The NFT singleton ref is a STABLE identity
+        # across moves, so recording it at registration lets a later mutable
+        # target update (which co-spends the singleton but carries no protocol
+        # list) be tied back to the canonical name it belongs to.
+        self.singleton_cache: Dict[bytes, bytes] = {}  # singleton_ref(36) -> name_hash
 
         self.tree_height: Dict[bytes, int] = {}
         self.name_height: Dict[bytes, int] = {}
         self.zone_height: Dict[bytes, int] = {}
         self.owner_height: Dict[bytes, int] = {}
+        self.singleton_height: Dict[bytes, int] = {}
 
         # Per-height undo info for reorg safety
         self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
@@ -305,7 +312,9 @@ class WaveIndex:
                 self.logger.warning('WAVE_GENESIS_REF not configured')
     
     def process_tx(self, tx_hash: bytes, tx, height: int, tx_idx: int,
-                   glyph_envelope: Dict[str, Any] = None):
+                   glyph_envelope: Dict[str, Any] = None,
+                   output_refs_by_vout: Dict[int, List[Tuple[bytes, int]]] = None,
+                   spent_singleton_refs: set = None):
         """
         Process a transaction for WAVE name registration/update.
         
@@ -322,8 +331,17 @@ class WaveIndex:
         
         protocols = glyph_envelope.get('protocols', [])
         if GlyphProtocol.GLYPH_WAVE not in protocols:
+            # Not a (re)registration — but it may be a mutable TARGET UPDATE.
+            # A "mod" op re-points the name by co-spending the NFT singleton; its
+            # CBOR payload is just {attrs: {...}} with no protocol list, so it
+            # would otherwise be ignored here and the name would resolve forever
+            # to its genesis target. Apply the update against the canonical name
+            # that owns the spent singleton.
+            self._maybe_apply_target_update(
+                tx_hash, height, glyph_envelope, spent_singleton_refs
+            )
             self.logger.debug(
-                f'WAVE skip tx {hash_to_hex_str(tx_hash)}: '
+                f'WAVE non-registration tx {hash_to_hex_str(tx_hash)}: '
                 f'protocols={protocols} (no GLYPH_WAVE={GlyphProtocol.GLYPH_WAVE})'
             )
             return
@@ -399,6 +417,17 @@ class WaveIndex:
             # First registration - store as canonical
             self.name_cache[name_hash] = claim_ref
             self.name_height[name_hash] = height
+
+            # Record the NFT singleton ref(s) this registration creates so a
+            # later mutable target update (which co-spends the singleton) can be
+            # mapped back to this canonical name. Singleton refs are a stable
+            # identity, so this mapping survives moves with no re-recording.
+            if output_refs_by_vout:
+                for ref_list in output_refs_by_vout.values():
+                    for ref_bytes, ref_type in ref_list:
+                        if ref_type == 1:  # singleton (NFT)
+                            self.singleton_cache[ref_bytes] = name_hash
+                            self.singleton_height[ref_bytes] = height
         
         # Store zone records (for both canonical and duplicates)
         zone = WaveZoneRecords.from_metadata(metadata)
@@ -488,6 +517,66 @@ class WaveIndex:
         key = WaveDBKeys.NAME + name_hash
         return self.db.utxo_db.get(key)
 
+    def _resolve_singleton_to_name(self, singleton_ref: bytes) -> Optional[bytes]:
+        """Resolve an NFT singleton ref to the canonical name_hash that owns it."""
+        if singleton_ref in self.singleton_cache:
+            return self.singleton_cache[singleton_ref]
+        return self.db.utxo_db.get(WaveDBKeys.SINGLETON + singleton_ref)
+
+    def _invalidate_hot_name_by_ref(self, ref: bytes):
+        """Drop any hot-cache entries pointing at this claim ref so the next
+        resolve() rebuilds from the freshly-updated zone records."""
+        stale = [n for n, info in self.hot_names.items()
+                 if getattr(info, 'ref', None) == ref]
+        for n in stale:
+            self.hot_names.pop(n, None)
+
+    def _maybe_apply_target_update(self, tx_hash: bytes, height: int,
+                                   glyph_envelope: Dict[str, Any],
+                                   spent_singleton_refs: set):
+        """Apply a mutable "mod" target update to the canonical name.
+
+        The tx co-spends the name's NFT singleton (covenant-enforced: only the
+        singleton holder can produce this), so a spent singleton that maps to a
+        known canonical name authorises updating that name's zone target.
+        """
+        if not self.enabled or not spent_singleton_refs:
+            return
+
+        metadata = glyph_envelope.get('metadata') or {}
+        attrs = metadata.get('attrs') or {}
+        # Only address-type targets are meaningful for resolution.
+        if attrs.get('target_type', 'address') != 'address':
+            return
+        new_target = attrs.get('target')
+        if not new_target:
+            return
+
+        for singleton_ref in spent_singleton_refs:
+            name_hash = self._resolve_singleton_to_name(singleton_ref)
+            if not name_hash:
+                continue
+            claim_ref = (self.name_cache.get(name_hash)
+                         or self.db.utxo_db.get(WaveDBKeys.NAME + name_hash))
+            if not claim_ref:
+                continue
+
+            # Merge onto the existing zone so unrelated records are preserved.
+            zone = self._get_zone_records(claim_ref) or WaveZoneRecords()
+            if zone.address == new_target:
+                continue  # already current
+            zone.address = new_target
+            if HAS_CBOR:
+                self.zone_cache[claim_ref] = cbor2.dumps(zone.to_dict())
+                self.zone_height[claim_ref] = height
+                self._pending_heights[claim_ref.hex()] = height
+            self._invalidate_hot_name_by_ref(claim_ref)
+            self.logger.info(
+                f'WAVE target updated via mod: '
+                f'name_hash={name_hash.hex()[:12]}.. -> {new_target!r} '
+                f'at height {height} (tx {hash_to_hex_str(tx_hash)})'
+            )
+
     def _undo_key(self, height: int) -> bytes:
         return WaveDBKeys.UNDO + pack_be_uint32(height)
 
@@ -544,10 +633,12 @@ class WaveIndex:
             + len(self.name_cache) * 190
             + len(self.zone_cache) * 600
             + len(self.owner_cache) * 190
+            + len(self.singleton_cache) * 190
             + len(self.tree_height) * 140
             + len(self.name_height) * 140
             + len(self.zone_height) * 140
             + len(self.owner_height) * 140
+            + len(self.singleton_height) * 140
             + undo_entries * 120
             + len(self._pending_heights) * 140
             + len(self.hot_names) * 400
@@ -607,6 +698,14 @@ class WaveIndex:
                 self._record_undo(height, rev_key)
             batch.put(rev_key, b'')
 
+        # Flush singleton -> name_hash mappings (for target-update lookups)
+        for singleton_ref, name_hash in self.singleton_cache.items():
+            height = self.singleton_height.get(singleton_ref)
+            key = WaveDBKeys.SINGLETON + singleton_ref
+            if height is not None:
+                self._record_undo(height, key)
+            batch.put(key, name_hash)
+
         # Persist undo information last so it includes keys written above.
         for height, entries in sorted(self._undo_cache.items()):
             batch.put(self._undo_key(height), encode_undo(entries))  # R22
@@ -619,10 +718,12 @@ class WaveIndex:
         self.name_cache.clear()
         self.zone_cache.clear()
         self.owner_cache.clear()
+        self.singleton_cache.clear()
         self.tree_height.clear()
         self.name_height.clear()
         self.zone_height.clear()
         self.owner_height.clear()
+        self.singleton_height.clear()
         self._pending_heights.clear()
         
         if count > 0:

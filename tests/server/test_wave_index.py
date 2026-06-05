@@ -618,5 +618,121 @@ class TestWaveOutputStructure:
         assert len(used_outputs) == 37
 
 
+class _FakeOutput:
+    def __init__(self, pk_script):
+        self.pk_script = pk_script
+
+
+class _FakeTx:
+    def __init__(self, outputs):
+        self.outputs = outputs
+        self.inputs = []
+
+
+class TestWaveTargetUpdate:
+    """A mutable "mod" target update must re-point the canonical name.
+
+    Regression for the bug where a WAVE name target-update confirmed on-chain
+    but the indexer kept resolving the GENESIS target forever (mod payloads
+    carry no protocol list, so they were skipped), making the name appear to
+    "still resolve to the old address" even though it was updated.
+    """
+
+    OLD_TARGET = '1BLZiLHCV17EqLWA9S42aFZScCnF1zbnPE'
+    NEW_TARGET = '1489r9fYzC9VgueuT16CPWiRRx4HKacYbB'
+    SINGLETON_REF = bytes.fromhex('22' * 32) + struct.pack('<I', 1)  # 36 bytes
+
+    @pytest.fixture
+    def mock_db(self):
+        db = Mock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(return_value=None)
+        db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
+        return db
+
+    @pytest.fixture
+    def mock_env(self):
+        env = Mock()
+        env.wave_index = True
+        env.wave_genesis_ref = 'a' * 64 + '_0'
+        env.wave_hot_names = 1000
+        env.reorg_limit = 10
+        env.coin.hashX_from_script = Mock(return_value=b'\x00' * 11)
+        env.glyph_index = None
+        return env
+
+    @pytest.fixture
+    def wave_index(self, mock_db, mock_env):
+        from electrumx.server.wave_index import WaveIndex
+        return WaveIndex(mock_db, mock_env)
+
+    def _tx(self):
+        return _FakeTx([_FakeOutput(bytes.fromhex('76a914' + '11' * 20 + '88ac'))])
+
+    def _register(self, wave_index):
+        envelope = {
+            'protocols': [2, 5, 11],  # NFT + MUT + WAVE
+            'metadata': {'attrs': {
+                'name': '12345', 'domain': 'rxd',
+                'target': self.OLD_TARGET, 'target_type': 'address',
+            }},
+        }
+        wave_index.process_tx(
+            bytes.fromhex('e5' * 32), self._tx(), 410000, 0, envelope,
+            output_refs_by_vout={1: [(self.SINGLETON_REF, 1)]},
+            spent_singleton_refs=set(),
+        )
+
+    def _update(self, wave_index, target=NEW_TARGET):
+        envelope = {
+            'protocols': [],  # mod payload: no protocol list
+            'metadata': {'attrs': {
+                'name': '12345', 'domain': 'rxd',
+                'target': target, 'target_type': 'address',
+            }},
+        }
+        wave_index.process_tx(
+            bytes.fromhex('f7' * 32), self._tx(), 435095, 0, envelope,
+            output_refs_by_vout={1: [(self.SINGLETON_REF, 1)]},
+            spent_singleton_refs={self.SINGLETON_REF},
+        )
+
+    def test_registration_records_singleton(self, wave_index):
+        self._register(wave_index)
+        from electrumx.server.wave_index import name_to_hash
+        assert wave_index.singleton_cache[self.SINGLETON_REF] == name_to_hash('12345')
+        assert wave_index.resolve('12345')['target'] == self.OLD_TARGET
+
+    def test_mod_update_repoints_canonical(self, wave_index):
+        self._register(wave_index)
+        # Prime the hot cache (simulates a resolve before the update).
+        assert wave_index.resolve('12345')['target'] == self.OLD_TARGET
+        self._update(wave_index)
+        result = wave_index.resolve('12345')
+        assert result['target'] == self.NEW_TARGET
+        assert result['available'] is False
+
+    def test_mod_update_is_not_a_duplicate(self, wave_index):
+        self._register(wave_index)
+        self._update(wave_index)
+        # Updating must not create a duplicate registration.
+        assert wave_index._has_duplicates('12345') is False
+
+    def test_mod_update_unknown_singleton_ignored(self, wave_index):
+        self._register(wave_index)
+        # A mod that spends some OTHER singleton must not touch this name.
+        envelope = {
+            'protocols': [],
+            'metadata': {'attrs': {'target': 'HIJACK', 'target_type': 'address'}},
+        }
+        wave_index.process_tx(
+            bytes.fromhex('cc' * 32), self._tx(), 435100, 0, envelope,
+            output_refs_by_vout=None,
+            spent_singleton_refs={bytes.fromhex('99' * 32) + struct.pack('<I', 7)},
+        )
+        assert wave_index.resolve('12345')['target'] == self.OLD_TARGET
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
