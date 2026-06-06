@@ -1451,11 +1451,83 @@ class GlyphAPIMixin:
     async def wave_stats(self):
         """Get WAVE indexing statistics."""
         self.bump_cost(0.5)
-        
+
         if not hasattr(self, 'wave_index') or not self.wave_index:
             return {'enabled': False}
-        
+
         return self.wave_index.stats()
+
+    # ========================================================================
+    # Realm directory API (on-chain GlyphGalaxy realms — realm_v1 NFTs)
+    # ========================================================================
+
+    async def realm_list(self, kind: str = None, owner: str = None,
+                         q: str = None, sort: str = 'new', limit: int = 200):
+        """
+        List indexed realms (worlds/arenas/experiences), filtered + sorted.
+
+        Args:
+            kind: Optional filter — 'world' | 'arena' | 'experience'.
+            owner: Optional filter by CURRENT holder address (edit rights follow
+                   the NFT, so this is the live holder, not the mint payload).
+            q: Optional case-insensitive substring over name + desc + id.
+            sort: 'new' (default, newest-minted first) | 'name'.
+            limit: Maximum results (default 200, max 1000).
+
+        Returns:
+            List of realm records. Each carries the immutable discovery fields
+            (id/name/kind/seed/spawn/desc/creator/royalty_bps) plus the live
+            ``owner`` (current NFT holder) and the realm's ``ref``.
+        """
+        self.bump_cost(2.0)
+
+        if not getattr(self, 'realm_index', None):
+            return {'error': 'Realm indexing not enabled'}
+
+        return self.realm_index.list(kind=kind, owner=owner, q=q,
+                                     sort=sort or 'new', limit=limit)
+
+    async def realm_get_by_id(self, realm_id: str):
+        """
+        Get one realm by its stable slug id.
+
+        Args:
+            realm_id: The realm's slug (the directory key + portal ref).
+
+        Returns:
+            The realm record (with the live current-holder ``owner``) or None if
+            no realm with that id is indexed.
+        """
+        self.bump_cost(1.0)
+
+        if not getattr(self, 'realm_index', None):
+            return {'error': 'Realm indexing not enabled'}
+
+        return self.realm_index.get_by_id(realm_id)
+
+    async def realm_search(self, q: str, limit: int = 200):
+        """
+        Free-text search over indexed realms (name + desc + id).
+
+        Args:
+            q: Search query string.
+            limit: Maximum results (default 200, max 1000).
+        """
+        self.bump_cost(2.0)
+
+        if not getattr(self, 'realm_index', None):
+            return {'error': 'Realm indexing not enabled'}
+
+        return self.realm_index.search(q, limit=limit)
+
+    async def realm_stats(self):
+        """Get realm indexing statistics."""
+        self.bump_cost(0.5)
+
+        if not getattr(self, 'realm_index', None):
+            return {'enabled': False}
+
+        return self.realm_index.stats()
 
 
 # Method registration for ElectrumX
@@ -1512,4 +1584,9 @@ GLYPH_METHODS = {
     'wave.get_subdomains': 'wave_get_subdomains',
     'wave.reverse_lookup': 'wave_reverse_lookup',
     'wave.stats': 'wave_stats',
+    # Realm directory (on-chain GlyphGalaxy realms — realm_v1 NFTs)
+    'realm.list': 'realm_list',
+    'realm.get_by_id': 'realm_get_by_id',
+    'realm.search': 'realm_search',
+    'realm.stats': 'realm_stats',
 }

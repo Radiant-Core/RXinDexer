@@ -191,8 +191,8 @@ class DB(object):
         assert not flush_data.undo_infos
         self.history.assert_flushed()
 
-    def flush_dbs(self, flush_data, flush_utxos, estimate_txs_remaining, 
-                  glyph_index=None, wave_index=None, swap_index=None, analytics_index=None, dmint_contracts=None):
+    def flush_dbs(self, flush_data, flush_utxos, estimate_txs_remaining,
+                  glyph_index=None, wave_index=None, realm_index=None, swap_index=None, analytics_index=None, dmint_contracts=None):
         '''Flush out cached state.  History is always flushed; UTXOs are
         flushed if flush_utxos. Glyph/WAVE/Swap indexes are flushed if provided.
         dMint contracts manager syncs from Glyph index if provided.'''
@@ -220,6 +220,9 @@ class DB(object):
             # Flush WAVE index data
             if wave_index:
                 wave_index.flush(batch)
+            # Flush realm directory index data
+            if realm_index:
+                realm_index.flush(batch)
             # Flush Swap index data
             if swap_index:
                 swap_index.flush(batch)
@@ -372,7 +375,7 @@ class DB(object):
         self.last_flush_tx_count = self.fs_tx_count
         self.write_utxo_state(batch)
 
-    def flush_backup(self, flush_data, touched, *, glyph_index=None, wave_index=None, swap_index=None, analytics_index=None, dmint_contracts=None):
+    def flush_backup(self, flush_data, touched, *, glyph_index=None, wave_index=None, realm_index=None, swap_index=None, analytics_index=None, dmint_contracts=None):
         '''Like flush_dbs() but when backing up.  All UTXOs are flushed.
         dMint contracts re-sync from Glyph index after reorg.'''
         assert not flush_data.headers
@@ -394,6 +397,8 @@ class DB(object):
                 glyph_index.backup(batch, reorg_height)
             if wave_index is not None:
                 wave_index.backup(batch, reorg_height)
+            if realm_index is not None:
+                realm_index.backup(batch, reorg_height)
             if swap_index is not None:
                 swap_index.backup(batch, reorg_height)
             if analytics_index is not None:

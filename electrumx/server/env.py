@@ -89,6 +89,7 @@ class Env(EnvBase):
         # RXinDexer: Glyph/WAVE/Swap indexing configuration
         self.glyph_index = False if minimal else self.boolean('GLYPH_INDEX', True)
         self.wave_index = False if minimal else self.boolean('WAVE_INDEX', True)
+        self.realm_index = False if minimal else self.boolean('REALM_INDEX', True)
         self.swap_index = False if minimal else self.boolean('SWAP_INDEX', True)
         self.analytics_index = False if minimal else self.boolean('ANALYTICS_INDEX', True)
         self.glyph_subscriptions = False if minimal else self.boolean('GLYPH_SUBSCRIPTIONS', True)

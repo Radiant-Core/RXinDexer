@@ -43,6 +43,14 @@ except ImportError:
     HAS_WAVE_INDEX = False
     WaveIndex = None
 
+# Import RealmIndex for the on-chain realm directory (realm_v1 NFTs)
+try:
+    from electrumx.server.realm_index import RealmIndex
+    HAS_REALM_INDEX = True
+except ImportError:
+    HAS_REALM_INDEX = False
+    RealmIndex = None
+
 # Import SwapIndex for DEX order tracking
 try:
     from electrumx.server.swap_index import SwapIndex
@@ -261,6 +269,14 @@ class BlockProcessor:
             self.wave_index = WaveIndex(db, env)
             self.logger.info('WAVE naming system indexing initialized')
 
+        # Realm directory indexing (realm_v1 NFTs). Holds a reference to the
+        # Glyph index so realm queries can resolve the CURRENT NFT holder (the
+        # editable-by owner) — edit rights follow the token, not the payload.
+        self.realm_index = None
+        if HAS_REALM_INDEX and getattr(env, 'realm_index', True):
+            self.realm_index = RealmIndex(db, env, glyph_index=self.glyph_index)
+            self.logger.info('Realm directory indexing initialized')
+
         # Swap order indexing
         self.swap_index = None
         if HAS_SWAP_INDEX and getattr(env, 'swap_index', True):
@@ -333,6 +349,7 @@ class BlockProcessor:
                 self.touched,
                 glyph_index=self.glyph_index,
                 wave_index=self.wave_index,
+                realm_index=self.realm_index,
                 swap_index=self.swap_index,
                 analytics_index=self.analytics_index,
                 dmint_contracts=self.dmint_contracts,
@@ -415,6 +432,7 @@ class BlockProcessor:
         self.db.flush_dbs(self.flush_data(), flush_utxos, self.estimate_txs_remaining,
                          glyph_index=self.glyph_index,
                          wave_index=self.wave_index,
+                         realm_index=self.realm_index,
                          swap_index=self.swap_index,
                          analytics_index=self.analytics_index,
                          dmint_contracts=self.dmint_contracts)
@@ -452,6 +470,8 @@ class BlockProcessor:
             index_cache_size += self.glyph_index.memory_estimate()
         if self.wave_index is not None:
             index_cache_size += self.wave_index.memory_estimate()
+        if self.realm_index is not None:
+            index_cache_size += self.realm_index.memory_estimate()
         if self.swap_index is not None:
             index_cache_size += self.swap_index.memory_estimate()
         if self.analytics_index is not None:
@@ -743,6 +763,20 @@ class BlockProcessor:
                     except Exception:
                         self.logger.exception(
                             'wave_index.process_tx failed for tx %s at height %d; skipping',
+                            hash_to_hex_str(tx_hash), self.height + 1
+                        )
+
+                # Process for the realm directory (realm_v1 NFT mints). Same
+                # adversarial-payload isolation as the other overlays: one bad
+                # realm tx must never halt the block.
+                if self.realm_index and glyph_envelope:
+                    try:
+                        self.realm_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, output_refs_by_vout, spent_singleton_refs)
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        self.logger.exception(
+                            'realm_index.process_tx failed for tx %s at height %d; skipping',
                             hash_to_hex_str(tx_hash), self.height + 1
                         )
 
@@ -1085,6 +1119,11 @@ class BlockProcessor:
             self.glyph_index.post_open_init()
         if self.wave_index and self.glyph_index:
             count = self.wave_index.backfill_from_glyph_db(self.glyph_index)
+            if count > 0:
+                async with self.state_lock:
+                    await self.flush(True)
+        if self.realm_index and self.glyph_index:
+            count = self.realm_index.backfill_from_glyph_db(self.glyph_index)
             if count > 0:
                 async with self.state_lock:
                     await self.flush(True)
