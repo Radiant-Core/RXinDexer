@@ -75,7 +75,22 @@ def scan_block(block):
 
 class _RPC:
     def __init__(self, url):
-        self.url = url
+        # urllib.request.Request passes the raw URL netloc (including userinfo) to
+        # http.client.HTTPConnection, which then tries to DNS-resolve "user:pass@host"
+        # as a hostname — causing "Name or service not known".  Strip credentials from
+        # the URL and send them as a Basic Auth header instead.
+        import base64
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(url)
+        user = parsed.username or ''
+        password = parsed.password or ''
+        # Rebuild URL without userinfo in the netloc
+        clean_netloc = parsed.hostname
+        if parsed.port:
+            clean_netloc += f':{parsed.port}'
+        self.url = urlunparse(parsed._replace(netloc=clean_netloc))
+        creds = f'{user}:{password}'.encode()
+        self._auth = 'Basic ' + base64.b64encode(creds).decode()
         self._id = 0
 
     def call(self, method, *params):
@@ -83,7 +98,10 @@ class _RPC:
         payload = json.dumps({'jsonrpc': '2.0', 'id': self._id,
                               'method': method, 'params': list(params)}).encode()
         req = urllib.request.Request(self.url, data=payload,
-                                     headers={'Content-Type': 'application/json'})
+                                     headers={
+                                         'Content-Type': 'application/json',
+                                         'Authorization': self._auth,
+                                     })
         with urllib.request.urlopen(req, timeout=60) as resp:
             body = json.loads(resp.read())
         if body.get('error'):
