@@ -356,19 +356,7 @@ def _rate_limit(request: Request):
 async def _observability_middleware(request: Request, call_next):
     """R18/R19: record per-request latency and count in Prometheus metrics."""
     t0 = time.perf_counter()
-    # HTTPException raised in inner middlewares (e.g. _security_middleware) bypasses
-    # FastAPI's ExceptionMiddleware (which sits below user middlewares in the stack)
-    # and would reach Starlette's ServerErrorMiddleware, which converts it to 500.
-    # Catch it here and convert to a proper JSON response.
-    try:
-        response = await call_next(request)
-    except HTTPException as exc:
-        from fastapi.responses import JSONResponse as _JSONResponse
-        response = _JSONResponse(
-            status_code=exc.status_code,
-            content={'detail': exc.detail},
-            headers=dict(exc.headers or {}),
-        )
+    response = await call_next(request)
     elapsed = time.perf_counter() - t0
     endpoint = request.url.path
     _metrics.rest_requests_total.labels(
@@ -380,10 +368,17 @@ async def _observability_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def _security_middleware(request: Request, call_next):
+    # NOTE: in Starlette, @app.middleware("http") decorators execute in REVERSE
+    # registration order (last-registered = outermost). _security_middleware is
+    # registered after _observability_middleware so it is the OUTER wrapper.
+    # HTTPException raised here bypasses FastAPI's ExceptionMiddleware (which lives
+    # below user middlewares in the Starlette stack) and would reach
+    # ServerErrorMiddleware, converting it to a 500. We catch it and return a
+    # JSONResponse directly.
     path = request.url.path
     # Public read-only endpoints — no API key required.
     # Include both trailing-slash and bare forms so FastAPI's redirect logic
-    # (which issues a 307 for /tokens → /tokens/) doesn't cause a spurious 401.
+    # (which issues a 307 for /tokens → /tokens/) doesn't cause a spurious auth check.
     public_paths = (
         '/health', '/status',
         '/analytics', '/analytics/',
@@ -402,17 +397,22 @@ async def _security_middleware(request: Request, call_next):
     # Protect only write/broadcast operations (regardless of method)
     protected_operations = ('/broadcast', '/submit', '/key-reveal')
 
-    if request.method != 'GET' or any(path.startswith(p) for p in protected_operations):
-        _require_api_key(request.headers.get('x-api-key'))
-        _rate_limit(request)
-        return await call_next(request)
-
-    if any(path.startswith(p) for p in public_paths):
-        _rate_limit(request)
-        return await call_next(request)
-
-    _require_api_key(request.headers.get('x-api-key'))
-    _rate_limit(request)
+    try:
+        if request.method != 'GET' or any(path.startswith(p) for p in protected_operations):
+            _require_api_key(request.headers.get('x-api-key'))
+            _rate_limit(request)
+        elif any(path.startswith(p) for p in public_paths):
+            _rate_limit(request)
+        else:
+            _require_api_key(request.headers.get('x-api-key'))
+            _rate_limit(request)
+    except HTTPException as exc:
+        from fastapi.responses import JSONResponse as _JSONResponse
+        return _JSONResponse(
+            status_code=exc.status_code,
+            content={'detail': exc.detail},
+            headers=dict(exc.headers or {}),
+        )
     return await call_next(request)
 
 @app.get('/metrics', include_in_schema=False)
