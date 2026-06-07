@@ -167,6 +167,106 @@ def test_private_peer_exempt_when_proxy_off():
 
 
 # --------------------------------------------------------------------------- #
+# Trusted-proxy peer allowlist (anti-XFF-spoof hardening)
+# --------------------------------------------------------------------------- #
+
+def test_xff_honoured_when_peer_is_trusted_proxy():
+    # (a) Peer IS the configured reverse proxy -> its X-Forwarded-For is
+    # trusted and the forwarded client IP is used.
+    rl = IPRateLimiter(_env(trust_proxy=True, trust_proxy_hops=1,
+                            trusted_proxies='172.18.0.5'))
+    sess = FakeSession(
+        peer_host='172.18.0.5',  # the Caddy container's bridge IP
+        headers={'X-Forwarded-For': '203.0.113.7, 10.0.0.1'},
+    )
+    assert rl.client_ip(sess) == '10.0.0.1'
+
+
+def test_xff_ignored_when_peer_is_untrusted_direct_client():
+    # (b) A client connecting DIRECTLY to a published listener (peer NOT in the
+    # trusted-proxy allowlist) cannot spoof X-Forwarded-For -- even with
+    # TRUST_PROXY=1, the limiter falls back to the attacker's own socket peer,
+    # so it can only run up cost on its OWN IP, never poison the victim's.
+    rl = IPRateLimiter(_env(trust_proxy=True, trust_proxy_hops=1,
+                            trusted_proxies='172.18.0.5'))
+    attacker = FakeSession(
+        peer_host='198.51.100.99',                 # direct, public peer
+        headers={'X-Forwarded-For': '203.0.113.7'},  # spoofed victim IP
+    )
+    # The spoofed victim 203.0.113.7 must NOT be returned.
+    assert rl.client_ip(attacker) == '198.51.100.99'
+
+
+def test_x_real_ip_ignored_from_untrusted_peer():
+    # The same gate applies to the x-real-ip fallback header.
+    rl = IPRateLimiter(_env(trust_proxy=True, trusted_proxies='172.18.0.5'))
+    attacker = FakeSession(peer_host='198.51.100.99',
+                           headers={'X-Real-IP': '203.0.113.7'})
+    assert rl.client_ip(attacker) == '198.51.100.99'
+
+
+def test_default_allowlist_trusts_rfc1918_peer_not_public(monkeypatch):
+    # With no explicit TRUSTED_PROXIES, the default allowlist (loopback +
+    # RFC1918) governs: a bridge-network proxy peer is trusted, a public peer
+    # is not.
+    monkeypatch.delenv('TRUSTED_PROXIES', raising=False)
+    rl = IPRateLimiter(_env(trust_proxy=True, trust_proxy_hops=1))
+
+    # RFC1918 peer (docker bridge) -> trusted -> forwarded client used.
+    proxy_sess = FakeSession(peer_host='172.18.0.9',
+                             headers={'X-Forwarded-For': '203.0.113.7'})
+    assert rl.client_ip(proxy_sess) == '203.0.113.7'
+
+    # Public peer connecting directly -> untrusted -> its own peer used.
+    direct_sess = FakeSession(peer_host='8.8.8.8',
+                              headers={'X-Forwarded-For': '203.0.113.7'})
+    assert rl.client_ip(direct_sess) == '8.8.8.8'
+
+
+def test_trusted_proxies_cidr_match():
+    # A CIDR allowlist trusts any peer inside it and no peer outside it.
+    rl = IPRateLimiter(_env(trust_proxy=True, trusted_proxies='172.16.0.0/12'))
+    inside = FakeSession(peer_host='172.20.5.5',
+                         headers={'X-Forwarded-For': '203.0.113.7'})
+    outside = FakeSession(peer_host='192.0.2.50',
+                          headers={'X-Forwarded-For': '203.0.113.7'})
+    assert rl.client_ip(inside) == '203.0.113.7'
+    assert rl.client_ip(outside) == '192.0.2.50'
+
+
+def test_trusted_proxies_parsing_mixed_and_junk():
+    # Comma/space separated, CIDR + bare IP (-> /32) + an unparseable token
+    # that is silently skipped.
+    nets = IPRateLimiter._parse_networks('10.0.0.0/8, 192.168.1.7  not-an-ip')
+    rendered = {str(n) for n in nets}
+    assert '10.0.0.0/8' in rendered
+    assert '192.168.1.7/32' in rendered
+    assert len(nets) == 2  # the junk token was dropped
+
+
+def test_xff_still_ignored_entirely_when_proxy_off():
+    # Belt-and-suspenders: TRUST_PROXY=0 means the peer check is irrelevant and
+    # the forwarded chain is never consulted, even from an allowlisted peer.
+    rl = IPRateLimiter(_env(trust_proxy=False, trusted_proxies='127.0.0.1'))
+    sess = FakeSession(peer_host='127.0.0.1',
+                       headers={'X-Forwarded-For': '203.0.113.7'})
+    assert rl.client_ip(sess) == '127.0.0.1'
+
+
+def test_empty_trusted_proxies_falls_back_to_default(monkeypatch):
+    # An empty/whitespace value is treated the same as unset (docker
+    # "VAR=" == unset): the safe RFC1918 + loopback default applies.  To turn
+    # off forwarded-header trust entirely, set TRUST_PROXY=0 instead.
+    monkeypatch.delenv('TRUSTED_PROXIES', raising=False)
+    rl = IPRateLimiter(_env(trust_proxy=True, trusted_proxies='   '))
+    assert len(rl.trusted_proxies) == 6  # the DEFAULT_TRUSTED_PROXIES set
+    sess = FakeSession(peer_host='172.18.0.5',
+                       headers={'X-Forwarded-For': '203.0.113.7'})
+    # 172.18.0.5 is RFC1918 -> in the default allowlist -> XFF honoured.
+    assert rl.client_ip(sess) == '203.0.113.7'
+
+
+# --------------------------------------------------------------------------- #
 # Cost persistence across reconnect
 # --------------------------------------------------------------------------- #
 

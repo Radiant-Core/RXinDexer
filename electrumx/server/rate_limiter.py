@@ -20,11 +20,17 @@ Design:
   after ``ip_state_ttl`` seconds of inactivity (last-seen), so a dropped+
   reopened connection finds its prior state intact, while idle IPs are reaped
   so memory stays bounded.
-* Proxy trust — when ``TRUST_PROXY`` is on, the real client IP is taken from
-  the proxy-supplied forwarded chain (``TRUST_PROXY_HOPS`` from the right);
-  otherwise the socket peer is used.  When a trusted proxy is configured the
-  socket peer is the proxy (typically loopback), so private/loopback peers are
-  NOT exempted — we throttle on the forwarded client IP instead.
+* Proxy trust — when ``TRUST_PROXY`` is on AND the socket peer is itself a
+  configured trusted proxy (``TRUSTED_PROXIES``, a CIDR/IP allowlist that
+  defaults to loopback + the RFC1918 docker ranges), the real client IP is
+  taken from the proxy-supplied forwarded chain (``TRUST_PROXY_HOPS`` from the
+  right); otherwise the raw socket peer is used.  This peer check is what stops
+  a client that connects DIRECTLY to a published listener (e.g. ``wss
+  :50011``/``ssl :50012``) from spoofing ``X-Forwarded-For`` to poison another
+  IP's persisted cost bucket — its forwarded header is ignored because its peer
+  is not in the allowlist.  When a trusted proxy is configured the socket peer
+  is the proxy (typically loopback / the bridge subnet), so private/loopback
+  peers are NOT exempted — we throttle on the forwarded client IP instead.
 
 The limiter is intentionally dependency-free and synchronous; callers are
 single-threaded asyncio sessions, so a plain dict + monotonic clock is enough.
@@ -32,7 +38,8 @@ single-threaded asyncio sessions, so a plain dict + monotonic clock is enough.
 
 import os
 import time
-from typing import Dict, Optional, Set, Tuple
+from ipaddress import ip_address, ip_network
+from typing import Dict, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +69,22 @@ DEFAULT_IP_STATE_TTL = 3600
 # Cost decay per second.  Matches the order of magnitude aiorpcx uses
 # (cost_hard_limit / 10000); applied lazily on each touch.
 _DEFAULT_COST_DECAY_PER_SEC = DEFAULT_IP_COST_HARD_LIMIT / 10000.0
+
+# Trusted-proxy allowlist used when TRUST_PROXY is on but TRUSTED_PROXIES is
+# not explicitly set.  Only a socket peer inside one of these networks is
+# treated as the reverse proxy whose X-Forwarded-For we honour.  The default
+# covers loopback and the RFC1918 ranges (the docker bridge Caddy connects
+# from), so a directly-connected public client cannot spoof a victim's IP.
+# Operators behind a proxy on a known address SHOULD narrow this to the exact
+# proxy IP / bridge subnet via the TRUSTED_PROXIES env var.
+DEFAULT_TRUSTED_PROXIES = (
+    '127.0.0.0/8',     # IPv4 loopback
+    '10.0.0.0/8',      # RFC1918
+    '172.16.0.0/12',   # RFC1918 (docker default bridge networks live here)
+    '192.168.0.0/16',  # RFC1918
+    '::1/128',         # IPv6 loopback
+    'fc00::/7',        # IPv6 unique-local
+)
 
 
 def _coerce_int(value, default: int) -> int:
@@ -125,6 +148,9 @@ class IPRateLimiter:
             env, 'trust_proxy', 'TRUST_PROXY', False)
         self.trust_proxy_hops = max(1, self._resolve_int(
             env, 'trust_proxy_hops', 'TRUST_PROXY_HOPS', 1))
+        # Socket-peer allowlist: only these peers are treated as the reverse
+        # proxy whose forwarded chain we trust (see _peer_is_trusted_proxy).
+        self.trusted_proxies = self._resolve_trusted_proxies(env)
         self.max_subs_per_ip = self._resolve_int(
             env, 'max_subs_per_ip', 'MAX_SUBS_PER_IP', DEFAULT_MAX_SUBS_PER_IP)
         self.ip_cost_hard_limit = self._resolve_float(
@@ -171,23 +197,66 @@ class IPRateLimiter:
             out = _coerce_float(os.environ.get(envvar), None)
         return default if out is None else out
 
+    @classmethod
+    def _resolve_trusted_proxies(cls, env) -> List:
+        """Resolve the trusted-proxy allowlist into a list of ip_network objs.
+
+        Source order: ``env.trusted_proxies`` attr, then the ``TRUSTED_PROXIES``
+        process env, then :data:`DEFAULT_TRUSTED_PROXIES`.  The value may be a
+        comma/space-separated string of CIDRs or bare IPs, or an iterable of
+        the same.  Unparseable tokens are skipped.
+        """
+        raw = getattr(env, 'trusted_proxies', None) if env is not None else None
+        if isinstance(raw, str):
+            raw = raw.strip() or None
+        if not raw:
+            raw = os.environ.get('TRUSTED_PROXIES')
+            if raw is not None:
+                raw = raw.strip() or None
+        if not raw:
+            raw = DEFAULT_TRUSTED_PROXIES
+        return cls._parse_networks(raw)
+
+    @staticmethod
+    def _parse_networks(spec) -> List:
+        if isinstance(spec, str):
+            tokens = [t for t in spec.replace(',', ' ').split() if t]
+        else:
+            tokens = [str(t).strip() for t in spec if str(t).strip()]
+        nets = []
+        for tok in tokens:
+            try:
+                # strict=False so a host address with a prefix (or a bare IP,
+                # which becomes a /32 //128) is accepted.
+                nets.append(ip_network(tok, strict=False))
+            except ValueError:
+                continue
+        return nets
+
     # -- IP derivation -------------------------------------------------------
 
     def client_ip(self, session) -> Optional[str]:
         """Resolve a session's real client IP, proxy-aware.
 
-        When ``trust_proxy`` is on and the session/transport exposes a
-        forwarded chain (``X-Forwarded-For`` from the WS handshake, or an
-        ``x-real-ip`` header), the client IP is taken from that chain at
-        ``trust_proxy_hops`` from the right (the trusted hop the proxy added).
-        Crucially, in trusted-proxy mode the socket peer is the proxy itself
-        (often loopback), so we do NOT exempt private/loopback peers here.
+        When ``trust_proxy`` is on AND the socket peer is itself a configured
+        trusted proxy (see :meth:`_peer_is_trusted_proxy`), and the
+        session/transport exposes a forwarded chain (``X-Forwarded-For`` from
+        the WS handshake, or an ``x-real-ip`` header), the client IP is taken
+        from that chain at ``trust_proxy_hops`` from the right (the trusted hop
+        the proxy added).  In that trusted-proxy mode the socket peer is the
+        proxy itself (often loopback), so we do NOT exempt private/loopback
+        peers here.
+
+        Crucially, a client that connects DIRECTLY to a published listener
+        (its peer is not in the trusted-proxy allowlist) cannot have its
+        ``X-Forwarded-For`` honoured — we fall back to its raw socket peer, so
+        it can only accrue cost against its own IP, never poison a victim's.
 
         When ``trust_proxy`` is off, the socket peer host is used and private
         peers behave exactly as before (this layer simply governs them too;
         the caller decides whether to exempt — see :meth:`is_exempt_peer`).
         """
-        if self.trust_proxy:
+        if self.trust_proxy and self._peer_is_trusted_proxy(session):
             forwarded = self._forwarded_for(session)
             if forwarded:
                 return forwarded
@@ -196,6 +265,25 @@ class IPRateLimiter:
                 return real.strip()
         host = self._peer_host(session)
         return host
+
+    def _peer_is_trusted_proxy(self, session) -> bool:
+        """Whether the session's socket peer is a configured trusted proxy.
+
+        Only a peer inside the ``TRUSTED_PROXIES`` allowlist is permitted to
+        set the forwarded client IP.  Returns False (so the forwarded chain is
+        ignored and the raw peer is used) when the allowlist is empty, the peer
+        is unknown, or the peer is not in any allowlisted network.
+        """
+        if not self.trusted_proxies:
+            return False
+        host = self._peer_host(session)
+        if host is None:
+            return False
+        try:
+            addr = ip_address(host)
+        except ValueError:
+            return False
+        return any(addr in net for net in self.trusted_proxies)
 
     @staticmethod
     def _peer_host(session) -> Optional[str]:
@@ -266,7 +354,6 @@ class IPRateLimiter:
         """
         if self.trust_proxy:
             return False
-        from ipaddress import ip_address
         host = self._peer_host(session)
         if host is None:
             return False

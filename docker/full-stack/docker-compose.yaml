@@ -111,10 +111,19 @@ services:
       # wallet shares the proxy's socket IP, so without TRUST_PROXY they all
       # collapse into one persisted cost bucket -> "excessive resource usage"
       # lockout for every wallet. Trust Caddy's appended X-Forwarded-For (hops=1
-      # reads the proxy-set value, ignoring client-spoofed entries). Direct
-      # listeners (50010/11/12) have no XFF and fall back to the socket peer.
+      # reads the proxy-set value, ignoring client-spoofed entries).
       - TRUST_PROXY=1
       - TRUST_PROXY_HOPS=1
+      # X-Forwarded-For is honoured ONLY when the socket peer is in this
+      # allowlist (the full-stack_default bridge subnet, where Caddy lives at
+      # 172.18.0.3). A client connecting DIRECTLY to the published wss listener
+      # (:50011) arrives with its real public source IP (iptables DNAT, e.g.
+      # "WSS 68.144.166.66"), which is NOT in this subnet, so it cannot spoof
+      # X-Forwarded-For to poison a victim IP's persisted cost bucket -- it can
+      # only accrue cost against its own IP. The :50010/:50012 (raw TCP/SSL)
+      # listeners carry no XFF at all. Subnet (not Caddy's /32) so a Caddy
+      # container-IP change cannot silently re-trigger the all-wallet lockout.
+      - TRUSTED_PROXIES=172.18.0.0/16
       - INITIAL_CONCURRENT=50
       - REQUEST_SLEEP=500
       # RXinDexer: Glyph token indexing (FT, NFT, dMint, Mutable, Containers)

@@ -129,6 +129,12 @@ class Env(EnvBase):
         # explicitly placed behind a trusted reverse proxy).
         self.trust_proxy = self.boolean('TRUST_PROXY', False)
         self.trust_proxy_hops = self.integer('TRUST_PROXY_HOPS', 1)
+        # Socket-peer allowlist (comma/space-separated CIDRs or IPs).  Only a
+        # peer in this list is treated as the reverse proxy whose
+        # X-Forwarded-For is honoured; a directly-connected client cannot spoof
+        # a victim IP.  Empty -> the rate limiter's safe default (loopback +
+        # RFC1918 docker ranges).
+        self.trusted_proxies = self.default('TRUSTED_PROXIES', '')
         # Aggregate subscription cap across all of one IP's sessions.  Reuses
         # MAX_SUBS_PER_CLIENT semantics but at the IP layer; defaults larger
         # than the per-session cap so the per-session cap governs single
