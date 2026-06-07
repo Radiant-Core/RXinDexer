@@ -5,8 +5,8 @@
 FROM ubuntu:22.04
 
 LABEL maintainer="radiantblockchain@protonmail.com"
-LABEL version="3.0.0"
-LABEL description="Radiant Node (radiantd) v3.0.0 built from Radiant-Core"
+LABEL version="3.1.0"
+LABEL description="Radiant Node (radiantd) v3.1.0 built from Radiant-Core"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -31,8 +31,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# Clone Radiant-Core v3.0.0 from the official repository
-RUN git clone --depth 1 --branch main https://github.com/Radiant-Core/Radiant-Core.git radiant
+# Clone Radiant-Core at the v3.1.0 release tag (pinned for reproducible builds).
+# Pinning the tag also busts Docker's cached git-clone layer on a version bump,
+# so `docker compose build radiantd` can't silently rebuild the old source.
+RUN git clone --depth 1 --branch v3.1.0 https://github.com/Radiant-Core/Radiant-Core.git radiant
 
 WORKDIR /build/radiant
 

@@ -24,6 +24,13 @@ services:
       -rpcpassword=${RPC_PASS:?RPC_PASS must be set}
       -rpcallowip=0.0.0.0/0
       -rpcbind=0.0.0.0
+      # v3.1.0+ added a DNS-rebinding defense that 403-rejects RPC requests
+      # whose Host header is a DNS name not in this allowlist. The indexer
+      # connects to http://radiantd:7332/ (Host: radiantd) and the Caddy swap
+      # proxy forwards Host: swap.radiantcore.org — both must be allowlisted or
+      # the indexer/swap RPC breaks. (Loopback + IP-literal Hosts are exempt.)
+      -rpcallowhost=radiantd
+      -rpcallowhost=swap.radiantcore.org
       -txindex=1
       -swapindex=1
       -zmqpubhashblock=tcp://0.0.0.0:28332
