@@ -342,5 +342,92 @@ class TestReorgMultiUpdate:
         assert wave_index.resolve('12345')['target'] == OLD_TARGET
 
 
+# ==========================================================================
+# Test 6 — owner tracking on singleton moves (transfer / sale / mod).
+# ==========================================================================
+def _p2pkh(h160_hex):
+    return bytes.fromhex('76a914' + h160_hex + '88ac')
+
+
+def _plain_singleton_script(h160_hex):
+    # OP_PUSHINPUTREFSINGLETON <ref(36)> OP_DROP <P2PKH>
+    return bytes.fromhex('d8' + '22' * 36 + '75') + _p2pkh(h160_hex)
+
+
+def _auth_singleton_script(h160_hex):
+    # ( OP_REQUIREINPUTREF <ref> <sigHash> OP_2DROP ) OP_STATESEPARATOR
+    # OP_PUSHINPUTREFSINGLETON <ref> OP_DROP <P2PKH>  — the form a target/state
+    # update produces. base_locking_script must still recover the trailing P2PKH.
+    return (bytes.fromhex('d1' + '22' * 36 + '20' + '33' * 32 + '6d' + 'bd' +
+                          'd8' + '22' * 36 + '75') + _p2pkh(h160_hex))
+
+
+def _move(wave_index, singleton_ref, script, tx_hash, height, vout=0):
+    outs = [_FakeOutput(b'')] * vout + [_FakeOutput(script)]
+    wave_index.process_tx(
+        tx_hash, _FakeTx(outs), height, 0,
+        None,  # plain move: no glyph envelope
+        output_refs_by_vout={vout: [(singleton_ref, 1)]},
+        spent_singleton_refs={singleton_ref},
+    )
+
+
+REG_H160 = '11' * 20  # owner at registration (from _p2pkh_tx)
+B_H160 = 'bb' * 20
+CLAIM_REF = bytes.fromhex('e5' * 32) + struct.pack('<I', 0)
+
+
+class TestOwnerTracking:
+    def _hashX(self, wave_index, h160_hex):
+        return wave_index.env.coin.hashX_from_script(_p2pkh(h160_hex))
+
+    def test_owner_set_at_registration(self, wave_index):
+        _register(wave_index)
+        assert wave_index._get_owner(CLAIM_REF) == self._hashX(wave_index, REG_H160)
+
+    def test_owner_updates_on_transfer(self, wave_index):
+        singleton = _register(wave_index)
+        assert wave_index._get_owner(CLAIM_REF) == self._hashX(wave_index, REG_H160)
+        _move(wave_index, singleton, _plain_singleton_script(B_H160),
+              bytes.fromhex('f7' * 32), 435095)
+        assert wave_index._get_owner(CLAIM_REF) == self._hashX(wave_index, B_H160)
+
+    def test_owner_hashX_stable_across_auth_form(self, wave_index):
+        # A target/state update wraps the same address in an auth covenant; the
+        # owner hashX must be the base address — identical to the plain form.
+        singleton = _register(wave_index)
+        _move(wave_index, singleton, _auth_singleton_script(B_H160),
+              bytes.fromhex('f7' * 32), 435095)
+        assert wave_index._get_owner(CLAIM_REF) == self._hashX(wave_index, B_H160)
+
+    def test_unmapped_singleton_does_not_change_owner(self, wave_index):
+        _register(wave_index)
+        unmapped = bytes.fromhex('99' * 32) + struct.pack('<I', 7)
+        _move(wave_index, unmapped, _plain_singleton_script(B_H160),
+              bytes.fromhex('cc' * 32), 435100)
+        assert wave_index._get_owner(CLAIM_REF) == self._hashX(wave_index, REG_H160)
+
+    def test_reverse_lookup_follows_owner_and_filters_stale(self, wave_index):
+        singleton = _register(wave_index)
+        # Flush registration so the OLD owner's reverse entry lands on disk.
+        with wave_index.db.utxo_db.write_batch() as batch:
+            wave_index.flush(batch)
+        old_owner = self._hashX(wave_index, REG_H160)
+        new_owner = self._hashX(wave_index, B_H160)
+        assert [e['ref'] for e in wave_index.reverse_lookup(old_owner)] == \
+            [wave_index._format_ref(CLAIM_REF)]
+
+        # Move to B in a SEPARATE flush — the old reverse entry now lingers.
+        _move(wave_index, singleton, _plain_singleton_script(B_H160),
+              bytes.fromhex('f7' * 32), 435095)
+        with wave_index.db.utxo_db.write_batch() as batch:
+            wave_index.flush(batch)
+
+        # New owner finds it; stale old-owner entry is filtered out.
+        assert [e['ref'] for e in wave_index.reverse_lookup(new_owner)] == \
+            [wave_index._format_ref(CLAIM_REF)]
+        assert wave_index.reverse_lookup(old_owner) == []
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

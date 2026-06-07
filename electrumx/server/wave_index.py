@@ -356,10 +356,19 @@ class WaveIndex:
         """
         if not self.enabled:
             return
-        
+
+        # Owner tracking: a spent singleton mapping to a known name means the name
+        # changed hands (transfer / sale / mutable target update). Re-point its
+        # owner from the re-created singleton output. Runs BEFORE the
+        # glyph-envelope gate so plain transfers — which carry no envelope — are
+        # tracked too.
+        self._maybe_update_owner(
+            tx_hash, tx, height, output_refs_by_vout, spent_singleton_refs
+        )
+
         if not glyph_envelope:
             return
-        
+
         protocols = glyph_envelope.get('protocols', [])
         if GlyphProtocol.GLYPH_WAVE not in protocols:
             # Not a (re)registration — but it may be a mutable TARGET UPDATE.
@@ -511,11 +520,13 @@ class WaveIndex:
             except Exception as e:
                 self.logger.warning(f'Failed to mark duplicate WAVE token in Glyph index: {e}')
         
-        # Store owner (scripthash of claim output)
-        from electrumx.lib.script import Script
+        # Store owner = base-address hashX of the claim output (the embedded
+        # P2PKH), so a name is queryable by the holder's normal address hashX and
+        # the value stays stable across plain<->auth singleton forms (a target /
+        # state update wraps the same p2pkh in an auth covenant). Kept current on
+        # every move by _maybe_update_owner.
         claim_script = tx.outputs[0].pk_script
-        owner_scripthash = self.env.coin.hashX_from_script(Script.zero_refs(claim_script))
-        self.owner_cache[claim_ref] = owner_scripthash
+        self.owner_cache[claim_ref] = self._owner_hashX_from_script(claim_script)
         self.owner_height[claim_ref] = height
 
         # Track height for flush/undo
@@ -656,6 +667,81 @@ class WaveIndex:
                 f'WAVE target updated via mod: '
                 f'name_hash={name_hash.hex()[:12]}.. -> {new_target!r} '
                 f'at height {height} (tx {hash_to_hex_str(tx_hash)})'
+            )
+
+    def _owner_hashX_from_script(self, script: bytes) -> bytes:
+        """Owner identity for a WAVE name = the base-address hashX (the embedded
+        P2PKH) of the singleton's holding script.
+
+        Using the base address (not zero_refs of the whole script) means the
+        value is the holder's ordinary address hashX — so wave.reverse_lookup is
+        queryable by address — and it is identical whether the singleton rests in
+        a plain nftScript (transfer) or an auth covenant (after a target/state
+        update). Falls back to zero_refs for exotic scripts with no P2PKH.
+        """
+        from electrumx.lib.script import Script
+        try:
+            return self.env.coin.hashX_from_script(
+                Script.base_locking_script(script)
+            )
+        except Exception:
+            return self.env.coin.hashX_from_script(Script.zero_refs(script))
+
+    def _maybe_update_owner(self, tx_hash: bytes, tx, height: int,
+                            output_refs_by_vout: Dict[int, Any],
+                            spent_singleton_refs: set):
+        """Re-point a name's owner when its singleton moves (transfer / sale /
+        target update).
+
+        The owner is otherwise written only at registration, so without this a
+        name's ownership — and wave.reverse_lookup — stays frozen on the genesis
+        holder even after the name changes hands. A spent singleton that maps to
+        a known canonical name (covenant-enforced: only the holder can spend it)
+        identifies the name; the re-created singleton output carries the same ref
+        and the new holder's address. Owner is keyed by the canonical claim_ref.
+
+        Stale reverse-index entries from the previous owner are NOT deleted here
+        (that would need reorg-fragile batch deletes); reverse_lookup filters
+        them out by comparing each hit against the current OWNER record.
+        """
+        if not self.enabled or not spent_singleton_refs or not output_refs_by_vout:
+            return
+
+        for singleton_ref in spent_singleton_refs:
+            name_hash = self._resolve_singleton_to_name(singleton_ref)
+            if not name_hash:
+                continue
+            claim_ref = (self.name_cache.get(name_hash)
+                         or self.db.utxo_db.get(WaveDBKeys.NAME + name_hash))
+            if not claim_ref:
+                continue
+
+            # Find the re-created singleton output (same ref) → new owner address.
+            new_owner = None
+            for vout, refs in output_refs_by_vout.items():
+                if any(rb == singleton_ref and rt == 1 for (rb, rt) in refs):
+                    try:
+                        new_owner = self._owner_hashX_from_script(
+                            tx.outputs[vout].pk_script
+                        )
+                    except Exception:
+                        new_owner = None
+                    break
+
+            # No tracked re-creation (burned/melted) — leave owner as-is rather
+            # than guess; resolution would also stop, so it won't mislead.
+            if new_owner is None:
+                continue
+            if self._get_owner(claim_ref) == new_owner:
+                continue  # unchanged
+
+            self.owner_cache[claim_ref] = new_owner
+            self.owner_height[claim_ref] = height
+            self._pending_heights[claim_ref.hex()] = height
+            self.logger.info(
+                f'WAVE owner updated: name_hash={name_hash.hex()[:12]}.. -> '
+                f'{new_owner.hex()} at height {height} '
+                f'(tx {hash_to_hex_str(tx_hash)})'
             )
 
     def _undo_key(self, height: int) -> bytes:
@@ -1167,29 +1253,34 @@ class WaveIndex:
     
     def reverse_lookup(self, scripthash: bytes, limit: int = 100) -> List[Dict[str, Any]]:
         """Find WAVE names owned by a scripthash.
-        
+
         Uses REVERSE_OWNER index: WR + scripthash + ref -> ''
         """
         results = []
         prefix = WaveDBKeys.REVERSE_OWNER + scripthash
-        
+
         for key, _value in self.db.utxo_db.iterator(prefix=prefix):
             if len(results) >= limit:
                 break
-            
+
             ref = key[len(prefix):]
-            entry = {'ref': self._format_ref(ref)}
-            
-            # Try to resolve the name for this ref
-            zone = self._get_zone_records(ref)
+
+            # Filter stale entries. When a name moves we update OWNER (authoritative)
+            # and add a fresh reverse entry, but the previous owner's reverse entry
+            # is left in place (deleting it would need reorg-fragile batch deletes).
+            # So only return refs whose CURRENT owner still matches this scripthash.
             owner_sh = self._get_owner(ref)
+            if owner_sh != scripthash:
+                continue
+
+            entry = {'ref': self._format_ref(ref)}
+            zone = self._get_zone_records(ref)
             if zone:
                 entry['zone'] = zone.to_dict()
-            if owner_sh:
-                entry['owner'] = owner_sh.hex()
-            
+            entry['owner'] = owner_sh.hex()
+
             results.append(entry)
-        
+
         return results
     
     def _get_zone_records(self, ref: bytes) -> Optional[WaveZoneRecords]:
