@@ -98,6 +98,44 @@ PROTOCOL_NAMES = {
 DMINT_MAX_SCRIPTNUM = (1 << 63) - 1
 DMINT_MAX_TOTAL_SUPPLY = (1 << 63) - 1
 
+# ---------------------------------------------------------------------------
+# CBOR payload size cap (DoS guard)
+# ---------------------------------------------------------------------------
+# A reveal scriptSig can push up to 2**32-1 bytes via OP_PUSHDATA4.  Without a
+# pre-decode cap, a single crafted reveal can force cbor2 to allocate large
+# buffers (or spin) before it ever learns the shape of the input, turning every
+# service that fetches reveal scriptSigs into a DoS target.  Always enforce the
+# cap *before* handing bytes to cbor2 — most CBOR libraries allocate before they
+# know the structure of the input.  Use cbor_loads_capped() at every decode
+# site.
+#
+# Sizing: this is the *whole CBOR payload* cap, which must sit ABOVE the
+# on-chain *content* limit so a max-size embed still decodes.  Photonic enforces
+# a 512 KB on-chain content limit (`mintEmbedMaxBytes = 512000`,
+# `GLYPH_INSCRIPTION_MAX_SIZE = 512*1024`), and the payload additionally carries
+# name/desc/ticker/refs + CBOR framing on top of `main.b`.  640 KiB gives ~125
+# KiB of headroom over a 512 KiB embed while keeping decode cost trivial.  Keep
+# this in sync with the Photonic content limit and Glyph v2 Token Standard
+# Appendix C; raise both together if the ecosystem content limit changes.
+MAX_CBOR_PAYLOAD_BYTES = 655_360  # 640 KiB (512 KiB content + headroom)
+
+
+def cbor_loads_capped(data: bytes):
+    """``cbor2.loads(data)`` with a hard input-size cap applied first.
+
+    Raises ``ValueError`` if the payload exceeds ``MAX_CBOR_PAYLOAD_BYTES`` so a
+    caller's existing ``try/except`` treats an oversized body as a decode
+    failure (fail closed — the token is simply not indexed), and re-raises
+    whatever ``cbor2`` raises for genuinely malformed CBOR.  Only reached when
+    ``HAS_CBOR`` is True (every call site gates on it first).
+    """
+    n = len(data) if data is not None else 0
+    if n > MAX_CBOR_PAYLOAD_BYTES:
+        raise ValueError(
+            f"CBOR payload too large: {n} > {MAX_CBOR_PAYLOAD_BYTES} bytes"
+        )
+    return cbor2.loads(data)
+
 
 # Envelope flags
 class EnvelopeFlags:
@@ -183,7 +221,7 @@ def parse_glyph_envelope(data: bytes) -> Optional[Dict[str, Any]]:
                 # Try decoding as CBOR reveal (most common case).
                 if HAS_CBOR:
                     try:
-                        decoded = cbor2.loads(payload)
+                        decoded = cbor_loads_capped(payload)
                         if isinstance(decoded, dict):
                             v = decoded.get('v', GlyphVersion.V1)
                             return {
@@ -424,9 +462,9 @@ def parse_glyph_metadata(envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not HAS_CBOR:
         return None
     try:
-        return cbor2.loads(metadata_bytes)
+        return cbor_loads_capped(metadata_bytes)
     except Exception:
-        _glyph_parse_errors.inc()  # R20: CBOR decode failure
+        _glyph_parse_errors.inc()  # R20: CBOR decode failure (incl. oversize)
         return None
 
 
@@ -880,7 +918,7 @@ def decode_cbor_metadata(data: bytes) -> Optional[Dict[str, Any]]:
     if not HAS_CBOR:
         return None
     try:
-        result = cbor2.loads(data)
+        result = cbor_loads_capped(data)
         if not isinstance(result, dict):
             return None
         return result
