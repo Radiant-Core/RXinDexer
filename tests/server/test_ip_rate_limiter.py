@@ -521,6 +521,32 @@ def test_session_wiring_seeds_cost_on_reconnect():
     assert sess_b._ip_seed_cost == 795.0
 
 
+def test_session_wiring_caps_seed_below_hard_limit():
+    # Regression: a heavily-penalised IP must NOT seed a reconnecting session
+    # at/above the per-session hard limit, or aiorpcx kills it on its first
+    # request ("excessive resource usage") and an auto-reconnecting client is
+    # locked out forever.  The seed is capped at cost_soft_limit.
+    from types import SimpleNamespace
+    limiter = IPRateLimiter(_env(ip_cost_decay_per_sec=0.0,
+                                 ip_cost_hard_limit=1_000_000))
+    mgr = _StubMgr(limiter)
+    mgr.env = SimpleNamespace(cost_soft_limit=10_000)  # hard limit would be 100k
+    ip = '203.0.113.61'
+
+    # Drive the IP's persisted cost far above the hard limit.
+    limiter.register_session(ip, session_id=1, now=0.0)
+    limiter.release_session(ip, session_id=1, session_cost=500_000.0, now=0.0)
+    assert limiter.register_session(ip, session_id=2, now=0.0) == 500_000.0
+
+    # A reconnecting session is seeded at the soft-limit cap, never 500k.
+    sess = FakeSession(peer_host=ip, session_id=3)
+    sess.cost = 5.0
+    mgr._register_session_ip(sess)
+    assert sess.cost == 10_000.0, 'seed must be capped at cost_soft_limit'
+    assert sess._ip_seed_cost == 10_000.0
+    assert sess.cost < 100_000, 'seed must stay below the per-session hard limit'
+
+
 def test_ip_addr_group_name_proxy_aware():
     # Proxy ON: socket peer is loopback, real client comes from XFF; group must
     # be the /24 of the forwarded client, NOT exempted as private.

@@ -1078,8 +1078,22 @@ class SessionManager:
             # throttle survives reconnects, but never lower the session's own
             # base connection cost.  Remember the seed so connection_lost folds
             # back only the EXTRA cost this session incurred (no double count).
+            #
+            # CAP the seed strictly below the per-session hard limit.  Seeding
+            # at/above cost_hard_limit makes aiorpcx reject the session's very
+            # first request with "excessive resource usage" before it can do any
+            # work; combined with a client that auto-reconnects (e.g. Photonic
+            # wallet) that becomes a self-sustaining per-IP lockout, because the
+            # persisted cost keeps re-seeding the instant kill faster than it
+            # decays.  Seeding only up to the soft limit lets a reconnecting
+            # client resume at full speed while its REAL per-IP cost still
+            # accrues in the limiter (add_cost) and the per-session hard limit +
+            # MAX_SUBS_PER_IP remain the hard protections.
             if persisted_cost and persisted_cost > getattr(session, 'cost', 0.0):
-                session.cost = persisted_cost
+                env = getattr(self, 'env', None)
+                seed_cap = float(getattr(env, 'cost_soft_limit', 0) or 0)
+                session.cost = (min(persisted_cost, seed_cap)
+                                if seed_cap > 0 else persisted_cost)
             session._ip_seed_cost = getattr(session, 'cost', 0.0)
         except Exception:
             self.logger.debug('IP rate-limit registration failed', exc_info=True)
