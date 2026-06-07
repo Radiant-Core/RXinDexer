@@ -106,6 +106,25 @@ def _coerce_float(value, default: float) -> float:
         return default
 
 
+def peer_in_networks(host: Optional[str], networks: List) -> bool:
+    """Whether a peer host string falls inside any of the given networks.
+
+    Shared by the per-IP limiter's trusted-proxy check
+    (:meth:`IPRateLimiter._peer_is_trusted_proxy`) and the REST API's
+    ``_get_client_ip`` so both gate ``X-Forwarded-For`` trust on the SAME
+    allowlist semantics.  Returns ``False`` — i.e. "not a trusted proxy", the
+    safe default — for an empty allowlist, a missing host, or an unparseable
+    address, so the forwarded chain is ignored and the raw socket peer is used.
+    """
+    if not networks or host is None:
+        return False
+    try:
+        addr = ip_address(host)
+    except ValueError:
+        return False
+    return any(addr in net for net in networks)
+
+
 class IPState:
     """Per-IP throttle state that survives individual connections."""
 
@@ -274,16 +293,7 @@ class IPRateLimiter:
         ignored and the raw peer is used) when the allowlist is empty, the peer
         is unknown, or the peer is not in any allowlisted network.
         """
-        if not self.trusted_proxies:
-            return False
-        host = self._peer_host(session)
-        if host is None:
-            return False
-        try:
-            addr = ip_address(host)
-        except ValueError:
-            return False
-        return any(addr in net for net in self.trusted_proxies)
+        return peer_in_networks(self._peer_host(session), self.trusted_proxies)
 
     @staticmethod
     def _peer_host(session) -> Optional[str]:

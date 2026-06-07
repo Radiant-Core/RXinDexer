@@ -56,6 +56,11 @@ import time
 from dataclasses import dataclass, field
 
 from electrumx.server import metrics as _metrics
+from electrumx.server.rate_limiter import (
+    DEFAULT_TRUSTED_PROXIES as _DEFAULT_TRUSTED_PROXIES,
+    IPRateLimiter as _IPRateLimiter,
+    peer_in_networks as _peer_in_networks,
+)
 
 from fastapi import FastAPI, HTTPException, Query, Path, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -301,20 +306,45 @@ _RATE_CLEANUP_INTERVAL: int = 1000
 _TRUST_PROXY: bool = os.getenv('TRUST_PROXY', '0').strip() not in ('0', 'false', 'no', '')
 _TRUST_PROXY_HOPS: int = max(1, int(os.getenv('TRUST_PROXY_HOPS', '1')))
 
+# Trusted-proxy allowlist for X-Forwarded-For (mirrors the ElectrumX limiter
+# hardening, commit c4637e6). REST :8000 is published on 0.0.0.0 in prod, so
+# without a peer gate a client connecting DIRECTLY could set
+# `X-Forwarded-For: <victim>` to evade its own rate limit or poison a victim
+# IP's REST bucket. We honour the forwarded chain only when the direct socket
+# peer (request.client.host) is itself a configured reverse proxy. Empty/unset
+# => safe default (loopback + RFC1918, the docker bridge Caddy connects from);
+# prod narrows it to TRUSTED_PROXIES=172.18.0.0/16 (the full-stack_default
+# bridge subnet where Caddy lives). Reuses the same env + parsing/matching
+# helpers as the per-IP limiter so both gate XFF identically.
+_TRUSTED_PROXIES = _IPRateLimiter._parse_networks(
+    os.getenv('TRUSTED_PROXIES', '').strip() or _DEFAULT_TRUSTED_PROXIES
+)
+
 
 def _get_client_ip(request: Request) -> str:
-    """R8: resolve real client IP honouring X-Forwarded-For when behind a proxy."""
-    if _TRUST_PROXY:
+    """R8 + XFF-spoof hardening: resolve the real client IP, honouring
+    X-Forwarded-For ONLY when the direct socket peer is a trusted proxy.
+
+    A client connecting directly to the published REST port could otherwise
+    spoof X-Forwarded-For to control its rate-limit key. We trust the forwarded
+    chain only when ``request.client.host`` is inside ``_TRUSTED_PROXIES``;
+    otherwise we fall back to the raw socket peer, so a direct client can only
+    accrue against its own IP and never poison a victim's. TRUST_PROXY=0
+    behaviour is unchanged (forwarded headers never consulted).
+    """
+    peer = request.client.host if request.client else None
+    if _TRUST_PROXY and _peer_in_networks(peer, _TRUSTED_PROXIES):
         forwarded = request.headers.get('x-forwarded-for', '').strip()
         if forwarded:
-            parts = [p.strip() for p in forwarded.split(',')]
-            # Take the Nth-from-right entry where N = TRUST_PROXY_HOPS
-            idx = max(0, len(parts) - _TRUST_PROXY_HOPS)
-            return parts[idx]
+            parts = [p.strip() for p in forwarded.split(',') if p.strip()]
+            if parts:
+                # Take the Nth-from-right entry where N = TRUST_PROXY_HOPS
+                idx = max(0, len(parts) - _TRUST_PROXY_HOPS)
+                return parts[idx]
         real_ip = request.headers.get('x-real-ip', '').strip()
         if real_ip:
             return real_ip
-    return request.client.host if request.client else 'unknown'
+    return peer if peer else 'unknown'
 
 
 def _rate_limit(request: Request):

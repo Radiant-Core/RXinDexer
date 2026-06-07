@@ -11,6 +11,11 @@ from unittest.mock import Mock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from electrumx.server.rate_limiter import (
+    IPRateLimiter as _IPRateLimiter,
+    DEFAULT_TRUSTED_PROXIES as _DEFAULT_TRUSTED_PROXIES,
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -715,6 +720,114 @@ class TestProxyAwareClientIP:
         assert ip == '203.0.113.77'
         # Also confirm 127.0.0.1 is not the result (the key point of R8)
         assert ip != '127.0.0.1'
+
+
+# ===========================================================================
+# XFF-spoof hardening — trusted-proxy peer gate on _get_client_ip
+# (mirrors the ElectrumX rate-limiter fix, commit c4637e6)
+# ===========================================================================
+
+class TestProxyTrustedPeerGate:
+    """REST :8000 is published on 0.0.0.0, so a client connecting DIRECTLY
+    could set `X-Forwarded-For: <victim>` to evade its own per-IP rate limit or
+    poison a victim's REST bucket. _get_client_ip must honour the forwarded
+    chain ONLY when request.client.host is itself a trusted proxy."""
+
+    def _make_request(self, headers: dict, client_host: str):
+        req = Mock()
+        req.headers = headers
+        client = Mock()
+        client.host = client_host
+        req.client = client
+        return req
+
+    def test_xff_honoured_when_peer_is_trusted_proxy(self, monkeypatch):
+        """Peer IS the configured reverse proxy -> its X-Forwarded-For is trusted."""
+        from electrumx.server import rest_api
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY', True)
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY_HOPS', 1)
+        monkeypatch.setattr(
+            rest_api, '_TRUSTED_PROXIES',
+            _IPRateLimiter._parse_networks('172.18.0.0/16'),
+        )
+        req = self._make_request(
+            {'x-forwarded-for': '203.0.113.7, 10.0.0.1'},
+            client_host='172.18.0.3',  # the Caddy container's bridge IP
+        )
+        # hops=1 -> right-most appended hop is the trusted proxy's value.
+        assert rest_api._get_client_ip(req) == '10.0.0.1'
+
+    def test_xff_ignored_when_peer_is_untrusted_direct_client(self, monkeypatch):
+        """A direct client (peer NOT in the allowlist) cannot spoof XFF even
+        with TRUST_PROXY=1; the raw socket peer is used instead."""
+        from electrumx.server import rest_api
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY', True)
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY_HOPS', 1)
+        monkeypatch.setattr(
+            rest_api, '_TRUSTED_PROXIES',
+            _IPRateLimiter._parse_networks('172.18.0.0/16'),
+        )
+        attacker = self._make_request(
+            {'x-forwarded-for': '203.0.113.7'},  # spoofed victim IP
+            client_host='198.51.100.99',         # real direct peer to :8000
+        )
+        ip = rest_api._get_client_ip(attacker)
+        # The spoofed victim must NOT become the rate-limit key.
+        assert ip == '198.51.100.99'
+        assert ip != '203.0.113.7'
+
+    def test_x_real_ip_ignored_from_untrusted_peer(self, monkeypatch):
+        """The same gate applies to the x-real-ip fallback header."""
+        from electrumx.server import rest_api
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY', True)
+        monkeypatch.setattr(
+            rest_api, '_TRUSTED_PROXIES',
+            _IPRateLimiter._parse_networks('172.18.0.0/16'),
+        )
+        attacker = self._make_request(
+            {'x-real-ip': '203.0.113.7'},
+            client_host='198.51.100.99',
+        )
+        assert rest_api._get_client_ip(attacker) == '198.51.100.99'
+
+    def test_default_allowlist_trusts_rfc1918_peer_not_public(self, monkeypatch):
+        """Default allowlist (loopback + RFC1918): a bridge peer is trusted, a
+        public direct peer is not."""
+        from electrumx.server import rest_api
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY', True)
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY_HOPS', 1)
+        monkeypatch.setattr(
+            rest_api, '_TRUSTED_PROXIES',
+            _IPRateLimiter._parse_networks(_DEFAULT_TRUSTED_PROXIES),
+        )
+        proxy = self._make_request(
+            {'x-forwarded-for': '203.0.113.7'}, client_host='172.18.0.9')
+        assert rest_api._get_client_ip(proxy) == '203.0.113.7'
+        direct = self._make_request(
+            {'x-forwarded-for': '203.0.113.7'}, client_host='8.8.8.8')
+        assert rest_api._get_client_ip(direct) == '8.8.8.8'
+
+    def test_rate_limit_buckets_keyed_per_attacker_not_victim(self, monkeypatch):
+        """End-to-end: an untrusted direct client spoofing XFF gets bucketed
+        under its OWN peer, leaving the victim's bucket untouched."""
+        from electrumx.server import rest_api
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY', True)
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY_HOPS', 1)
+        monkeypatch.setattr(
+            rest_api, '_TRUSTED_PROXIES',
+            _IPRateLimiter._parse_networks('172.18.0.0/16'),
+        )
+        monkeypatch.setattr(rest_api, '_rate_buckets', {})
+        monkeypatch.setenv('REST_RATE_LIMIT_PER_MIN', '600')
+
+        attacker = self._make_request(
+            {'x-forwarded-for': '203.0.113.7'},  # spoofed victim
+            client_host='198.51.100.99',
+        )
+        rest_api._rate_limit(attacker)
+        # The bucket was created under the attacker's real peer, NOT the victim.
+        assert '198.51.100.99' in rest_api._rate_buckets
+        assert '203.0.113.7' not in rest_api._rate_buckets
 
 
 # ===========================================================================
