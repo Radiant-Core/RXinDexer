@@ -106,6 +106,15 @@ services:
       # Rate limiting (relaxed for local RPC to prevent throttling disconnects)
       - COST_SOFT_LIMIT=10000
       - COST_HARD_LIMIT=100000
+      # Per-IP rate limiter must see the REAL client IP. Behind the Caddy
+      # reverse proxy (electrumx.radiantcore.org -> rxindexer:50013) every
+      # wallet shares the proxy's socket IP, so without TRUST_PROXY they all
+      # collapse into one persisted cost bucket -> "excessive resource usage"
+      # lockout for every wallet. Trust Caddy's appended X-Forwarded-For (hops=1
+      # reads the proxy-set value, ignoring client-spoofed entries). Direct
+      # listeners (50010/11/12) have no XFF and fall back to the socket peer.
+      - TRUST_PROXY=1
+      - TRUST_PROXY_HOPS=1
       - INITIAL_CONCURRENT=50
       - REQUEST_SLEEP=500
       # RXinDexer: Glyph token indexing (FT, NFT, dMint, Mutable, Containers)
