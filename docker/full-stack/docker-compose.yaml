@@ -12,6 +12,10 @@ services:
       dockerfile: Dockerfile.radiantd
     container_name: radiantd
     restart: unless-stopped
+    # CPU cap (fair-use safety net on the shared 4-vCPU VPS). Keep this in the
+    # committed file so a recreate/deploy doesn't drop it; a live
+    # `docker update --cpus=1.5 radiantd` applies the same cap without a restart.
+    cpus: 1.5
     volumes:
       - radiant-data:/root/.radiant
     ports:
@@ -80,6 +84,11 @@ services:
     # normal load. Adjust both if CACHE_MB is raised.
     mem_limit: 12g
     mem_reservation: 4g
+    # CPU cap (fair-use safety net on the shared 4-vCPU VPS). Committed so a
+    # recreate/deploy keeps it; a live `docker update --cpus=2.0 rxindexer`
+    # applies the same cap without a restart. The host dockerd cgroup is also
+    # capped at CPUQuota=150% (systemd: docker.service).
+    cpus: 2.0
     depends_on:
       radiantd:
         condition: service_healthy
