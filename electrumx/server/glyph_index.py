@@ -23,6 +23,7 @@ from electrumx.lib.glyph import (
     extract_token_info,
     get_token_type_id,
     get_token_type,
+    cbor_loads_capped,
     contains_glyph_magic,
     is_glyph_op_return,
     parse_glyph_from_output,
@@ -2196,7 +2197,10 @@ class GlyphIndex:
         
         if cbor_data and HAS_CBOR:
             try:
-                return cbor2.loads(cbor_data)
+                # Size-capped to match index-time decoding; an over-cap or
+                # malformed body fails closed (returns None) rather than feeding
+                # an unbounded structure to the JSON serialiser.
+                return cbor_loads_capped(cbor_data)
             except Exception:
                 pass
         return None

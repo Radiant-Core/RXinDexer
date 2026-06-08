@@ -504,6 +504,35 @@ def parse_ref(ref_str: str) -> Tuple[str, int]:
     return txid_hex, int(vout_str)
 
 
+class MetadataTooComplex(ValueError):
+    """A decoded Glyph structure is too large/shared/cyclic to serialise.
+
+    Raised by ``to_jsonsafe`` (and the REST ``_sanitize_cbor``) instead of
+    letting a pathological CBOR body wedge the single-threaded server. Subclasses
+    ``ValueError`` so the existing ``except Exception``/``except ValueError``
+    handlers turn it into a fast, clean error response.
+    """
+
+
+# Upper bound on the number of nodes ``to_jsonsafe`` will expand before it
+# refuses to continue.  A decoded CBOR value can be a *shared-reference DAG*
+# (CBOR value-sharing, tags 28/29 — which ``cbor2.loads`` materialises into
+# genuinely shared Python objects) or contain reference cycles.  ``to_jsonsafe``
+# emits a plain JSON tree, so a shared subtree is re-expanded once per reference
+# path: a ~200-byte payload that nests one shared node 26 levels deep expands to
+# 2**26 ≈ 67M nodes and pins the event loop for minutes (and the downstream
+# ``json.dumps`` would blow up identically).  This is exactly why
+# ``glyph.get_metadata`` timed out for certain WAVE/commit tokens whose stored
+# metadata is tiny but value-shared, while plain tokens returned instantly.
+#
+# A legitimate metadata body is size-capped to ``MAX_CBOR_PAYLOAD_BYTES``
+# (640 KiB) at index time, and a non-shared CBOR encodes at most ~1 node per
+# byte, so a real token never decodes to more than ~655K nodes.  2M gives ~3x
+# headroom while bounding the worst-case expansion of a hostile body to well
+# under a second before it fails fast.
+MAX_JSONSAFE_NODES = 2_000_000
+
+
 def to_jsonsafe(obj: Any) -> Any:
     """Recursively convert a decoded Glyph structure into JSON-serialisable form.
 
@@ -515,16 +544,38 @@ def to_jsonsafe(obj: Any) -> Any:
     raises and the client sees ``-32603 internal server error``. This converts
     every bytes value to a hex string and recurses through dicts/lists, leaving
     scalars untouched; ``CBORTag`` values are unwrapped to their ``.value``.
+
+    Raises :class:`MetadataTooComplex` if the structure expands past
+    ``MAX_JSONSAFE_NODES`` nodes or contains a reference cycle, so a value-shared
+    or cyclic CBOR body returns a fast error instead of hanging the event loop.
     """
-    if isinstance(obj, (bytes, bytearray)):
-        return obj.hex()
-    if isinstance(obj, dict):
-        return {to_jsonsafe(k): to_jsonsafe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [to_jsonsafe(v) for v in obj]
-    if obj.__class__.__name__ == 'CBORTag' and hasattr(obj, 'value'):
-        return to_jsonsafe(obj.value)
-    return obj
+    counter = [0]
+
+    def _convert(o, path):
+        counter[0] += 1
+        if counter[0] > MAX_JSONSAFE_NODES:
+            raise MetadataTooComplex(
+                f"Glyph structure expands past {MAX_JSONSAFE_NODES} nodes "
+                f"(value-shared or oversized CBOR); refusing to serialise"
+            )
+        if isinstance(o, (bytes, bytearray)):
+            return o.hex()
+        if isinstance(o, (dict, list, tuple)):
+            oid = id(o)
+            if oid in path:
+                raise MetadataTooComplex(
+                    "cyclic Glyph structure; refusing to serialise"
+                )
+            path = path | {oid}
+            if isinstance(o, dict):
+                return {_convert(k, path): _convert(v, path)
+                        for k, v in o.items()}
+            return [_convert(v, path) for v in o]
+        if o.__class__.__name__ == 'CBORTag' and hasattr(o, 'value'):
+            return _convert(o.value, path)
+        return o
+
+    return _convert(obj, frozenset())
 
 
 def extract_token_info(metadata: Dict[str, Any], envelope: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

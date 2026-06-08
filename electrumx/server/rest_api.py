@@ -55,6 +55,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
+from electrumx.lib.glyph import MAX_JSONSAFE_NODES, MetadataTooComplex
 from electrumx.server import metrics as _metrics
 from electrumx.server.rate_limiter import (
     DEFAULT_TRUSTED_PROXIES as _DEFAULT_TRUSTED_PROXIES,
@@ -1018,17 +1019,43 @@ def _sanitize_cbor(obj):
 
     Handles CBORTag (unknown tags → str repr), bytes (→ hex str), and
     nested dicts/lists.
+
+    Bounded the same way as ``electrumx.lib.glyph.to_jsonsafe``: a value-shared
+    CBOR DAG (tags 28/29) or a reference cycle would otherwise re-expand
+    exponentially and wedge this worker. Raises :class:`MetadataTooComplex`
+    (a ``ValueError``) past ``MAX_JSONSAFE_NODES`` nodes so the caller turns it
+    into a fast error response instead of hanging.
     """
     import cbor2
-    if isinstance(obj, dict):
-        return {str(k): _sanitize_cbor(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_cbor(i) for i in obj]
-    if isinstance(obj, (bytes, bytearray)):
-        return obj.hex()
-    if isinstance(obj, cbor2.CBORTag):
-        return {"_cbor_tag": obj.tag, "value": _sanitize_cbor(obj.value)}
-    return obj
+
+    counter = [0]
+
+    def _convert(o, path):
+        counter[0] += 1
+        if counter[0] > MAX_JSONSAFE_NODES:
+            raise MetadataTooComplex(
+                f"Glyph metadata expands past {MAX_JSONSAFE_NODES} nodes "
+                f"(value-shared or oversized CBOR); refusing to serialise"
+            )
+        if isinstance(o, dict):
+            oid = id(o)
+            if oid in path:
+                raise MetadataTooComplex("cyclic Glyph metadata")
+            path = path | {oid}
+            return {str(k): _convert(v, path) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            oid = id(o)
+            if oid in path:
+                raise MetadataTooComplex("cyclic Glyph metadata")
+            path = path | {oid}
+            return [_convert(i, path) for i in o]
+        if isinstance(o, (bytes, bytearray)):
+            return o.hex()
+        if isinstance(o, cbor2.CBORTag):
+            return {"_cbor_tag": o.tag, "value": _convert(o.value, path)}
+        return o
+
+    return _convert(obj, frozenset())
 
 
 @app.get("/tokens/{ref}/metadata", tags=["Token Analytics"])
@@ -1047,6 +1074,9 @@ async def get_token_metadata(ref: str = _REF_PATH):
             if metadata:
                 return {"ref": ref, "metadata": _sanitize_cbor(metadata)}
         return {"ref": ref, "metadata": None}
+    except MetadataTooComplex as e:
+        # Value-shared / cyclic / oversized CBOR — fail fast instead of hanging.
+        raise HTTPException(status_code=422, detail=str(e))
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except HTTPException:

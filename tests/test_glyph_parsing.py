@@ -30,6 +30,9 @@ from electrumx.lib.glyph import (
     parse_glyph_metadata,
     extract_token_info,
     get_token_type_id,
+    to_jsonsafe,
+    MetadataTooComplex,
+    MAX_JSONSAFE_NODES,
     _parse_script_pushes,
 )
 
@@ -880,3 +883,60 @@ class TestDmintContractStateParsing:
         result = parse_dmint_contract_state(script)
         assert result is not None
         assert result['target'] == big_target
+
+
+# ============================================================================
+# to_jsonsafe — bounded serialisation of decoded CBOR metadata
+# ============================================================================
+
+class TestToJsonSafeBounding:
+    """``to_jsonsafe`` must convert ordinary metadata verbatim but fail fast on
+    a value-shared CBOR DAG or a reference cycle, instead of re-expanding it
+    exponentially and wedging the single-threaded server.
+
+    Regression for the production ``glyph.get_metadata`` timeout on certain
+    WAVE/commit tokens (e.g. ``7ece1a14…d60ce_0`` "glyphgalaxy.rxd"), whose
+    stored metadata is tiny but uses CBOR value-sharing (tags 28/29); the old
+    unbounded converter took minutes / never returned.
+    """
+
+    def test_bytes_and_cbortag_unchanged(self):
+        sample = {
+            'p': [2],
+            'name': 'instas 11 / 18',
+            'main': {'t': 'image/png', 'b': bytes.fromhex('89504e47')},
+            'tag': cbor2.CBORTag(64, b'\x01\x02'),
+            'nested': {'a': [1, 2, {'x': b'\xaa\xbb'}]},
+        }
+        out = to_jsonsafe(sample)
+        assert out['main']['b'] == '89504e47'      # bytes -> hex
+        assert out['tag'] == '0102'                # CBORTag unwrapped to .value
+        assert out['name'] == 'instas 11 / 18'
+        assert out['nested']['a'][2]['x'] == 'aabb'
+
+    def test_small_shared_subtree_allowed(self):
+        # A repeated *small* object is fine — it is below the node cap.
+        shared = {'k': 'v'}
+        out = to_jsonsafe({'a': shared, 'b': shared})
+        assert out == {'a': {'k': 'v'}, 'b': {'k': 'v'}}
+
+    def test_value_shared_dag_raises_fast(self):
+        # ~273-byte payload that re-expands to 2**26 ≈ 67M nodes when flattened.
+        node = {'leaf': 'x'}
+        for _ in range(26):
+            node = {'a': node, 'b': node}
+        decoded = cbor2.loads(cbor2.dumps(node, value_sharing=True))
+        with pytest.raises(MetadataTooComplex):
+            to_jsonsafe(decoded)
+
+    def test_reference_cycle_raises_not_recursionerror(self):
+        a = {}
+        a['self'] = a
+        with pytest.raises(MetadataTooComplex):
+            to_jsonsafe(a)
+
+    def test_legit_large_flat_structure_ok(self):
+        # Well under the node cap — must still convert.
+        n = min(600_000, MAX_JSONSAFE_NODES - 10)
+        out = to_jsonsafe({'arr': list(range(n))})
+        assert len(out['arr']) == n
