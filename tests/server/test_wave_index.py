@@ -340,6 +340,45 @@ class TestWaveZoneRecords:
         assert records.a_record == '192.168.1.1'
         assert records.custom == {'x-custom': 'value'}
 
+    def test_zone_to_dict_coerces_exotic_cbor_values(self, WaveZoneRecords):
+        """to_dict() must never leak a non-JSON-native value.
+
+        Zone fields (custom x-* records, TXT lists, desc, ...) come verbatim
+        from on-chain CBOR metadata, so an attacker can register a WAVE name
+        whose zone embeds a CBOR ``undefined`` (CBOR simple value 23), raw
+        ``bytes``, a ``CBORTag``, or a ``set``. Returning that from
+        ``wave.resolve`` / the REST zone routes makes the reply un-serialisable
+        and hangs the client (aiorpcX silently drops a reply it cannot
+        JSON-encode — the exact glyph.get_metadata footgun). to_dict() must
+        coerce the whole dict to JSON-safe form.
+        """
+        import json
+        import cbor2
+
+        records = WaveZoneRecords()
+        records.address = 'rxd1abc'
+        # Truthy non-JSON-native values that pass to_dict()'s `if field:` guards
+        # (an empty/undefined value is simply dropped by the guard, which is also
+        # safe). These exercise the coercion that prevents the hang.
+        records.description = b'raw-desc-bytes'        # raw bytes desc
+        records.txt = [b'raw-bytes-record']            # bytes in a TXT list
+        records.custom = {
+            'x-blob': b'\xde\xad',                     # raw bytes custom record
+            'x-tag': cbor2.CBORTag(64, b'\x01'),       # typed-array tag
+            'x-set': {7, 8},                           # set
+        }
+
+        out = records.to_dict()
+
+        # Must round-trip through json.dumps exactly like the RPC framing does.
+        json.dumps(out)
+        assert out['address'] == 'rxd1abc'
+        assert out['desc'] == b'raw-desc-bytes'.hex()
+        assert out['TXT'] == [b'raw-bytes-record'.hex()]
+        assert out['x-blob'] == 'dead'
+        assert out['x-tag'] == '01'
+        assert sorted(out['x-set']) == [7, 8]
+
 
 class TestWaveIndex:
     """Tests for WaveIndex class."""

@@ -23,7 +23,7 @@ from collections import defaultdict
 from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, sha256
 from electrumx.lib.util import pack_be_uint32, encode_undo, decode_undo
-from electrumx.lib.glyph import GlyphProtocol
+from electrumx.lib.glyph import GlyphProtocol, to_jsonsafe
 
 try:
     import cbor2
@@ -105,7 +105,15 @@ class WaveZoneRecords:
             result['NS'] = self.ns
         if self.custom:
             result.update(self.custom)
-        return result
+        # Zone fields (custom x-* records, TXT/MX/NS lists, desc, ...) come
+        # verbatim from on-chain CBOR metadata, so a record can carry a
+        # non-JSON-native value: cbor2.undefined (CBOR simple value 23), raw
+        # bytes, a CBORTag, a Decimal/datetime, or a set. Returning such a value
+        # from wave.resolve / the REST zone routes makes the reply
+        # un-serialisable, and aiorpcX SILENTLY DROPS a reply it cannot
+        # JSON-encode — so the client hangs (the same footgun as the
+        # glyph.get_metadata timeout). Coerce the whole dict to JSON-safe form.
+        return to_jsonsafe(result)
     
     @classmethod
     def from_metadata(cls, metadata: Dict[str, Any]) -> 'WaveZoneRecords':

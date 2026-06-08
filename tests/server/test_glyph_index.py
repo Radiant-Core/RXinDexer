@@ -1739,3 +1739,100 @@ class TestDmintLiveContracts:
         refs = idx._find_all_contract_refs(_T(), token_ref)
         # GEN:1 and GEN:2 kept; token ref and the other-txid covenant excluded.
         assert refs == {c1, c2}
+
+
+class TestTokenDictJsonSafe:
+    """``_token_to_dict`` must never leak a non-JSON-native value derived from
+    on-chain CBOR metadata.
+
+    ``attrs`` is carried verbatim from ``metadata['attrs']`` and round-trips
+    through ``to_bytes``/``from_bytes`` unchanged, and several scalar fields
+    (``description``, ``icon_type``, ``timelock_hint``, ...) are raw
+    ``metadata.get(...)`` passthroughs. A token whose metadata embeds a CBOR
+    ``undefined`` (CBOR simple value 23), raw ``bytes``, a ``CBORTag``, a
+    ``set`` or a ``Decimal`` would otherwise make every handler that returns
+    ``_token_to_dict`` (``glyph.get_token_info``, ``glyph.list_tokens``, the
+    REST token routes, ...) emit an un-serialisable reply — and aiorpcX
+    silently drops a reply it cannot JSON-encode, hanging the client.
+    """
+
+    def _make_token(self, attrs=None, **overrides):
+        from electrumx.server.glyph_index import GlyphTokenInfo
+        t = GlyphTokenInfo()
+        t.ref = b'\x11' * 32 + (0).to_bytes(4, 'little')
+        t.protocols = [GlyphProtocol.GLYPH_NFT]
+        t.token_type = GlyphTokenType.NFT
+        t.name = 'pic'
+        t.attrs = attrs
+        for k, v in overrides.items():
+            setattr(t, k, v)
+        return t
+
+    def test_token_dict_with_exotic_attrs_is_json_serialisable(self):
+        import json
+        import cbor2
+        from decimal import Decimal
+        from electrumx.server.glyph_index import GlyphIndex
+
+        idx = GlyphIndex.__new__(GlyphIndex)
+        exotic_attrs = {
+            'thumb': b'\x89PNG',                 # raw bytes
+            'rarity': cbor2.undefined,           # CBOR simple value 23
+            'tag': cbor2.CBORTag(64, b'\x01'),   # typed-array tag
+            'fee': Decimal('1.5'),               # semantic-tag Decimal
+            'traits': {1, 2, 3},                 # set
+        }
+        token = self._make_token(attrs=exotic_attrs)
+
+        result = idx._token_to_dict(token)
+
+        # Must round-trip through json.dumps exactly like the RPC framing does.
+        json.dumps(result)
+        assert result['attrs']['thumb'] == '89504e47'
+        assert result['attrs']['rarity'] is None
+        assert result['attrs']['tag'] == '01'
+        assert result['attrs']['fee'] == '1.5'
+        assert sorted(result['attrs']['traits']) == [1, 2, 3]
+
+    def test_token_dict_with_undefined_scalar_field_is_json_serialisable(self):
+        import json
+        import cbor2
+        from electrumx.server.glyph_index import GlyphIndex
+
+        idx = GlyphIndex.__new__(GlyphIndex)
+        # A malformed description that decoded to CBOR undefined (the exact
+        # WAVE footgun, but on a scalar token field instead of metadata).
+        token = self._make_token(description=cbor2.undefined,
+                                  icon_type=b'\xff\xfe')
+        result = idx._token_to_dict(token)
+        json.dumps(result)
+        assert result['description'] is None
+        assert result['icon_type'] == 'fffe'
+
+    def test_key_reveal_coerces_non_json_native_fields(self):
+        import json
+        import cbor2
+        from electrumx.server.glyph_index import GlyphIndex, GlyphDBKeys
+
+        idx = GlyphIndex.__new__(GlyphIndex)
+        idx.enabled = True
+        idx.key_reveal_cache = {}
+        ref = b'\x33' * 32 + (0).to_bytes(4, 'little')
+        # A record whose 'key'/'t' fields decoded to non-JSON-native values
+        # (raw bytes CEK, CBOR undefined timestamp). get_key_reveal spreads the
+        # result into the reply, so it must be coerced.
+        record = {'tx': b'\xaa' * 32, 'key': b'\xbb' * 32,
+                  'h': 900, 't': cbor2.undefined}
+        idx.key_reveal_cache[ref] = cbor2.dumps(record)
+
+        db = MagicMock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(return_value=None)
+        idx.db = db
+
+        result = idx.get_key_reveal(ref)
+        json.dumps(result)
+        assert result['reveal_tx'] == 'aa' * 32
+        assert result['revealed_key'] == 'bb' * 32
+        assert result['created_at'] is None
+        assert result['reveal_height'] == 900

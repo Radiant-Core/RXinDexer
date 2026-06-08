@@ -29,6 +29,7 @@ from electrumx.lib.glyph import (
     parse_glyph_from_output,
     format_ref,
     parse_ref,
+    to_jsonsafe,
 )
 
 try:
@@ -1372,12 +1373,20 @@ class GlyphIndex:
             return None
         try:
             d = cbor2.loads(raw)
-            return {
+            # The reveal record is decoded straight from on-chain/stored CBOR and
+            # the result is spread (`**result`) into the glyph.get_key_reveal RPC
+            # reply and the REST route. `revealed_key`/`reveal_height`/`created_at`
+            # are raw `d.get(...)` values, so a malformed or future-written record
+            # could carry a non-JSON-native value (raw bytes for the CEK, a
+            # CBORTag, cbor2.undefined, a datetime). Returning that would make the
+            # reply un-serialisable and hang the client (aiorpcX silently drops a
+            # reply it cannot JSON-encode). Coerce to JSON-safe form.
+            return to_jsonsafe({
                 'reveal_tx': d['tx'].hex() if isinstance(d.get('tx'), (bytes, bytearray)) else d.get('tx'),
                 'revealed_key': d.get('key'),
                 'reveal_height': d.get('h'),
                 'created_at': d.get('t'),
-            }
+            })
         except Exception:
             return None
 
@@ -2343,7 +2352,23 @@ class GlyphIndex:
             if token.is_wave_duplicate:
                 result['wave_warning'] = 'This is a DUPLICATE WAVE name registration. It is NOT used for name resolution. Only the first (canonical) registration is authoritative.'
 
-        return result
+        # Several fields here are carried verbatim from the on-chain CBOR
+        # metadata with no type coercion — `attrs` (an arbitrary NFT-attribute
+        # sub-structure), plus scalar passthroughs like `description`,
+        # `icon_type`, `cipher_hash`, `enc_scheme` and the `timelock_*` fields
+        # (each a raw `metadata.get(...)`/`d.get(...)` that round-trips through
+        # to_bytes/from_bytes unchanged). Any of these can therefore be a
+        # non-JSON-native value: raw bytes, a CBORTag, cbor2.undefined, a
+        # Decimal/datetime, or a set. _token_to_dict is the return value of many
+        # handlers (glyph.get_token_info, glyph.list_tokens, the REST token
+        # routes, the dMint contract sync, ...), several of which do NOT wrap
+        # their result in to_jsonsafe; leaking such a value makes the reply
+        # un-serialisable and hangs the client, because aiorpcX silently drops a
+        # reply it cannot JSON-encode (the same footgun as the
+        # glyph.get_metadata timeout). Coerce the whole dict once here so every
+        # caller is covered uniformly. This is a no-op tree walk over the
+        # already-hex-encoded/primitive fields the method builds explicitly.
+        return to_jsonsafe(result)
     
     @staticmethod
     def _algorithm_name(algo_id: int) -> str:
