@@ -43,4 +43,4 @@ prometheus-client>=0.20.0
 # Only needed when SWAP_VERIFY_SIGNATURES is enabled — the indexer runs fine
 # without it (verification stays default-off, see electrumx/lib/rswp_verify.py).
 # Install explicitly to opt in to ECDSA verification of swap advertisements.
-coincurve>=18,<22
+coincurve>=21.0.0,<22
