@@ -573,7 +573,24 @@ def to_jsonsafe(obj: Any) -> Any:
             return [_convert(v, path) for v in o]
         if o.__class__.__name__ == 'CBORTag' and hasattr(o, 'value'):
             return _convert(o.value, path)
-        return o
+        if o is None or isinstance(o, (bool, int, float, str)):
+            return o
+        # Everything else a CBOR decode can yield is NOT JSON-native: most
+        # importantly ``cbor2.undefined`` (CBOR simple value 23 — e.g. a WAVE
+        # token's empty ``desc`` field), plus Decimal/datetime/Fraction from
+        # semantic tags, sets, and unknown simple values. Returning any of these
+        # makes the RPC response un-serialisable, and aiorpcX SILENTLY DROPS a
+        # reply it cannot JSON-encode — so the client hangs until it times out.
+        # (This is the real cause of the WAVE ``glyph.get_metadata`` timeout.)
+        # Coerce to a JSON-safe value so a reply is always produced.
+        # ``cbor2.undefined`` is a singleton; match it by identity (its class
+        # name varies across cbor2 versions: ``undefined_type`` / ``UndefinedType``).
+        if (HAS_CBOR and o is cbor2.undefined) or \
+                o.__class__.__name__ in ('undefined_type', 'UndefinedType'):
+            return None
+        if isinstance(o, (set, frozenset)):
+            return [_convert(v, path) for v in o]
+        return str(o)
 
     return _convert(obj, frozenset())
 

@@ -1053,7 +1053,16 @@ def _sanitize_cbor(obj):
             return o.hex()
         if isinstance(o, cbor2.CBORTag):
             return {"_cbor_tag": o.tag, "value": _convert(o.value, path)}
-        return o
+        if o is None or isinstance(o, (bool, int, float, str)):
+            return o
+        # Non-JSON-native CBOR leftovers (cbor2.undefined, simple values,
+        # Decimal/datetime, sets, ...). Returning them would make the response
+        # un-serialisable and the worker would error/hang. Coerce to JSON-safe.
+        if o is cbor2.undefined or o.__class__.__name__ in ('UndefinedType', 'CBORSimpleValue'):
+            return None
+        if isinstance(o, (set, frozenset)):
+            return [_convert(v, path) for v in o]
+        return str(o)
 
     return _convert(obj, frozenset())
 

@@ -940,3 +940,32 @@ class TestToJsonSafeBounding:
         n = min(600_000, MAX_JSONSAFE_NODES - 10)
         out = to_jsonsafe({'arr': list(range(n))})
         assert len(out['arr']) == n
+
+    def test_cbor_undefined_becomes_null(self):
+        # THE production WAVE bug: cbor2.undefined (CBOR simple value 23, e.g. an
+        # empty `desc`) is NOT JSON-serialisable. If to_jsonsafe leaves it in, the
+        # RPC layer's json.dumps raises and aiorpcX silently drops the reply, so
+        # the client hangs. to_jsonsafe must coerce it to null and the whole
+        # result must be JSON-serialisable.
+        import json
+        meta = {'v': 2, 'p': [2, 5, 11], 'name': 'glyphgalaxy.rxd',
+                'desc': cbor2.undefined, 'type': 'wave_name',
+                'attrs': {'domain': 'rxd', 'expires': 1843941372}}
+        out = to_jsonsafe(meta)
+        assert out['desc'] is None
+        # Must not raise — this is exactly what the RPC framing does.
+        json.dumps(out)
+
+    def test_output_always_json_serialisable(self):
+        # Any non-JSON-native CBOR leftover must be coerced so a reply is always
+        # produced (undefined -> null, set -> list, exotic -> str).
+        import json
+        from decimal import Decimal
+        meta = {'u': cbor2.undefined, 's': {1, 2, 3}, 'd': Decimal('1.5'),
+                'b': b'\xab', 'tag': cbor2.CBORTag(64, b'\x01')}
+        out = to_jsonsafe(meta)
+        assert out['u'] is None
+        assert sorted(out['s']) == [1, 2, 3]
+        assert out['d'] == '1.5'          # Decimal -> str (lossless, serialisable)
+        assert out['b'] == 'ab'
+        json.dumps(out)                    # must not raise
