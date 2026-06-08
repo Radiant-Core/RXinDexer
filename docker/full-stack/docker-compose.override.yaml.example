@@ -1,0 +1,44 @@
+# docker-compose.override.yaml — OPTIONAL, host-specific, NEVER committed.
+#
+# docker compose auto-merges a file named exactly `docker-compose.override.yaml`
+# (sitting next to docker-compose.yaml) on top of the base config. Use it for
+# per-host customisation — primarily CA-signed (e.g. Let's Encrypt) TLS certs —
+# WITHOUT editing the committed base.
+#
+# Copy to docker-compose.override.yaml and edit:
+#   cp docker-compose.override.yaml.example docker-compose.override.yaml
+#
+# IMPORTANT — the live index is ALREADY safe without this file.
+# The base docker-compose.yaml binds the RocksDB index from ./electrumdb
+# (-> docker/full-stack/electrumdb). You do NOT need an override to avoid a
+# genesis resync. This override only customises TLS cert paths (and, optionally,
+# the entrypoint). Removing/forgetting it will NOT lose or rebuild the index.
+#
+# Merge semantics for `volumes:` — entries merge by CONTAINER PATH (target).
+# An override `./electrumdb:/data/electrumdb` would REPLACE the base entry that
+# shares the target `/data/electrumdb`. Because the base already uses exactly
+# that bind-mount, you normally do NOT need to repeat the index mount here.
+
+services:
+  rxindexer:
+    environment:
+      # Point at your CA-signed cert/key. These must live INSIDE the bind-mounted
+      # ./electrumdb dir (the only host path mounted into the container), e.g.
+      # docker/full-stack/electrumdb/your-host.crt. Filenames are deliberately
+      # generic in the committed base (server.crt/server.key) so prod hostnames
+      # are not baked into the repo.
+      - SSL_CERTFILE=/data/electrumdb/your-host.example.org.crt
+      - SSL_KEYFILE=/data/electrumdb/your-host.example.org.key
+
+    # The committed entrypoint.sh already: respects SSL_CERTFILE/SSL_KEYFILE and
+    # only generates a self-signed fallback cert when the files are MISSING. So
+    # if you place real CA-signed certs at the paths above, the stock entrypoint
+    # uses them as-is and the lines below are NOT needed.
+    #
+    # Only uncomment the volume + entrypoint swap below if you maintain a custom
+    # entrypoint (e.g. one that force-renews Let's Encrypt certs on boot). Mount
+    # it over the baked-in one and select it as the entrypoint:
+    #
+    # volumes:
+    #   - ./entrypoint-force-le.sh:/opt/electrumx/entrypoint.sh:ro
+    # entrypoint: ["/opt/electrumx/entrypoint.sh"]

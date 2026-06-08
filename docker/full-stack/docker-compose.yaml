@@ -84,7 +84,22 @@ services:
       radiantd:
         condition: service_healthy
     volumes:
-      - rxindexer-data:/data/electrumdb
+      # SAFE-BY-DEFAULT: the ~15 GB RocksDB index lives in a HOST bind-mount
+      # (./electrumdb -> docker/full-stack/electrumdb), NOT a named volume.
+      #
+      # Why a bind-mount and not a named volume: production already runs this
+      # bind-mount, supplied historically by an untracked override file. A named
+      # volume here was a landmine — running `docker compose up` without that
+      # override mounted a FRESH EMPTY named volume, so rxindexer would resync
+      # the chain from genesis (~24h outage) instead of opening the live index.
+      # Binding ./electrumdb directly in the committed base makes the default
+      # config point at the SAME on-disk index prod uses, with or without any
+      # override. Do NOT revert this to a named volume without a data migration.
+      #
+      # The runtime ./electrumdb dir (and the SSL key/cert it holds) is
+      # gitignored. Ensure it is owned by uid:gid 1000:1000 (matching `user:`),
+      # e.g.  sudo chown -R 1000:1000 docker/full-stack/electrumdb
+      - ./electrumdb:/data/electrumdb
       - rxindexer-contracts:/data/contracts
     ports:
       - "50010:50010"   # TCP (Electrum protocol)
@@ -183,7 +198,10 @@ services:
 volumes:
   radiant-data:
     name: radiant-node-data
-  rxindexer-data:
-    name: rxindexer-db-data
+  # NOTE: the rxindexer index is intentionally a HOST bind-mount
+  # (./electrumdb), declared on the rxindexer service above — NOT a named
+  # volume. A former `rxindexer-data: {name: rxindexer-db-data}` named volume
+  # was removed because it could silently swap the live index for an empty one
+  # (genesis resync). See the comment on the rxindexer `volumes:` block.
   rxindexer-contracts:
     name: rxindexer-contracts-data

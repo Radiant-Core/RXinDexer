@@ -115,10 +115,35 @@ docker logs -f rxindexer
 
 ## Data Persistence
 
-Docker volumes store all data:
-- `radiant-node-data` - Blockchain (~50GB+)
-- `rxindexer-db-data` - Index database
-- `rxindexer-contracts-data` - dMint contracts
+Data is stored as follows:
+- `radiant-node-data` (named volume) - Blockchain (~50GB+)
+- `./electrumdb` (**host bind-mount**) - RXinDexer RocksDB index (~15GB+) **and**
+  the SSL cert/key. This lives on the host at `docker/full-stack/electrumdb`.
+- `rxindexer-contracts-data` (named volume) - dMint contracts
+
+> **Why the index is a bind-mount (and must stay one).** The RXinDexer index is
+> deliberately a host bind-mount, not a named volume. A named volume here was a
+> foot-gun: a `docker compose up` that didn't see the production override would
+> mount a *fresh empty* named volume, and RXinDexer would resync the chain from
+> genesis (~24h outage) instead of opening the live index. Binding `./electrumdb`
+> in the committed base makes the default config point at the same on-disk index
+> in every environment. Ensure the dir is owned by uid:gid `1000:1000`:
+> `sudo chown -R 1000:1000 docker/full-stack/electrumdb`.
+
+### Optional per-host override (TLS certs)
+
+The committed base ships generic self-signed cert defaults (`server.crt` /
+`server.key`, auto-generated on first boot by `entrypoint.sh`). To use CA-signed
+certs (e.g. Let's Encrypt) without editing the committed base, copy the template
+and point `SSL_CERTFILE` / `SSL_KEYFILE` at your cert inside `./electrumdb`:
+
+```bash
+cp docker-compose.override.yaml.example docker-compose.override.yaml
+# edit cert filenames; docker compose auto-merges this file
+```
+
+The override is **optional** and gitignored. It does **not** affect the index
+bind-mount — forgetting it never triggers a resync.
 
 ## Graceful Shutdown
 
@@ -153,8 +178,9 @@ docker-compose ps
 
 **Database corruption after crash:**
 ```bash
-# Remove and rebuild index (keeps blockchain)
+# Remove and rebuild index (keeps blockchain). This DELETES the live ~15GB
+# index and forces a full resync — only do this if the index is unrecoverable.
 docker-compose down
-docker volume rm rxindexer-db-data
+sudo rm -rf ./electrumdb/{hist,meta,utxo}   # index subdirs; keeps SSL certs
 docker-compose up -d
 ```

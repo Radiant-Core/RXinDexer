@@ -67,8 +67,16 @@ electrumx-standalone-deploy.zip
 test.env
 *.env.local
 
-# Production override (contains credentials — never commit)
+# Production override (contains credentials / host-specific cert paths — never
+# commit). The committed base is safe-by-default; the override is OPTIONAL and
+# only customises TLS cert paths / a custom entrypoint. A sanitized template is
+# tracked as docker-compose.override.yaml.example.
 docker-compose.prod.yml
+docker-compose.override.yaml
+docker-compose.override.yml
+# Host-specific custom entrypoint variants (e.g. Let's Encrypt force-renew).
+entrypoint-*.sh
+!entrypoint.sh
 
 # Test databases
 tests/.pytest_cache/
