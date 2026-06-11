@@ -86,9 +86,35 @@ class LevelDB(Storage):
         self.close = self.db.close
         self.get = self.db.get
         self.put = self.db.put
-        self.iterator = self.db.iterator
         self.write_batch = partial(self.db.write_batch, transaction=True,
                                    sync=True)
+
+    def iterator(self, prefix=b'', reverse=False, seek=None,
+                 include_value=True):
+        '''Prefix iterator with RocksDB-compatible cursor semantics.
+
+        The cursor-pagination layer (R16) passes ``seek`` — the raw key to
+        resume from — which plyvel's native iterator does not understand (and
+        plyvel forbids combining ``prefix=`` with ``start``/``stop``), so the
+        prefix is expressed as explicit [start, stop) bounds with the seek key
+        clamped into them.  Without this every seek-using caller (dmint
+        sync_from_index, cursor pagination) raises TypeError on the LevelDB
+        engine.
+        '''
+        kwargs = {'reverse': reverse, 'include_value': include_value}
+        start = prefix
+        stop = util.increment_byte_string(prefix) if prefix else None
+        if seek and seek >= prefix:
+            if reverse:
+                # Resume scanning downward strictly below the cursor.
+                stop = min(seek, stop) if stop else seek
+            else:
+                start = seek
+        if start:
+            kwargs['start'] = start
+        if stop:
+            kwargs['stop'] = stop
+        return self.db.iterator(**kwargs)
 
 
 # pylint:disable=E1101

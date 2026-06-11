@@ -19,6 +19,7 @@ from electrumx.lib import util
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash, HASHX_LEN
 from electrumx.lib.util import pack_le_uint32
 from electrumx.lib.script import Script
+from electrumx.server.swap_index import parse_multi_txout, maker_from_script
 from electrumx.lib.glyph import (
     contains_glyph_magic, parse_glyph_envelope, get_token_type,
     GlyphProtocol, is_dmint_reveal, is_wave_claim
@@ -359,47 +360,81 @@ class MempoolGlyphIndex:
             order = MempoolSwapOrder()
             order.tx_hash = tx_hash
             
-            if version == 2:
-                # v2: flags(3) offeredType(4) termsType(5) tokenID(6) [wantTokenID] utxoHash utxoIndex terms sig
+            if version in (2, 3):
+                # v2: flags(3) offeredType(4) const(5) tokenID(6) [wantTokenID]
+                #     utxoHash utxoIndex terms sig
+                # v3: + optional <expiryHeight:4LE> (flags & 0x02) after the
+                #     want id — mirrors swap_index._parse_rswp_v2.
                 if len(chunks) < 10:
                     return None
-                
+
                 idx = 3
                 flags = chunks[idx][0] if len(chunks[idx]) == 1 else 0
                 idx += 1
-                
+
+                if flags & 0x02 and version != 3:
+                    return None  # expiry is a v3 field
+
                 offered_type = chunks[idx][0] if len(chunks[idx]) == 1 else 0
-                idx += 2  # Skip termsType
-                
+                idx += 2  # Skip constant marker
+
                 # Token ID (32 bytes)
                 if len(chunks[idx]) != 32:
                     return None
                 token_id = chunks[idx]
                 idx += 1
-                
+
                 # Want token ID (optional)
                 want_token_id = None
                 if flags & 0x01:
                     if idx < len(chunks) and len(chunks[idx]) == 32:
                         want_token_id = chunks[idx]
                         idx += 1
-                
+
+                # Expiry height (v3, optional): skip over it.
+                if flags & 0x02:
+                    if idx >= len(chunks) or len(chunks[idx]) != 4:
+                        return None
+                    idx += 1
+
                 # UTXO Hash (32 bytes)
                 if idx >= len(chunks) or len(chunks[idx]) != 32:
                     return None
                 utxo_hash = chunks[idx]
                 idx += 1
-                
+
                 # UTXO Index
                 if idx >= len(chunks):
                     return None
                 utxo_index = self._parse_int(chunks[idx])
-                
+                idx += 1
+
                 order.order_id = utxo_hash + struct.pack('<I', utxo_index)
                 order.base_ref = token_id + struct.pack('<I', 0)
-                if want_token_id:
-                    order.quote_ref = want_token_id + struct.pack('<I', 0)
-                order.side = 1 if offered_type == 1 else 0  # SELL=1, BUY=0
+                # Absent want push == native RXD: default to the zero ref so
+                # token/RXD orders match the same pair key as explicit zeros.
+                order.quote_ref = (want_token_id or b'\x00' * 32) + struct.pack('<I', 0)
+                # offeredType is Photonic's ContractType (RXD=0, NFT=1, FT=2):
+                # offering RXD bids for the want token (BUY); offering any
+                # token is a SELL of it.  Mirrors swap_index._parse_rswp_v2.
+                order.side = 0 if offered_type == 0 else 1  # BUY=0, SELL=1
+
+                # priceTerms: ONE push holding a MultiTxOutV1 blob — the exact
+                # payout outputs the maker must receive (the trailing push is
+                # the maker's signature).  Same decoder as the confirmed index
+                # so unconfirmed orders surface real price/amount/maker instead
+                # of zeros.
+                if idx < len(chunks):
+                    outputs = parse_multi_txout(chunks[idx])
+                    if outputs:
+                        total = sum(v for v, _ in outputs)
+                        order.price = total
+                        order.amount = total
+                        for _, out_script in outputs:
+                            sh, _addr = maker_from_script(out_script)
+                            if sh:
+                                order.maker_scripthash = sh
+                                break
                 
             elif version == 1:
                 # v1: type(3) tokenID(4) utxoHash(5) utxoIndex(6) terms(7) sig(8)
@@ -641,15 +676,16 @@ class MempoolGlyphIndex:
                     'side': 'buy' if order.side == 0 else 'sell',
                     'price': order.price,
                     'amount': order.amount,
+                    'maker_scripthash': order.maker_scripthash.hex() if order.maker_scripthash else None,
                     'confirmed': False,
                 })
-        
+
         return results
-    
+
     def get_user_unconfirmed_orders(self, scripthash: bytes) -> List[Dict[str, Any]]:
         """Get unconfirmed orders for a specific user."""
         results = []
-        
+
         for order_id in self.swap_by_maker.get(scripthash, set()):
             order = self.swap_orders.get(order_id)
             if order:
@@ -661,9 +697,10 @@ class MempoolGlyphIndex:
                     'side': 'buy' if order.side == 0 else 'sell',
                     'price': order.price,
                     'amount': order.amount,
+                    'maker_scripthash': order.maker_scripthash.hex() if order.maker_scripthash else None,
                     'confirmed': False,
                 })
-        
+
         return results
     
     @staticmethod

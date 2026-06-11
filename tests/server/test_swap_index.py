@@ -593,9 +593,279 @@ class TestMempoolSwapParsing:
     def test_mempool_parse_non_rswp(self, mempool_glyph_index):
         """Test that non-RSWP returns None."""
         script = bytes([OP_RETURN, 4]) + b'TEST'
-        
+
         order = mempool_glyph_index._parse_rswp_mempool(script, bytes(32), 0)
         assert order is None
+
+
+def _p2pkh(pkh20: bytes) -> bytes:
+    """OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG"""
+    return bytes([0x76, 0xa9, 0x14]) + pkh20 + bytes([0x88, 0xac])
+
+
+def _multi_txout(outputs) -> bytes:
+    """Encode [(value, script), ...] as a MultiTxOutV1 blob (count < 253, len < 253)."""
+    blob = bytes([len(outputs)])
+    for value, script in outputs:
+        blob += struct.pack('<Q', value) + bytes([len(script)]) + script
+    return blob
+
+
+class TestPriceTermsDecoding:
+    """MultiTxOutV1 priceTerms decode → real amount / price / maker / side.
+
+    These vectors double as the cross-repo spec for RadiantSwap's TS encoder
+    (RadiantSwap/tests/rswp.test.ts builds byte-identical advertisements), so
+    the encoder and this parser cannot drift silently.
+    """
+
+    PKH = bytes([0xab]) * 20
+
+    @pytest.fixture
+    def swap_index(self):
+        from electrumx.server.swap_index import SwapIndex
+
+        db = Mock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(return_value=None)
+        db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
+        env = Mock()
+        env.swap_index = True
+        env.reorg_limit = 10
+        env.coin = Mock(P2PKH_VERBYTE=b'\x00', P2SH_VERBYTES=[b'\x05'])
+        return SwapIndex(db, env)
+
+    def test_parse_multi_txout_single_p2pkh(self):
+        from electrumx.server.swap_index import parse_multi_txout
+
+        script = _p2pkh(self.PKH)
+        blob = _multi_txout([(10_000, script)])
+        assert parse_multi_txout(blob) == [(10_000, script)]
+
+    def test_parse_multi_txout_multiple_outputs_sum(self):
+        from electrumx.server.swap_index import parse_multi_txout
+
+        s1, s2 = _p2pkh(self.PKH), _p2pkh(bytes([0xcd]) * 20)
+        blob = _multi_txout([(7_000, s1), (3_000, s2)])
+        assert parse_multi_txout(blob) == [(7_000, s1), (3_000, s2)]
+
+    def test_parse_multi_txout_legacy_fallback(self):
+        """A bare value(8 LE) + script blob (no framing) decodes via fallback."""
+        from electrumx.server.swap_index import parse_multi_txout
+
+        script = _p2pkh(self.PKH)
+        blob = struct.pack('<Q', 5_000) + script
+        assert parse_multi_txout(blob) == [(5_000, script)]
+
+    def test_parse_multi_txout_garbage_returns_none(self):
+        from electrumx.server.swap_index import parse_multi_txout
+
+        assert parse_multi_txout(b'') is None
+        assert parse_multi_txout(b'\x01\x02\x03\x04') is None
+
+    def test_maker_from_bare_p2pkh(self):
+        from electrumx.lib.hash import sha256
+        from electrumx.server.swap_index import maker_from_script
+
+        script = _p2pkh(self.PKH)
+        coin = Mock(P2PKH_VERBYTE=b'\x00', P2SH_VERBYTES=[b'\x05'])
+        sh, addr = maker_from_script(script, coin)
+        assert sh == sha256(script)[::-1]
+        assert addr is not None
+        # Without a coin only the scripthash is resolvable.
+        sh2, addr2 = maker_from_script(script)
+        assert sh2 == sh and addr2 is None
+
+    def test_maker_from_mainnet_verified_address(self):
+        """Round-trip the maker address of the mainnet-verified order 5fbd060e…
+
+        (height 428525): priceTerms count=1 value=10000, maker
+        1L6UJfojmZEciBo83yB1cCMASZyQ8zMKuw.
+        """
+        from electrumx.lib.hash import Base58
+        from electrumx.server.swap_index import maker_from_script
+
+        address = '1L6UJfojmZEciBo83yB1cCMASZyQ8zMKuw'
+        pkh = Base58.decode_check(address)[1:]  # strip verbyte
+        coin = Mock(P2PKH_VERBYTE=b'\x00', P2SH_VERBYTES=[b'\x05'])
+        _sh, addr = maker_from_script(_p2pkh(pkh), coin)
+        assert addr == address
+
+    def test_maker_from_ft_token_script(self):
+        """An ftScript payout (P2PKH + ref machinery) resolves to the embedded P2PKH."""
+        from electrumx.lib.hash import sha256
+        from electrumx.server.swap_index import maker_from_script
+
+        OP_STATESEPARATOR = 0xbd
+        OP_PUSHINPUTREF = 208
+        base = _p2pkh(self.PKH)
+        ft_script = (base + bytes([OP_STATESEPARATOR, OP_PUSHINPUTREF])
+                     + bytes(36) + bytes([0x75]))
+        sh, _addr = maker_from_script(ft_script)
+        assert sh == sha256(base)[::-1]
+
+    def test_v2_order_decodes_price_amount_maker(self, swap_index):
+        """Full v2 advertisement → non-zero price/amount + resolvable maker."""
+        token_id = bytes([0xaa]) * 32
+        utxo_hash = bytes([0xbb]) * 32
+        payout = _p2pkh(self.PKH)
+        price_terms = _multi_txout([(123_456_789, payout)])
+
+        script = build_rswp_v2_script(
+            token_id, utxo_hash, 2, price_terms, b'\xde' * 8,
+            flags=FLAG_HAS_WANT, offered_type=2, terms_type=1,
+            want_token_id=bytes(32),
+        )
+        order = swap_index._parse_rswp_advertisement(
+            script, bytes([0xcc]) * 32, 0, 200, 1234567890)
+
+        from electrumx.lib.hash import sha256
+        assert order is not None
+        assert order.amount == 123_456_789
+        assert order.remaining_amount == 123_456_789
+        assert order.price == 123_456_789
+        assert order.maker_scripthash == sha256(payout)[::-1]
+        assert order.maker_address is not None
+        assert order.order_id == utxo_hash + struct.pack('<I', 2)
+
+    @pytest.mark.parametrize('offered_type,expected_side', [
+        (0, 0),  # RXD offered  -> BUY (bidding for the want token)
+        (1, 1),  # NFT offered  -> SELL
+        (2, 1),  # FT offered   -> SELL (shares!)
+        (3, 1),  # VAULT        -> SELL
+    ])
+    def test_v2_side_follows_contract_type(self, swap_index, offered_type,
+                                           expected_side):
+        script = build_rswp_v2_script(
+            bytes([0xaa]) * 32, bytes([0xbb]) * 32, 0,
+            _multi_txout([(10_000, _p2pkh(self.PKH))]), b'\xde' * 8,
+            flags=0, offered_type=offered_type, terms_type=1,
+        )
+        order = swap_index._parse_rswp_advertisement(
+            script, bytes([0xcc]) * 32, 0, 200, 1234567890)
+        assert order is not None and order.side == expected_side
+
+    def test_v2_garbage_terms_still_indexes_with_zero_amount(self, swap_index):
+        """Unparseable priceTerms must not reject the order (or crash)."""
+        script = build_rswp_v2_script(
+            bytes([0xaa]) * 32, bytes([0xbb]) * 32, 0, b'\x01\x02\x03\x04',
+            b'\xde' * 8, flags=0, offered_type=2, terms_type=1,
+        )
+        order = swap_index._parse_rswp_advertisement(
+            script, bytes([0xcc]) * 32, 0, 200, 1234567890)
+        assert order is not None
+        assert order.amount == 0 and order.maker_scripthash == b''
+
+    def test_v2_absent_want_defaults_quote_to_rxd_zero_ref(self, swap_index):
+        """Canonical encoders omit the want push for RXD; the order must still
+        land on the (token, RXD-zero) orderbook pair, identically to an
+        explicit zero want id."""
+        args = (bytes([0xaa]) * 32, bytes([0xbb]) * 32, 0,
+                _multi_txout([(10_000, _p2pkh(self.PKH))]), b'\xde' * 8)
+        omitted = swap_index._parse_rswp_advertisement(
+            build_rswp_v2_script(*args, flags=0, offered_type=2, terms_type=1),
+            bytes([0xcc]) * 32, 0, 200, 1234567890)
+        explicit = swap_index._parse_rswp_advertisement(
+            build_rswp_v2_script(*args, flags=FLAG_HAS_WANT, offered_type=2,
+                                 terms_type=1, want_token_id=bytes(32)),
+            bytes([0xcc]) * 32, 0, 200, 1234567890)
+        assert omitted is not None and explicit is not None
+        assert omitted.quote_ref == bytes(36)
+        assert omitted.quote_ref == explicit.quote_ref
+        assert swap_index._pair_key(omitted) == swap_index._pair_key(explicit)
+        assert swap_index._pair_key(omitted) is not None
+
+    def test_v3_expiry_height_parsed(self, swap_index):
+        """v3 = v2 + <expiryHeight:4LE> (flags 0x02) between want id and outpoint."""
+        token_id = bytes([0xaa]) * 32
+        utxo_hash = bytes([0xbb]) * 32
+        terms = _multi_txout([(10_000, _p2pkh(self.PKH))])
+
+        script = bytes([OP_RETURN])
+        script += build_push_data(RSWP_MAGIC)
+        script += build_push_data(bytes([0x03]))         # version 3
+        script += build_push_data(bytes([0x02]))         # flags: HAS_EXPIRY
+        script += build_push_data(bytes([0x02]))         # offeredType FT
+        script += build_push_data(bytes([0x01]))         # const marker
+        script += build_push_data(token_id)
+        script += build_push_data(struct.pack('<I', 444_000))  # expiry height
+        script += build_push_data(utxo_hash)
+        script += build_push_data(bytes([0x00]))
+        script += build_push_data(terms)
+        script += build_push_data(b'\xde' * 8)
+
+        order = swap_index._parse_rswp_advertisement(
+            script, bytes([0xcc]) * 32, 0, 200, 1234567890)
+        assert order is not None
+        assert order.expiry_height == 444_000
+        assert order.amount == 10_000
+        assert order.quote_ref == bytes(36)  # absent want -> RXD
+
+    def test_v2_with_expiry_flag_is_rejected(self, swap_index):
+        """The expiry flag (0x02) is a v3 field; a v2 ad carrying it is malformed."""
+        script = build_rswp_v2_script(
+            bytes([0xaa]) * 32, bytes([0xbb]) * 32, 0,
+            _multi_txout([(10_000, _p2pkh(self.PKH))]), b'\xde' * 8,
+            flags=0x02, offered_type=2, terms_type=1,
+        )
+        assert swap_index._parse_rswp_advertisement(
+            script, bytes([0xcc]) * 32, 0, 200, 1234567890) is None
+
+    def test_unknown_version_is_skipped(self, swap_index):
+        """A v4 ad must be skipped, never misparsed (forward incompatibility)."""
+        script = bytearray(build_rswp_v2_script(
+            bytes([0xaa]) * 32, bytes([0xbb]) * 32, 0,
+            _multi_txout([(10_000, _p2pkh(self.PKH))]), b'\xde' * 8,
+            flags=0, offered_type=2, terms_type=1,
+        ))
+        script[7] = 0x04  # version byte (OP_RETURN + push4"RSWP" + push1 -> offset 7)
+        assert swap_index._parse_rswp_advertisement(
+            bytes(script), bytes([0xcc]) * 32, 0, 200, 1234567890) is None
+
+
+class TestMempoolPriceTermsDecoding:
+    """The mempool RSWP parser shares the MultiTxOutV1 decode + side mapping."""
+
+    PKH = bytes([0xab]) * 20
+
+    @pytest.fixture
+    def mempool_glyph_index(self):
+        from electrumx.server.mempool_glyph import MempoolGlyphIndex
+
+        env = Mock()
+        env.mempool_glyph_index = True
+        env.mempool_swap_index = True
+        return MempoolGlyphIndex(env)
+
+    def test_mempool_v2_decodes_price_amount_maker(self, mempool_glyph_index):
+        from electrumx.lib.hash import sha256
+
+        payout = _p2pkh(self.PKH)
+        script = build_rswp_v2_script(
+            bytes([0xaa]) * 32, bytes([0xbb]) * 32, 2,
+            _multi_txout([(123_456_789, payout)]), b'\xde' * 8,
+            flags=FLAG_HAS_WANT, offered_type=2, terms_type=1,
+            want_token_id=bytes(32),
+        )
+        order = mempool_glyph_index._parse_rswp_mempool(
+            script, bytes([0xcc]) * 32, 0)
+
+        assert order is not None
+        assert order.price == 123_456_789
+        assert order.amount == 123_456_789
+        assert order.maker_scripthash == sha256(payout)[::-1]
+        assert order.side == 1  # FT offered -> SELL
+
+    def test_mempool_v2_rxd_offer_is_buy(self, mempool_glyph_index):
+        script = build_rswp_v2_script(
+            bytes([0xaa]) * 32, bytes([0xbb]) * 32, 0,
+            _multi_txout([(10_000, _p2pkh(self.PKH))]), b'\xde' * 8,
+            flags=0, offered_type=0, terms_type=1,
+        )
+        order = mempool_glyph_index._parse_rswp_mempool(
+            script, bytes([0xcc]) * 32, 0)
+        assert order is not None and order.side == 0
 
 
 if __name__ == '__main__':

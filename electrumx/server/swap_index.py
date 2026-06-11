@@ -141,10 +141,92 @@ def _backing_utxo_carries_token(ri_record: bytes, token_hash: bytes) -> bool:
     return False
 
 
+def parse_multi_txout(blob: bytes):
+    """Decode an RSWP MultiTxOutV1 priceTerms blob.
+
+    Layout (see Photonic ``encodePriceTermsOutputs`` / ``parsePriceTerms``):
+        <CompactSize count> { <value: 8-byte LE> <CompactSize scriptLen> <script> }*count
+    Legacy fallback: a bare ``<value:8-LE><script:rest>`` single output.
+    Returns a list of ``(value:int, script:bytes)`` or ``None``.
+
+    Module-level so the mempool RSWP parser (mempool_glyph.py) shares the
+    exact same decode as the confirmed index.
+    """
+    if not blob:
+        return None
+
+    def read_compact(b, o):
+        n = b[o]
+        if n < 253:
+            return n, o + 1
+        if n == 253:
+            return struct.unpack_from('<H', b, o + 1)[0], o + 3
+        if n == 254:
+            return struct.unpack_from('<I', b, o + 1)[0], o + 5
+        return struct.unpack_from('<Q', b, o + 1)[0], o + 9
+
+    try:
+        outputs = []
+        o = 0
+        count, o = read_compact(blob, o)
+        if count <= 0 or count > 1000:
+            raise ValueError('bad count')
+        for _ in range(count):
+            if o + 8 > len(blob):
+                raise ValueError('truncated value')
+            value = struct.unpack_from('<Q', blob, o)[0]
+            o += 8
+            slen, o = read_compact(blob, o)
+            if o + slen > len(blob):
+                raise ValueError('truncated script')
+            outputs.append((value, blob[o:o + slen]))
+            o += slen
+        if o != len(blob) or not outputs:
+            raise ValueError('trailing bytes')
+        return outputs
+    except Exception:
+        # Legacy single-output fallback: value(8 LE) + rest = script
+        if len(blob) >= 9:
+            return [(struct.unpack_from('<Q', blob, 0)[0], blob[8:])]
+        return None
+
+
+def maker_from_script(script: bytes, coin=None):
+    """Resolve a payout output script to (electrum_scripthash_32, address).
+
+    The maker is the recipient of the priceTerms payout; the script is a
+    p2pkh (RXD) or an ftScript (token) that embeds the maker P2PKH. Returns
+    (b'', None) if no standard address can be extracted.  ``coin`` supplies
+    the address verbytes; with ``coin=None`` only the scripthash is returned.
+    """
+    try:
+        base = Script.base_locking_script(script)
+    except (ScriptError, Exception):
+        return b'', None
+    # Standard templates: P2PKH (OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG) / P2SH
+    address = None
+    try:
+        if (len(base) == 25 and base[0] == OpCodes.OP_DUP
+                and base[1] == OpCodes.OP_HASH160 and base[2] == 0x14
+                and base[23] == OpCodes.OP_EQUALVERIFY and base[24] == OpCodes.OP_CHECKSIG):
+            if coin is not None:
+                address = Base58.encode_check(coin.P2PKH_VERBYTE + base[3:23])
+        elif (len(base) == 23 and base[0] == OpCodes.OP_HASH160
+                and base[1] == 0x14 and base[22] == OpCodes.OP_EQUAL):
+            if coin is not None:
+                address = Base58.encode_check(coin.P2SH_VERBYTES[0] + base[2:22])
+        else:
+            return b'', None
+    except (Base58Error, Exception):
+        address = None
+    # Electrum scripthash convention: sha256(script) reversed.
+    return sha256(base)[::-1], address
+
+
 class SwapOrderInfo:
     """
     Represents an indexed swap order.
-    
+
     Stores all fields needed by DEX interfaces and market data APIs.
     """
     __slots__ = (
@@ -614,11 +696,14 @@ class SwapIndex:
             order.height = height
             order.timestamp = timestamp
             
-            if version == 2:
-                return self._parse_rswp_v2(chunks, order)
+            if version in (2, 3):
+                return self._parse_rswp_v2(chunks, order, version)
             elif version == 1:
                 return self._parse_rswp_v1(chunks, order)
             else:
+                # Unknown version: skip, never misparse (forward incompatibility
+                # is by design — see the v3 coordination note in Photonic's
+                # buildSwapAdvertisementScript).
                 return None
                 
         except Exception as e:
@@ -626,26 +711,41 @@ class SwapIndex:
             _swap_parse_errors.inc()  # R20
             return None
     
-    def _parse_rswp_v2(self, chunks: List[bytes], order: SwapOrderInfo) -> Optional[SwapOrderInfo]:
+    def _parse_rswp_v2(self, chunks: List[bytes], order: SwapOrderInfo,
+                       version: int = 2) -> Optional[SwapOrderInfo]:
         """
-        Parse RSWP v2 format (extended).
-        
-        Format: <"RSWP"> <version=2> <flags> <offeredType> <termsType> <tokenID> [wantTokenID] <utxoHash> <utxoIndex> <priceTerms...> <signature>
+        Parse RSWP v2/v3 format (extended).
+
+        v2: <"RSWP"> <0x02> <flags> <offeredType> <0x01> <tokenID·rev>
+            [wantTokenID·rev] <utxoHash·rev> <utxoIndex> <priceTerms> <signature>
+        v3 (Photonic swap-offer expiry): identical, but version byte 0x03 and an
+            optional <expiryHeight: 4-byte LE> between the want id and the
+            outpoint when flags & 0x02.
+
+        The want push is OMITTED by canonical encoders when the wanted asset is
+        native RXD (the zero token id) — an absent want therefore means RXD,
+        not "no pair": quote_ref defaults to the zero ref so token/RXD orders
+        land in the orderbook pair index.
         """
         FLAG_HAS_WANT = 0x01
-        
+        FLAG_HAS_EXPIRY = 0x02
+
         # Minimum chunks: RSWP(1) + ver(2) + flags(3) + offeredType(4) + termsType(5) + tokenID(6) + utxoHash(7) + utxoIndex(8) + terms(9) + sig(10)
         if len(chunks) < 10:
             return None
-        
+
         idx = 3  # Start after version
-        
+
         # Flags
         if len(chunks[idx]) != 1:
             return None
         flags = chunks[idx][0]
         idx += 1
-        
+
+        # Expiry is a v3 field; a v2 ad carrying the flag is malformed.
+        if flags & FLAG_HAS_EXPIRY and version != 3:
+            return None
+
         # Offered type
         if len(chunks[idx]) != 1:
             return None
@@ -658,13 +758,13 @@ class SwapIndex:
         if len(chunks[idx]) != 1:
             return None
         idx += 1
-        
+
         # Token ID (32 bytes)
         if len(chunks[idx]) != 32:
             return None
         token_id = chunks[idx]
         idx += 1
-        
+
         # Want Token ID (32 bytes, optional based on flag)
         want_token_id = None
         if flags & FLAG_HAS_WANT:
@@ -672,7 +772,16 @@ class SwapIndex:
                 return None
             want_token_id = chunks[idx]
             idx += 1
-        
+
+        # Expiry height (v3, optional based on flag): absolute block height,
+        # 4-byte little-endian, between the want id and the outpoint.
+        expiry_height = 0
+        if flags & FLAG_HAS_EXPIRY:
+            if idx >= len(chunks) or len(chunks[idx]) != 4:
+                return None
+            expiry_height = struct.unpack('<I', chunks[idx])[0]
+            idx += 1
+
         # UTXO Hash (32 bytes)
         if idx >= len(chunks) or len(chunks[idx]) != 32:
             return None
@@ -703,9 +812,19 @@ class SwapIndex:
         # Build order
         order.order_id = utxo_hash + struct.pack('<I', utxo_index)
         order.base_ref = token_id + struct.pack('<I', 0)  # Token ref
-        if want_token_id:
-            order.quote_ref = want_token_id + struct.pack('<I', 0)
-        order.side = OrderSide.SELL if offered_type == 1 else OrderSide.BUY
+        # Absent want push == native RXD (canonical encoders omit the zero id),
+        # so default the quote to the zero ref: explicit-zero-want and
+        # omitted-want ads converge on the same orderbook pair key.
+        order.quote_ref = (want_token_id or b'\x00' * 32) + struct.pack('<I', 0)
+        order.expiry_height = expiry_height
+        # offeredType is Photonic's ContractType (RXD=0, NFT=1, FT=2, VAULT=3).
+        # Offering RXD is a bid FOR the want token (BUY); offering any token is
+        # an ask of that token (SELL).  The previous `== 1` test misfiled every
+        # FT listing as a buy, putting fungible-token sells on the wrong side of
+        # the orderbook.  Orders indexed before this fix keep their stored side
+        # until a reindex (close-path key reconstruction uses the persisted
+        # side, so no live migration is needed for correctness).
+        order.side = OrderSide.BUY if offered_type == 0 else OrderSide.SELL
         order.status = OrderStatus.OPEN
 
         # priceTerms is a MultiTxOutV1 blob: the exact payout outputs a taker
@@ -716,81 +835,12 @@ class SwapIndex:
         return order
 
     def _parse_multi_txout(self, blob: bytes):
-        """Decode an RSWP MultiTxOutV1 priceTerms blob.
-
-        Layout (see Photonic ``encodePriceTermsOutputs`` / ``parsePriceTerms``):
-            <CompactSize count> { <value: 8-byte LE> <CompactSize scriptLen> <script> }*count
-        Legacy fallback: a bare ``<value:8-LE><script:rest>`` single output.
-        Returns a list of ``(value:int, script:bytes)`` or ``None``.
-        """
-        if not blob:
-            return None
-
-        def read_compact(b, o):
-            n = b[o]
-            if n < 253:
-                return n, o + 1
-            if n == 253:
-                return struct.unpack_from('<H', b, o + 1)[0], o + 3
-            if n == 254:
-                return struct.unpack_from('<I', b, o + 1)[0], o + 5
-            return struct.unpack_from('<Q', b, o + 1)[0], o + 9
-
-        try:
-            outputs = []
-            o = 0
-            count, o = read_compact(blob, o)
-            if count <= 0 or count > 1000:
-                raise ValueError('bad count')
-            for _ in range(count):
-                if o + 8 > len(blob):
-                    raise ValueError('truncated value')
-                value = struct.unpack_from('<Q', blob, o)[0]
-                o += 8
-                slen, o = read_compact(blob, o)
-                if o + slen > len(blob):
-                    raise ValueError('truncated script')
-                outputs.append((value, blob[o:o + slen]))
-                o += slen
-            if o != len(blob) or not outputs:
-                raise ValueError('trailing bytes')
-            return outputs
-        except Exception:
-            # Legacy single-output fallback: value(8 LE) + rest = script
-            if len(blob) >= 9:
-                return [(struct.unpack_from('<Q', blob, 0)[0], blob[8:])]
-            return None
+        """Decode an RSWP MultiTxOutV1 priceTerms blob (see parse_multi_txout)."""
+        return parse_multi_txout(blob)
 
     def _maker_from_script(self, script: bytes):
-        """Resolve a payout output script to (electrum_scripthash_32, address).
-
-        The maker is the recipient of the priceTerms payout; the script is a
-        p2pkh (RXD) or an ftScript (token) that embeds the maker P2PKH. Returns
-        (b'', None) if no standard address can be extracted.
-        """
-        try:
-            base = Script.base_locking_script(script)
-        except (ScriptError, Exception):
-            return b'', None
-        coin = getattr(self.env, 'coin', None)
-        # Standard templates: P2PKH (OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG) / P2SH
-        address = None
-        try:
-            if (len(base) == 25 and base[0] == OpCodes.OP_DUP
-                    and base[1] == OpCodes.OP_HASH160 and base[2] == 0x14
-                    and base[23] == OpCodes.OP_EQUALVERIFY and base[24] == OpCodes.OP_CHECKSIG):
-                if coin is not None:
-                    address = Base58.encode_check(coin.P2PKH_VERBYTE + base[3:23])
-            elif (len(base) == 23 and base[0] == OpCodes.OP_HASH160
-                    and base[1] == 0x14 and base[22] == OpCodes.OP_EQUAL):
-                if coin is not None:
-                    address = Base58.encode_check(coin.P2SH_VERBYTES[0] + base[2:22])
-            else:
-                return b'', None
-        except (Base58Error, Exception):
-            address = None
-        # Electrum scripthash convention: sha256(script) reversed.
-        return sha256(base)[::-1], address
+        """Resolve a payout script to (scripthash, address) (see maker_from_script)."""
+        return maker_from_script(script, getattr(self.env, 'coin', None))
 
     def _apply_price_terms(self, price_terms_blob: bytes, order: SwapOrderInfo):
         """Populate amount / price / maker from the priceTerms MultiTxOutV1 blob.
@@ -813,63 +863,6 @@ class SwapIndex:
                 order.maker_scripthash = sh
                 order.maker_address = addr
                 break
-    
-    def _parse_price_terms(self, terms_type: int, term_chunks: List[bytes],
-                           order: SwapOrderInfo):
-        """
-        Parse price terms from RSWP advertisement.
-        
-        termsType 0 — Fixed price:
-          term_chunks = [<price>, <amount>]
-          price and amount are script-encoded integers.
-          
-        termsType 1 — Rate (ratio):
-          term_chunks = [<numerator>, <denominator>, <amount>]
-          Effective price = numerator / denominator (scaled to 10^8).
-          
-        termsType 2 — Fixed price + min fill:
-          term_chunks = [<price>, <amount>, <min_fill>]
-        """
-        try:
-            if terms_type == 0:
-                # Fixed price: [price, amount]
-                if len(term_chunks) >= 1:
-                    order.price = self._parse_script_int(term_chunks[0]) or 0
-                if len(term_chunks) >= 2:
-                    order.amount = self._parse_script_int(term_chunks[1]) or 0
-                    order.remaining_amount = order.amount
-            elif terms_type == 1:
-                # Rate: [numerator, denominator, amount]
-                numerator = 0
-                denominator = 1
-                if len(term_chunks) >= 1:
-                    numerator = self._parse_script_int(term_chunks[0]) or 0
-                if len(term_chunks) >= 2:
-                    denominator = self._parse_script_int(term_chunks[1]) or 1
-                    if denominator == 0:
-                        denominator = 1
-                if len(term_chunks) >= 3:
-                    order.amount = self._parse_script_int(term_chunks[2]) or 0
-                    order.remaining_amount = order.amount
-                # Convert rate to scaled price (10^8 precision)
-                order.price = int((numerator * 10**8) / denominator)
-            elif terms_type == 2:
-                # Fixed price + min fill: [price, amount, min_fill]
-                if len(term_chunks) >= 1:
-                    order.price = self._parse_script_int(term_chunks[0]) or 0
-                if len(term_chunks) >= 2:
-                    order.amount = self._parse_script_int(term_chunks[1]) or 0
-                    order.remaining_amount = order.amount
-                if len(term_chunks) >= 3:
-                    order.min_fill = self._parse_script_int(term_chunks[2]) or 0
-            else:
-                # Unknown terms type — store raw concatenated bytes as price
-                # for forward compatibility
-                raw = b''.join(term_chunks)
-                if raw:
-                    order.price = self._parse_script_int(raw) or 0
-        except Exception:
-            pass
     
     def _parse_rswp_v1(self, chunks: List[bytes], order: SwapOrderInfo) -> Optional[SwapOrderInfo]:
         """
@@ -1372,13 +1365,10 @@ class SwapIndex:
         return names.get(status, 'unknown')
 
 
-# API Method Registration
-SWAP_METHODS = {
-    'swap.get_order': 'swap_get_order',
-    'swap.get_orderbook': 'swap_get_orderbook',
-    'swap.get_open_orders': 'swap_get_open_orders',
-    'swap.get_user_orders': 'swap_get_user_orders',
-    'swap.get_history': 'swap_get_history',
-    'swap.get_count': 'swap_get_count',
-    'swap.get_pair_stats': 'swap_get_pair_stats',
-}
+# RPC registration note: swap.* electrum methods are registered in
+# electrumx/server/glyph_api.py (GLYPH_METHODS), NOT here.  The orderbook
+# query is `swap.get_orders(base_ref, quote_ref)` — with both refs supplied it
+# returns the {bids, asks} orderbook via SwapIndex.get_orderbook(); with fewer
+# it lists open orders.  (An older SWAP_METHODS dict here advertised method
+# names like swap.get_orderbook that were never wired to any session — it was
+# dead and misleading, so it was removed.)
