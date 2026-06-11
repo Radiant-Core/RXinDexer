@@ -34,6 +34,14 @@ For filter-then-sort methods that can't seek (e.g. `list_encrypted_tokens`),
 the cursor is the integer offset into the sorted post-filter list, also
 base64-encoded.
 
+The cursor is the next key to *serve*, not the last key served. Both
+storage engines implement the same resume rule (`tests/server/
+test_storage.py` pins it engine-parameterized): ascending scans resume at
+the first key >= cursor; descending scans (e.g. `swap.get_history`,
+newest-first) resume at the last key <= cursor. The cursor key itself is
+served in both directions — RocksDB parks reverse scans via
+`SeekForPrev`, LevelDB via an inclusive `stop` bound.
+
 ### Stability under mempool churn
 
 Because the cursor encodes the *next key to seek to*, not a row number,
