@@ -168,6 +168,9 @@ class SessionManager:
         self._status_cache = pylru.lrucache(4096)
         self._status_lookups = 0
         self._status_hits = 0
+        # ref.get [mint, location] cache, keyed by the ref's hashX — NOT the
+        # raw ref — because _notify_sessions invalidates from the block
+        # processor's touched set, which contains script_hashX(ref) values.
         self._ref_get_cache = pylru.lrucache(1000)
         self._ref_get_lookups = 0
         self._ref_get_hits = 0
@@ -931,15 +934,18 @@ class SessionManager:
         '''Returns the mint and location for a ref'''
         cost = 0.1
         self._ref_get_lookups += 1
+        # The touched set in _notify_sessions holds hashXs, so the cache key
+        # must be the ref's hashX for invalidation to ever match.
+        hashX = self.env.coin.hashX_from_script(ref)
         try:
-            result = self._ref_get_cache[ref]
+            result = self._ref_get_cache[hashX]
             self._ref_get_hits += 1
         except KeyError:
             mint = self.db.get_ref_mint(ref)
             loc = self.db.get_ref_location(ref)
             cost += 0.202
             result = [mint, loc]
-            self._ref_get_cache[ref] = result
+            self._ref_get_cache[hashX] = result
 
         if isinstance(result, Exception):
             raise result
