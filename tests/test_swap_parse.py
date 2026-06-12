@@ -77,10 +77,11 @@ def test_rswp_v2_order_amount_and_maker():
     # resolvable maker (was null)
     assert order.maker_address == EXPECT_MAKER_ADDR, order.maker_address
     assert order.maker_scripthash.hex() == EXPECT_MAKER_SH, order.maker_scripthash.hex()
-    # structural fields still correct
-    assert order.base_ref == bytes(36)  # zero ref = native RXD offered
-    assert order.quote_ref[:32].hex() == "4f9b4240e9e550191ba05d50f036f0939283c2457a16dccae57dd23b41414932"
-    # offered_type byte was 0 -> BUY under the (unchanged) side logic
+    # structural fields: RXD offered + token wanted = a BUY, and the pair is
+    # normalized token-as-base so this bid lands in the SAME orderbook book
+    # as the asks for the wanted token (base = WANT side, quote = RXD).
+    assert order.base_ref[:32].hex() == "4f9b4240e9e550191ba05d50f036f0939283c2457a16dccae57dd23b41414932"
+    assert order.quote_ref == bytes(36)  # zero ref = native RXD offered
     assert order.side == OrderSide.BUY
 
 

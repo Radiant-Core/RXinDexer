@@ -247,27 +247,33 @@ class TestSwapIndexParsing:
         assert order.side == 1  # SELL (offered_type == 1)
 
     def test_parse_rswp_v2_with_want_token(self, swap_index):
-        """Test parsing RSWP v2 advertisement with want token."""
+        """Test parsing RSWP v2 advertisement with want token.
+
+        offered_type == 0 makes this a BUY, and the pair is normalized
+        token-as-base: base_ref comes from the WANT side, quote_ref from the
+        offered side, so the bid keys into the same orderbook pair as the
+        asks for the wanted token.
+        """
         token_id = bytes([0xaa] * 32)
         want_token_id = bytes([0xdd] * 32)
         utxo_hash = bytes([0xbb] * 32)
         utxo_index = 3
         price_terms = b'\x01\x02\x03\x04'
         signature = b'\x05\x06\x07\x08'
-        
+
         script = build_rswp_v2_script(
             token_id, utxo_hash, utxo_index, price_terms, signature,
             flags=FLAG_HAS_WANT, offered_type=0, terms_type=1,
             want_token_id=want_token_id
         )
-        
+
         tx_hash = bytes([0xcc] * 32)
         order = swap_index._parse_rswp_advertisement(script, tx_hash, 0, 300, 1234567890)
-        
+
         assert order is not None
-        assert order.base_ref[:32] == token_id
-        assert order.quote_ref[:32] == want_token_id
         assert order.side == 0  # BUY (offered_type == 0)
+        assert order.base_ref[:32] == want_token_id  # base = WANT side for a bid
+        assert order.quote_ref[:32] == token_id      # quote = offered side
 
     def test_parse_non_rswp_script(self, swap_index):
         """Test that non-RSWP scripts return None."""
@@ -824,6 +830,190 @@ class TestPriceTermsDecoding:
             bytes(script), bytes([0xcc]) * 32, 0, 200, 1234567890) is None
 
 
+class _BookStore:
+    """Dict-backed stand-in for db.utxo_db with a real prefix iterator, so
+    process_tx -> flush -> get_orderbook runs end-to-end against 'disk'."""
+
+    def __init__(self):
+        self.store = {}
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def iterator(self, prefix=b'', reverse=False, seek=None,
+                 include_value=True):
+        items = sorted((k, v) for k, v in self.store.items()
+                       if k.startswith(prefix))
+        if reverse:
+            items = list(reversed(items))
+        for k, v in items:
+            yield (k, v) if include_value else (k, None)
+
+
+class _BookBatch:
+    """Write batch applying puts/deletes straight to the _BookStore."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def put(self, key, value):
+        self._store[key] = value
+
+    def delete(self, key):
+        self._store.pop(key, None)
+
+
+class TestBuyOrderBookKeying:
+    """RXD-offered bids must land in the SAME OPEN_BY_PAIR book as the asks
+    for the token they want (regtest repro 2026-06-12, ad tx d64a0791…).
+
+    A canonical RadiantSwap bid advertisement carries offeredType 0x00 with a
+    zero offered-token id, the wanted token as the HAS_WANT push (reversed
+    sha256 of its 36-byte ref), priceTerms = one MultiTxOutV1 output paying
+    the maker's token lock, and a plain P2PKH RXD coin as backing outpoint.
+    Keying the bid on its offered (zero) ref filed it under the (zero, token)
+    pair, so swap.get_orders(token, rxd) returned empty bids[] while the
+    matching SELL ad listed fine in asks[].
+    """
+
+    PKH = bytes([0xab]) * 20
+    # The wanted token's on-disk 36-byte ref and its advertised (reversed
+    # sha256) want push — exactly what Photonic's assetToSwapTokenId emits.
+    WANT_REF36 = bytes([0xaa]) * 32 + struct.pack('<I', 0)
+
+    @property
+    def want_push(self):
+        return _sha256(self.WANT_REF36)[::-1]
+
+    @pytest.fixture
+    def swap_index(self):
+        from electrumx.server.swap_index import SwapIndex
+
+        db = Mock()
+        db.utxo_db = _BookStore()
+        db.db_height = 100
+        env = Mock()
+        env.swap_index = True
+        env.reorg_limit = 10
+        env.coin = Mock(P2PKH_VERBYTE=b'\x00', P2SH_VERBYTES=[b'\x05'])
+        return SwapIndex(db, env)
+
+    def _maker_token_lock(self):
+        """ftScript paying the maker: P2PKH + state separator + ref machinery."""
+        OP_STATESEPARATOR = 0xbd
+        OP_PUSHINPUTREF = 0xd0
+        return (_p2pkh(self.PKH) + bytes([OP_STATESEPARATOR, OP_PUSHINPUTREF])
+                + self.WANT_REF36 + bytes([0x75]))
+
+    def _bid_script(self, utxo_hash=bytes([0xbb]) * 32, utxo_index=1,
+                    photons=1_000):
+        """Full canonical v2 bid ad: RXD offered, WANT_REF36's token wanted."""
+        return build_rswp_v2_script(
+            bytes(32),                      # offered token id = zeros (RXD)
+            utxo_hash, utxo_index,
+            _multi_txout([(photons, self._maker_token_lock())]),
+            b'\xde' * 8,
+            flags=FLAG_HAS_WANT, offered_type=0, terms_type=1,
+            want_token_id=self.want_push,
+        )
+
+    def _ask_script(self, utxo_hash=bytes([0xee]) * 32, utxo_index=2,
+                    photons=50_000):
+        """Matching v2 SELL ad: same token offered, RXD wanted (want omitted)."""
+        return build_rswp_v2_script(
+            self.want_push,                 # offered token id = the token
+            utxo_hash, utxo_index,
+            _multi_txout([(photons, _p2pkh(self.PKH))]),
+            b'\xde' * 8,
+            flags=0, offered_type=2, terms_type=1,
+        )
+
+    def test_full_bid_ad_parses_onto_want_token_book(self, swap_index):
+        """The regression: a bid's base_ref must be the WANT side."""
+        from electrumx.lib.hash import sha256
+
+        order = swap_index._parse_rswp_advertisement(
+            self._bid_script(), bytes([0xcc]) * 32, 0, 200, 1234567890)
+
+        assert order is not None
+        assert order.side == 0  # BUY
+        assert order.base_ref == self.want_push + struct.pack('<I', 0)
+        assert order.quote_ref == bytes(36)  # RXD zero ref
+        assert order.amount == 1_000
+        assert order.price == 1_000
+        # Maker resolves from the P2PKH embedded in the token lock payout.
+        assert order.maker_scripthash == sha256(_p2pkh(self.PKH))[::-1]
+        assert order.order_id == bytes([0xbb]) * 32 + struct.pack('<I', 1)
+
+    def test_bid_and_ask_share_one_orderbook_prefix(self, swap_index):
+        """Bid and matching ask differ ONLY in the side byte of the pair key."""
+        from electrumx.server.swap_index import SwapDBKeys, OrderSide
+
+        bid = swap_index._parse_rswp_advertisement(
+            self._bid_script(), bytes([0xcc]) * 32, 0, 200, 1234567890)
+        ask = swap_index._parse_rswp_advertisement(
+            self._ask_script(), bytes([0xcd]) * 32, 0, 200, 1234567890)
+        assert bid is not None and ask is not None
+
+        assert bid.base_ref == ask.base_ref
+        assert bid.quote_ref == ask.quote_ref
+
+        bid_key = swap_index._pair_key(bid)
+        ask_key = swap_index._pair_key(ask)
+        book = len(SwapDBKeys.OPEN_BY_PAIR) + 36 + 36  # prefix up to side byte
+        assert bid_key[:book] == ask_key[:book]
+        assert bid_key[book] == OrderSide.BUY
+        assert ask_key[book] == OrderSide.SELL
+
+    def test_bid_lists_in_get_orderbook_bids(self, swap_index):
+        """End-to-end repro: process both ads, flush, query the (token, RXD)
+        book — the bid must appear in bids[] alongside the ask in asks[]."""
+
+        class _Out:
+            def __init__(self, s):
+                self.pk_script = s
+
+        class _Tx:
+            def __init__(self, s):
+                self.outputs = [_Out(s)]
+
+        swap_index.process_tx(bytes([0xcc]) * 32, _Tx(self._bid_script()),
+                              200, 0)
+        swap_index.process_tx(bytes([0xcd]) * 32, _Tx(self._ask_script()),
+                              200, 1)
+        swap_index.flush(_BookBatch(swap_index.db.utxo_db.store))
+
+        book = swap_index.get_orderbook(
+            self.want_push + struct.pack('<I', 0), bytes(36))
+
+        assert len(book['bids']) == 1
+        assert len(book['asks']) == 1
+        assert book['bids'][0]['side'] == 'buy'
+        assert book['bids'][0]['order_id'] == \
+            (bytes([0xbb]) * 32 + struct.pack('<I', 1))[::-1].hex()
+        assert book['asks'][0]['side'] == 'sell'
+
+    def test_bid_validation_checks_offered_side_not_want(self, swap_index):
+        """A bid offers RXD: its plain backing coin must never be required to
+        carry the WANTED token — even when the coin happens to hold some
+        unrelated ref (present-but-mismatched b'ri' record)."""
+        from electrumx.server.swap_index import _advertised_token_hash
+
+        bid = swap_index._parse_rswp_advertisement(
+            self._bid_script(), bytes([0xcc]) * 32, 0, 200, 1234567890)
+        assert bid is not None
+
+        # Offered side is RXD -> nothing to verify on-chain.
+        assert _advertised_token_hash(bid) is None
+
+        # Even a present b'ri' record carrying a foreign token must not
+        # reject the bid (the check applies to the OFFERED asset only).
+        foreign = bytes([0x77]) * 32 + struct.pack('<I', 4)
+        swap_index.db.utxo_db.store[b'ri' + bid.order_id] = \
+            _ri_record((foreign, 0))
+        assert swap_index._backing_utxo_offers_token(bid) is True
+
+
 class TestMempoolPriceTermsDecoding:
     """The mempool RSWP parser shares the MultiTxOutV1 decode + side mapping."""
 
@@ -866,6 +1056,31 @@ class TestMempoolPriceTermsDecoding:
         order = mempool_glyph_index._parse_rswp_mempool(
             script, bytes([0xcc]) * 32, 0)
         assert order is not None and order.side == 0
+
+    def test_mempool_bid_keys_same_pair_as_ask(self, mempool_glyph_index):
+        """Unconfirmed bids must land in the same swap_by_pair bucket as the
+        asks for the wanted token (mirrors TestBuyOrderBookKeying)."""
+        want_ref36 = bytes([0xaa]) * 32 + struct.pack('<I', 0)
+        want_push = _sha256(want_ref36)[::-1]
+        bid_script = build_rswp_v2_script(
+            bytes(32), bytes([0xbb]) * 32, 1,
+            _multi_txout([(1_000, _p2pkh(self.PKH))]), b'\xde' * 8,
+            flags=FLAG_HAS_WANT, offered_type=0, terms_type=1,
+            want_token_id=want_push,
+        )
+        ask_script = build_rswp_v2_script(
+            want_push, bytes([0xee]) * 32, 2,
+            _multi_txout([(50_000, _p2pkh(self.PKH))]), b'\xde' * 8,
+            flags=0, offered_type=2, terms_type=1,
+        )
+        bid = mempool_glyph_index._parse_rswp_mempool(
+            bid_script, bytes([0xcc]) * 32, 0)
+        ask = mempool_glyph_index._parse_rswp_mempool(
+            ask_script, bytes([0xcd]) * 32, 0)
+        assert bid is not None and ask is not None
+        assert bid.side == 0 and ask.side == 1
+        assert bid.base_ref == ask.base_ref == want_push + struct.pack('<I', 0)
+        assert bid.quote_ref == ask.quote_ref == bytes(36)
 
 
 if __name__ == '__main__':

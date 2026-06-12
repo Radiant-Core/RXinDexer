@@ -53,6 +53,10 @@ WORKDIR /opt
 
 # Clone RXinDexer from GitHub
 ARG RXINDEXER_BRANCH=main
+# Cache-bust the clone: ADD of a URL is re-fetched on every build, so the
+# layers below are invalidated when the branch tip moves (and stay cached
+# when it doesn't). Without this, Docker reuses a stale clone forever.
+ADD https://api.github.com/repos/Radiant-Core/RXinDexer/git/refs/heads/${RXINDEXER_BRANCH} /tmp/rxindexer-ref.json
 RUN git clone --depth 1 --branch ${RXINDEXER_BRANCH} \
     https://github.com/Radiant-Core/RXinDexer.git electrumx
 

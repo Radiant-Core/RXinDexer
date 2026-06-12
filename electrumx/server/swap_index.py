@@ -101,22 +101,29 @@ REF_LEN = 36
 
 
 def _advertised_token_hash(order) -> Optional[bytes]:
-    """Return the 32-byte SHA-256 token identifier the order advertises, or None.
+    """Return the 32-byte SHA-256 id of the token the order OFFERS, or None.
 
     The RSWP advertisement does NOT carry the offered token's raw 36-byte ref;
     it carries ``offeredTokenId = sha256(ref_36)`` pushed byte-REVERSED (Photonic
     ``assetToSwapTokenId`` in swapBroadcast.ts + ``buildSwapAdvertisementScript``
     in Swap.tsx, which ``.reverse()``-es the 32-byte hash before the push).  The
-    parser stores that on-script (reversed) value verbatim as ``base_ref[:32]``,
-    so to recover the canonical ``sha256(ref_36)`` we reverse it back.
+    parser stores that on-script (reversed) value verbatim in the ref's first 32
+    bytes, so to recover the canonical ``sha256(ref_36)`` we reverse it back.
 
-    Returns None for an RXD-offered order (token id == 32 zero bytes), which has
-    no token ref to back-check, and for a malformed/short base_ref.
+    The backing-UTXO check only makes sense for the OFFERED asset (the thing
+    the backing outpoint must actually hold).  Pair refs are normalized
+    token-as-base, so for a SELL the offered asset is ``base_ref``; for a BUY
+    the maker offers the quote side (RXD for canonical bids) and ``base_ref``
+    is the WANTED token — which the backing coin does not and must not carry.
+
+    Returns None for an RXD offer (token id == 32 zero bytes), which has no
+    token ref to back-check, and for a malformed/short ref.
     """
-    base_ref = order.base_ref
-    if not base_ref or len(base_ref) < 32:
+    offered_ref = (order.quote_ref if order.side == OrderSide.BUY
+                   else order.base_ref)
+    if not offered_ref or len(offered_ref) < 32:
         return None
-    token_hash = base_ref[:32][::-1]
+    token_hash = offered_ref[:32][::-1]
     if token_hash == b'\x00' * 32:
         return None  # RXD offer — nothing to verify on-chain.
     return token_hash
@@ -555,8 +562,9 @@ class SwapIndex:
             this same block and not yet flushed to ``b'ri'``; rejecting here
             would be a false positive.  (It would also reject RXD-only backing
             UTXOs, which legitimately have no ref record.)
-          * token id is RXD/zero or base_ref malformed -> ACCEPT (nothing to
-            check on-chain).
+          * offered asset is RXD/zero (canonical BUY bids) or the offered ref
+            is malformed -> ACCEPT (nothing to check on-chain; a bid's backing
+            coin offers plain RXD value, never the wanted token).
           * record PRESENT but contains no ref hashing to the offered token id
             -> REJECT: the advertised UTXO demonstrably does not carry the
             offered token.
@@ -811,11 +819,11 @@ class SwapIndex:
 
         # Build order
         order.order_id = utxo_hash + struct.pack('<I', utxo_index)
-        order.base_ref = token_id + struct.pack('<I', 0)  # Token ref
+        offered_ref = token_id + struct.pack('<I', 0)
         # Absent want push == native RXD (canonical encoders omit the zero id),
-        # so default the quote to the zero ref: explicit-zero-want and
+        # so default the want to the zero ref: explicit-zero-want and
         # omitted-want ads converge on the same orderbook pair key.
-        order.quote_ref = (want_token_id or b'\x00' * 32) + struct.pack('<I', 0)
+        want_ref = (want_token_id or b'\x00' * 32) + struct.pack('<I', 0)
         order.expiry_height = expiry_height
         # offeredType is Photonic's ContractType (RXD=0, NFT=1, FT=2, VAULT=3).
         # Offering RXD is a bid FOR the want token (BUY); offering any token is
@@ -825,6 +833,20 @@ class SwapIndex:
         # until a reindex (close-path key reconstruction uses the persisted
         # side, so no live migration is needed for correctness).
         order.side = OrderSide.BUY if offered_type == 0 else OrderSide.SELL
+        # Pair orientation: the orderbook is keyed token-as-base / counter-
+        # asset-as-quote, so a bid and its matching asks share one
+        # OPEN_BY_PAIR book.  A SELL offers the base token (wanting the
+        # quote); a BUY offers the quote (RXD) and WANTS the base token, so
+        # for BUY orders base_ref comes from the want side.  Keying a bid on
+        # its offered (zero) ref instead put it in a (zero, token) book that
+        # no orderbook query ever scanned: get_orderbook(token, rxd) returned
+        # empty bids[] while the matching asks listed fine.
+        if order.side == OrderSide.BUY:
+            order.base_ref = want_ref
+            order.quote_ref = offered_ref
+        else:
+            order.base_ref = offered_ref
+            order.quote_ref = want_ref
         order.status = OrderStatus.OPEN
 
         # priceTerms is a MultiTxOutV1 blob: the exact payout outputs a taker

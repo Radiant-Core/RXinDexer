@@ -410,14 +410,25 @@ class MempoolGlyphIndex:
                 idx += 1
 
                 order.order_id = utxo_hash + struct.pack('<I', utxo_index)
-                order.base_ref = token_id + struct.pack('<I', 0)
+                offered_ref = token_id + struct.pack('<I', 0)
                 # Absent want push == native RXD: default to the zero ref so
                 # token/RXD orders match the same pair key as explicit zeros.
-                order.quote_ref = (want_token_id or b'\x00' * 32) + struct.pack('<I', 0)
+                want_ref = (want_token_id or b'\x00' * 32) + struct.pack('<I', 0)
                 # offeredType is Photonic's ContractType (RXD=0, NFT=1, FT=2):
                 # offering RXD bids for the want token (BUY); offering any
                 # token is a SELL of it.  Mirrors swap_index._parse_rswp_v2.
                 order.side = 0 if offered_type == 0 else 1  # BUY=0, SELL=1
+                # Pair orientation mirrors swap_index._parse_rswp_v2: the book
+                # is keyed token-as-base, so a BUY (RXD offered, token wanted)
+                # takes base_ref from the WANT side — otherwise unconfirmed
+                # bids land in a (zero, token) swap_by_pair bucket that the
+                # (token, zero) pair queries never read.
+                if order.side == 0:
+                    order.base_ref = want_ref
+                    order.quote_ref = offered_ref
+                else:
+                    order.base_ref = offered_ref
+                    order.quote_ref = want_ref
 
                 # priceTerms: ONE push holding a MultiTxOutV1 blob — the exact
                 # payout outputs the maker must receive (the trailing push is
