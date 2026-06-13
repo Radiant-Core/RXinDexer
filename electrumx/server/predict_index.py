@@ -32,10 +32,13 @@ from electrumx.lib.util import pack_be_uint32, unpack_be_uint32, encode_undo, de
 from electrumx.lib.script import OpCodes
 
 OP_STATESEPARATOR = 0xbd
+OP_PUSHINPUTREFSINGLETON = 0xd8
+SINGLETON_PUSH = bytes([OP_PUSHINPUTREFSINGLETON])  # followed by the 36-byte ref operand in code
 RMKT_MAGIC = b'RMKT'
 RMKT_VERSION = 0x01
 STATE_LEN = 42
 STATE_LEN_OPT = 74
+QUESTION_MAX_BYTES = 1024  # SDK caps at 512; bound the stored/serialized question (anti chain-halt)
 
 
 class PredictDBKeys:
@@ -86,6 +89,13 @@ def parse_market_beacon(script: bytes) -> Optional[Dict[str, Any]]:
         if len(market_ref) != 36 or len(yes_ref) != 36 or len(no_ref) != 36:
             return None
         if len(c[6]) != 4 or len(c[7]) != 4 or len(c[8]) != 33:
+            return None
+        # REDTEAM-FIX (high): bound the question BEFORE decode/store. On-chain OP_RETURN pushes can be
+        # huge (Radiant relaxed datacarrier); an unbounded question would later overflow
+        # struct.pack('<H', len(q)) in MarketRecord.to_bytes() at flush time — an uncaught error in
+        # the shared write batch that would halt every indexer at that block. The SDK caps questions
+        # at MAX_QUESTION_BYTES (512); accept some headroom but reject absurd beacons outright.
+        if len(c[9]) > QUESTION_MAX_BYTES:
             return None
         question = c[9].decode('utf-8', errors='strict')
         if not question:
@@ -162,7 +172,9 @@ class MarketRecord:
             setattr(self, s, kw.get(s))
 
     def to_bytes(self) -> bytes:
-        q = (self.question or '').encode('utf-8')
+        # REDTEAM-FIX (high): truncate so struct.pack('<H', len(q)) can never overflow (belt to the
+        # parse-time cap), keeping a serialization error out of the shared flush batch.
+        q = (self.question or '').encode('utf-8')[:QUESTION_MAX_BYTES]
         return b''.join([
             self.market_ref, self.yes_ref, self.no_ref,
             struct.pack('<IIBBB', self.expiry, self.grace, self.status,
@@ -252,12 +264,22 @@ class PredictionMarketIndex:
             self.logger.info('RMKT beacon in %s rejected: marketRef not inducible by tx',
                              hash_to_hex_str(tx_hash))
             return
-        # 2) out0 must be the Market singleton carrying marketRef; read params from its state
+        # 2) out0 must be the Market singleton carrying marketRef as a SINGLETON operand, and bind
+        #    all three refs (the Market covenant references marketRef/yesRef/noRef). REDTEAM-FIX:
+        #    a bare substring "marketRef in script" check would accept a crafted non-singleton output
+        #    that merely embeds the bytes; require OP_PUSHINPUTREFSINGLETON(0xd8)+marketRef in the
+        #    code section + yes/no refs present, so the recorded market is the genuine deployment.
         if len(tx.outputs) < 3:
             return
         s0 = parse_singleton_state(tx.outputs[0].pk_script)
-        if not s0 or market_ref not in tx.outputs[0].pk_script:
-            self.logger.info('RMKT beacon in %s rejected: out0 is not the deployed singleton',
+        if not s0:
+            self.logger.info('RMKT beacon in %s rejected: out0 is not a stateful singleton output',
+                             hash_to_hex_str(tx_hash))
+            return
+        code0 = s0['code']
+        if not ((SINGLETON_PUSH + market_ref) in code0
+                and beacon['yes_ref'] in code0 and beacon['no_ref'] in code0):
+            self.logger.info('RMKT beacon in %s rejected: out0 code is not the Market singleton for these refs',
                              hash_to_hex_str(tx_hash))
             return
         # 3) out1/out2 must be genuine MARKER anchors carrying the yes/no refs + marketRef
@@ -307,12 +329,21 @@ class PredictionMarketIndex:
             return
         self._prune_old_undo_keys(batch)
         for market_ref, rec in self.market_cache.items():
+            # REDTEAM-FIX (high): build the record value BEFORE touching the batch, and never let a
+            # discovery-overlay serialization error abort the shared write batch (which would halt
+            # the chain). A bad record is logged and skipped — mirrors swap_index's flush discipline.
+            try:
+                value = rec.to_bytes()
+            except Exception:
+                self.logger.exception('predict_index: skipping un-serializable market record %s',
+                                      hash_to_hex_str(market_ref))
+                continue
             h = rec.create_height
             mkey = PredictDBKeys.MARKET + market_ref
             hkey = PredictDBKeys.BY_HEIGHT + pack_be_uint32(h) + market_ref
             self._record_undo(h, mkey)
             self._record_undo(h, hkey)
-            batch.put(mkey, rec.to_bytes())
+            batch.put(mkey, value)
             batch.put(hkey, b'')
         for h, entries in self._undo_cache.items():
             if entries:

@@ -489,6 +489,8 @@ class BlockProcessor:
             index_cache_size += self.realm_index.memory_estimate()
         if self.swap_index is not None:
             index_cache_size += self.swap_index.memory_estimate()
+        if self.predict_index is not None:
+            index_cache_size += self.predict_index.memory_estimate()
         if self.analytics_index is not None:
             index_cache_size += self.analytics_index.memory_estimate()
         utxo_MB = (db_deletes_size + utxo_cache_size) // one_MB

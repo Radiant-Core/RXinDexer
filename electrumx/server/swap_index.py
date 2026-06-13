@@ -1367,7 +1367,12 @@ class SwapIndex:
             'percent_filled': (order.filled_amount / order.amount * 100) if order.amount > 0 else 0,
             'min_fill': order.min_fill,
             'fee_rate': order.fee_rate,
-            'status': self._status_name(order.status),
+            # REDTEAM-FIX: reflect v3 expiry in EVERY read path (direct get / user-orders / REST),
+            # not just the orderbook scans — an order whose expiry_height the chain has reached
+            # reports 'expired', so a client never treats a stale order as fillable.
+            'status': ('expired' if (order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL)
+                                     and self._is_expired(order))
+                       else self._status_name(order.status)),
             'expiry_height': order.expiry_height if order.expiry_height > 0 else None,
             'fill_count': order.fill_count,
             'avg_fill_price': order.avg_fill_price,

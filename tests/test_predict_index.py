@@ -110,10 +110,48 @@ def test_reject_anchor_missing_ref():
     print('  ok: beacon rejected when an anchor does not carry its ref')
 
 
+def _push(data: bytes) -> bytes:
+    n = len(data)
+    if n < 0x4c:
+        return bytes([n]) + data
+    if n <= 0xff:
+        return bytes([0x4c, n]) + data
+    if n <= 0xffff:
+        return bytes([0x4d]) + n.to_bytes(2, 'little') + data
+    return bytes([0x4e]) + n.to_bytes(4, 'little') + data
+
+
+def _rmkt(question: bytes) -> bytes:
+    b = bytes.fromhex
+    return (bytes([0x6a]) + _push(b'RMKT') + _push(bytes([1]))
+            + _push(b(FIX['marketRef'])) + _push(b(FIX['yesRef'])) + _push(b(FIX['noRef']))
+            + _push((444444).to_bytes(4, 'little')) + _push((50).to_bytes(4, 'little'))
+            + _push(b(FIX['oracle'])) + _push(question))
+
+
+def test_reject_oversized_question():
+    # REDTEAM-FIX (high): an oversized question would later overflow struct.pack('<H', len(q)) in
+    # to_bytes() at flush -> chain-halt. parse_market_beacon must reject it BEFORE it is stored.
+    from electrumx.server.predict_index import parse_market_beacon, QUESTION_MAX_BYTES, MarketRecord
+    ok = parse_market_beacon(_rmkt(b'A' * QUESTION_MAX_BYTES))
+    assert ok is not None and ok['question'] == 'A' * QUESTION_MAX_BYTES, 'max-size question should parse'
+    huge = parse_market_beacon(_rmkt(b'A' * (QUESTION_MAX_BYTES + 1)))
+    assert huge is None, 'oversized question must be rejected at parse (anti chain-halt)'
+    over = parse_market_beacon(_rmkt(b'A' * 70000))
+    assert over is None, '70 KB question must be rejected'
+    # belt: to_bytes truncates so struct.pack('<H') can never raise even if a long question slips in
+    rec = MarketRecord(market_ref=bytes(36), yes_ref=bytes(36), no_ref=bytes(36), expiry=1, grace=1,
+                       oracle=bytes(33), status=0, optimistic=False, beacon_params_match=True,
+                       question='Z' * 100000, create_txid=bytes(32), create_height=1)
+    rec.to_bytes()  # must NOT raise
+    print('  ok: oversized question rejected at parse; to_bytes truncates (no chain-halt)')
+
+
 if __name__ == '__main__':
     test_beacon_and_state_parse()
     test_honest_market_recorded()
     test_reject_not_inducible()
     test_reject_out0_not_singleton()
     test_reject_anchor_missing_ref()
+    test_reject_oversized_question()
     print('\nALL PREDICT_INDEX TESTS PASS')
