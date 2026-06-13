@@ -1143,7 +1143,15 @@ class SwapIndex:
             return SwapOrderInfo.from_bytes(data)
         return None
     
-    def get_orderbook(self, base_ref: bytes, quote_ref: bytes, 
+    def _is_expired(self, order) -> bool:
+        """AUDIT-FIX: a v3 order with an absolute expiry_height that the chain has reached is no
+        longer fillable (the maker's pre-signed order is stale). The OrderStatus.EXPIRED enum was
+        never assigned, so without this an expired order lingered in the open book and a taker could
+        be steered to fill it. Excluded from every open-order read path below."""
+        eh = getattr(order, 'expiry_height', 0)
+        return bool(eh) and eh <= getattr(self.db, 'db_height', 0)
+
+    def get_orderbook(self, base_ref: bytes, quote_ref: bytes,
                       side: int = None, limit: int = 50) -> Dict[str, List[Dict]]:
         """
         Get orderbook for a trading pair.
@@ -1161,7 +1169,7 @@ class SwapIndex:
                     break
                 order_id = key[-36:]  # Last 36 bytes is order_id
                 order = self.get_order(order_id)
-                if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
+                if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL) and not self._is_expired(order):
                     asks.append(self._order_to_dict(order))
         
         # Get bids (buys) - highest price first (inverted in key)
@@ -1172,7 +1180,7 @@ class SwapIndex:
                     break
                 order_id = key[-36:]
                 order = self.get_order(order_id)
-                if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
+                if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL) and not self._is_expired(order):
                     bids.append(self._order_to_dict(order))
         
         return {'bids': bids, 'asks': asks}
@@ -1203,7 +1211,7 @@ class SwapIndex:
                     break
                 order_id = key[-36:]
                 order = self.get_order(order_id)
-                if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
+                if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL) and not self._is_expired(order):
                     entries.append(self._order_to_dict(order))
             return {
                 'entries': entries,
@@ -1222,7 +1230,7 @@ class SwapIndex:
 
             order_id = key[-36:]
             order = self.get_order(order_id)
-            if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL):
+            if order and order.status in (OrderStatus.OPEN, OrderStatus.PARTIAL) and not self._is_expired(order):
                 results.append(self._order_to_dict(order))
             count += 1
 

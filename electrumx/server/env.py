@@ -91,6 +91,7 @@ class Env(EnvBase):
         self.wave_index = False if minimal else self.boolean('WAVE_INDEX', True)
         self.realm_index = False if minimal else self.boolean('REALM_INDEX', True)
         self.swap_index = False if minimal else self.boolean('SWAP_INDEX', True)
+        self.predict_index = False if minimal else self.boolean('PREDICT_INDEX', True)
         self.analytics_index = False if minimal else self.boolean('ANALYTICS_INDEX', True)
         self.glyph_subscriptions = False if minimal else self.boolean('GLYPH_SUBSCRIPTIONS', True)
         self.mempool_glyph_index = False if minimal else self.boolean('MEMPOOL_GLYPH_INDEX', True)

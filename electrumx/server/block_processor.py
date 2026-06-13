@@ -59,6 +59,14 @@ except ImportError:
     HAS_SWAP_INDEX = False
     SwapIndex = None
 
+# Import PredictionMarketIndex for RadiantSwap market (RMKT beacon) discovery
+try:
+    from electrumx.server.predict_index import PredictionMarketIndex
+    HAS_PREDICT_INDEX = True
+except ImportError:
+    HAS_PREDICT_INDEX = False
+    PredictionMarketIndex = None
+
 try:
     from electrumx.server.analytics_index import AnalyticsIndex
     HAS_ANALYTICS_INDEX = True
@@ -282,6 +290,11 @@ class BlockProcessor:
         if HAS_SWAP_INDEX and getattr(env, 'swap_index', True):
             self.swap_index = SwapIndex(db, env)
             self.logger.info('Swap order indexing initialized')
+        # Prediction-market (RMKT beacon) discovery indexing
+        self.predict_index = None
+        if HAS_PREDICT_INDEX and getattr(env, 'predict_index', True):
+            self.predict_index = PredictionMarketIndex(db, env)
+            self.logger.info('Prediction-market (RMKT) discovery indexing initialized')
         self.analytics_index = None
         if HAS_ANALYTICS_INDEX and getattr(env, 'analytics_index', True):
             self.analytics_index = AnalyticsIndex(db, env)
@@ -351,6 +364,7 @@ class BlockProcessor:
                 wave_index=self.wave_index,
                 realm_index=self.realm_index,
                 swap_index=self.swap_index,
+                predict_index=self.predict_index,
                 analytics_index=self.analytics_index,
                 dmint_contracts=self.dmint_contracts,
             )
@@ -434,6 +448,7 @@ class BlockProcessor:
                          wave_index=self.wave_index,
                          realm_index=self.realm_index,
                          swap_index=self.swap_index,
+                         predict_index=self.predict_index,
                          analytics_index=self.analytics_index,
                          dmint_contracts=self.dmint_contracts)
         elapsed = time.perf_counter() - t0
@@ -788,7 +803,19 @@ class BlockProcessor:
                         raise
                     except Exception:
                         self.logger.exception(
-                            'swap_index.process_tx failed for tx %s at height %d; skipping',
+                            'swap_index.process_tx failed for %s at height %d',
+                            hash_to_hex_str(tx_hash), self.height + 1
+                        )
+
+                # RadiantSwap prediction-market discovery (RMKT beacons)
+                if self.predict_index:
+                    try:
+                        self.predict_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, spent_outpoints)
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        self.logger.exception(
+                            'predict_index.process_tx failed for tx %s at height %d; skipping',
                             hash_to_hex_str(tx_hash), self.height + 1
                         )
 

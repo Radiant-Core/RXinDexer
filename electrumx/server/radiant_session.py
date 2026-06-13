@@ -52,6 +52,13 @@ class RadiantElectrumX(GlyphAPIMixin, ElectrumX):
         return None
 
     @property
+    def predict_index(self):
+        """Access the RadiantSwap prediction-market (RMKT) discovery index."""
+        if hasattr(self, 'session_mgr') and hasattr(self.session_mgr, 'bp'):
+            return getattr(self.session_mgr.bp, 'predict_index', None)
+        return None
+
+    @property
     def realm_index(self):
         """Access the realm (realm_v1) directory index from block processor."""
         if hasattr(self, 'session_mgr') and hasattr(self.session_mgr, 'bp'):
