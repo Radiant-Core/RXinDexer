@@ -59,6 +59,13 @@ class RadiantElectrumX(GlyphAPIMixin, ElectrumX):
         return None
 
     @property
+    def royalty_index(self):
+        """Access the royalty-listing (RRYL) discovery index."""
+        if hasattr(self, 'session_mgr') and hasattr(self.session_mgr, 'bp'):
+            return getattr(self.session_mgr.bp, 'royalty_index', None)
+        return None
+
+    @property
     def realm_index(self):
         """Access the realm (realm_v1) directory index from block processor."""
         if hasattr(self, 'session_mgr') and hasattr(self.session_mgr, 'bp'):

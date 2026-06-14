@@ -67,6 +67,14 @@ except ImportError:
     HAS_PREDICT_INDEX = False
     PredictionMarketIndex = None
 
+# Import RoyaltyIndex for royalty-listing (RRYL beacon) discovery
+try:
+    from electrumx.server.royalty_index import RoyaltyIndex
+    HAS_ROYALTY_INDEX = True
+except ImportError:
+    HAS_ROYALTY_INDEX = False
+    RoyaltyIndex = None
+
 try:
     from electrumx.server.analytics_index import AnalyticsIndex
     HAS_ANALYTICS_INDEX = True
@@ -295,6 +303,12 @@ class BlockProcessor:
         if HAS_PREDICT_INDEX and getattr(env, 'predict_index', True):
             self.predict_index = PredictionMarketIndex(db, env)
             self.logger.info('Prediction-market (RMKT) discovery indexing initialized')
+        # Royalty-listing (RRYL beacon) discovery indexing — default OFF until a
+        # production deploy + backfill (see env.ROYALTY_INDEX).
+        self.royalty_index = None
+        if HAS_ROYALTY_INDEX and getattr(env, 'royalty_index', False):
+            self.royalty_index = RoyaltyIndex(db, env)
+            self.logger.info('Royalty-listing (RRYL) discovery indexing initialized')
         self.analytics_index = None
         if HAS_ANALYTICS_INDEX and getattr(env, 'analytics_index', True):
             self.analytics_index = AnalyticsIndex(db, env)
@@ -365,6 +379,7 @@ class BlockProcessor:
                 realm_index=self.realm_index,
                 swap_index=self.swap_index,
                 predict_index=self.predict_index,
+                royalty_index=self.royalty_index,
                 analytics_index=self.analytics_index,
                 dmint_contracts=self.dmint_contracts,
             )
@@ -449,6 +464,7 @@ class BlockProcessor:
                          realm_index=self.realm_index,
                          swap_index=self.swap_index,
                          predict_index=self.predict_index,
+                         royalty_index=self.royalty_index,
                          analytics_index=self.analytics_index,
                          dmint_contracts=self.dmint_contracts)
         elapsed = time.perf_counter() - t0
@@ -491,6 +507,8 @@ class BlockProcessor:
             index_cache_size += self.swap_index.memory_estimate()
         if self.predict_index is not None:
             index_cache_size += self.predict_index.memory_estimate()
+        if self.royalty_index is not None:
+            index_cache_size += self.royalty_index.memory_estimate()
         if self.analytics_index is not None:
             index_cache_size += self.analytics_index.memory_estimate()
         utxo_MB = (db_deletes_size + utxo_cache_size) // one_MB
@@ -818,6 +836,18 @@ class BlockProcessor:
                     except Exception:
                         self.logger.exception(
                             'predict_index.process_tx failed for tx %s at height %d; skipping',
+                            hash_to_hex_str(tx_hash), self.height + 1
+                        )
+
+                # Royalty-listing discovery (RRYL beacons)
+                if self.royalty_index:
+                    try:
+                        self.royalty_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, spent_outpoints)
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        self.logger.exception(
+                            'royalty_index.process_tx failed for tx %s at height %d; skipping',
                             hash_to_hex_str(tx_hash), self.height + 1
                         )
 

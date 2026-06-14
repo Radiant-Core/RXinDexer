@@ -1154,6 +1154,36 @@ class GlyphAPIMixin:
         except Exception as e:
             return {'error': str(e)}
 
+    async def royalty_get_listings(self, ref: str = None, seller: str = None,
+                                   limit: int = 100, offset: int = 0):
+        """List active royalty-covenant listings (cross-seller discovery).
+
+        With no args: the global feed of every NFT listed for sale, newest-first.
+        With ``ref`` (txid_vout or 72-hex): listings for one NFT.
+        With ``seller`` (32-byte scripthash hex): one seller's listings.
+
+        Each entry carries the full terms + ``covenant_script`` so a wallet can
+        build a purchase without the seller's off-chain descriptor.
+        """
+        self.bump_cost(2.0)
+        if not self.royalty_index:
+            return {'error': 'Royalty indexing not enabled'}
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        try:
+            ref_bytes = self._parse_ref(ref) if ref else None
+            seller_bytes = bytes.fromhex(seller) if seller else None
+            if seller_bytes is not None and len(seller_bytes) != 32:
+                return {'error': 'seller must be a 32-byte scripthash hex'}
+            return self.royalty_index.get_listings(
+                ref=ref_bytes, seller_scripthash=seller_bytes,
+                limit=limit, offset=offset,
+            )
+        except (ValueError, TypeError) as e:
+            return {'error': f'Invalid input: {e}'}
+        except Exception as e:
+            return {'error': str(e)}
+
     async def swap_get_user_unconfirmed(self, scripthash: str):
         """
         Get unconfirmed swap orders for a user.
@@ -1592,6 +1622,8 @@ GLYPH_METHODS = {
     # RadiantSwap prediction-market discovery (RMKT beacons)
     'market.get': 'market_get',
     'market.list': 'market_list',
+    # Royalty-listing discovery (RRYL beacons)
+    'royalty.get_listings': 'royalty_get_listings',
     # Mempool Glyph/Swap
     'glyph.get_unconfirmed_balance': 'glyph_get_unconfirmed_balance',
     'glyph.get_unconfirmed_txs': 'glyph_get_unconfirmed_txs',

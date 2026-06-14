@@ -127,9 +127,21 @@ def mock_daemon():
 
 
 @pytest.fixture
+def mock_royalty_index():
+    idx = Mock()
+    idx.enabled = True
+    idx.listing_cache = {}
+    idx.get_listings = Mock(return_value=[{
+        'txid': 'ab' * 32, 'vout': 0, 'ref': 'aa' * 32 + '_0',
+        'price': 100000, 'royalty_total': 5000, 'value': 600, 'status': 'active',
+    }])
+    return idx
+
+
+@pytest.fixture
 def client(mock_glyph_index, mock_wave_index, mock_swap_index,
            mock_analytics_index, mock_dmint_contracts, mock_db, mock_daemon):
-    """Create a TestClient with all mocks wired in."""
+    """Create a TestClient with all mocks wired in (no royalty index)."""
     from electrumx.server.rest_api import app, set_indexer
     set_indexer(
         mock_glyph_index, mock_db, mock_daemon,
@@ -139,6 +151,60 @@ def client(mock_glyph_index, mock_wave_index, mock_swap_index,
         dmint_contracts=mock_dmint_contracts,
     )
     return TestClient(app)
+
+
+@pytest.fixture
+def royalty_client(mock_glyph_index, mock_wave_index, mock_swap_index,
+                   mock_analytics_index, mock_dmint_contracts, mock_db,
+                   mock_daemon, mock_royalty_index):
+    """TestClient with the royalty index wired in."""
+    from electrumx.server.rest_api import app, set_indexer
+    set_indexer(
+        mock_glyph_index, mock_db, mock_daemon,
+        wave_index=mock_wave_index,
+        swap_index=mock_swap_index,
+        royalty_index=mock_royalty_index,
+        analytics_index=mock_analytics_index,
+        dmint_contracts=mock_dmint_contracts,
+    )
+    return TestClient(app)
+
+
+class TestRoyaltyEndpoints:
+
+    def test_listings_global(self, royalty_client, mock_royalty_index):
+        resp = royalty_client.get('/royalties/listings')
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list) and len(data) == 1
+        assert data[0]['price'] == 100000
+        mock_royalty_index.get_listings.assert_called_with(
+            ref=None, seller_scripthash=None, limit=100, offset=0)
+
+    def test_listings_by_ref(self, royalty_client, mock_royalty_index):
+        ref = 'cd' * 36  # 72-hex LE ref
+        resp = royalty_client.get('/royalties/listings', params={'ref': ref})
+        assert resp.status_code == 200
+        assert mock_royalty_index.get_listings.call_args.kwargs['ref'] == bytes.fromhex(ref)
+
+    def test_listings_bad_seller(self, royalty_client):
+        resp = royalty_client.get('/royalties/listings', params={'seller': 'ab'})
+        assert resp.status_code == 400  # not a 32-byte scripthash
+
+    def test_listings_unavailable_503(self, client):
+        # the default client wires no royalty index -> 503
+        resp = client.get('/royalties/listings')
+        assert resp.status_code == 503
+
+    def test_stats(self, royalty_client):
+        resp = royalty_client.get('/royalties/stats')
+        assert resp.status_code == 200
+        assert resp.json()['enabled'] is True
+
+    def test_status_reports_royalty_indexing(self, royalty_client):
+        resp = royalty_client.get('/status')
+        assert resp.status_code == 200
+        assert resp.json()['royalty_indexing'] is True
 
 
 # ===========================================================================

@@ -457,6 +457,7 @@ async def prometheus_metrics():
 _glyph_index = None
 _wave_index = None
 _swap_index = None
+_royalty_index = None
 _analytics_index = None
 _dmint_contracts = None
 _mempool = None
@@ -466,14 +467,16 @@ _start_time = time.time()
 
 
 def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
-                analytics_index=None, dmint_contracts=None, mempool=None):
+                royalty_index=None, analytics_index=None, dmint_contracts=None,
+                mempool=None):
     """Set the indexer references from the main server."""
-    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _analytics_index, _dmint_contracts, _mempool
+    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _analytics_index, _dmint_contracts, _mempool
     _glyph_index = glyph_index
     _db = db
     _daemon = daemon
     _wave_index = wave_index
     _swap_index = swap_index
+    _royalty_index = royalty_index
     _analytics_index = analytics_index
     _dmint_contracts = dmint_contracts
     _mempool = mempool
@@ -571,6 +574,7 @@ async def get_status():
 
     status["wave_indexing"] = _wave_index is not None
     status["swap_indexing"] = _swap_index is not None
+    status["royalty_indexing"] = _royalty_index is not None
     status["analytics_indexing"] = _analytics_index is not None
     status["dmint_contracts"] = _dmint_contracts is not None
 
@@ -1790,6 +1794,57 @@ async def get_swap_stats():
         return {
             'enabled': getattr(_swap_index, 'enabled', False),
             'order_cache_size': len(getattr(_swap_index, 'order_cache', {})),
+        }
+    except Exception as e:
+        raise _internal_error(e)
+
+
+# =============================================================================
+# ROYALTY LISTINGS
+# =============================================================================
+
+def _ensure_royalty():
+    if not _royalty_index:
+        raise HTTPException(status_code=503, detail="Royalty index not available")
+
+
+@app.get("/royalties/listings", tags=["Royalties"])
+async def get_royalty_listings(
+    ref: Optional[str] = Query(default=None, description="NFT ref, 72-hex LE (the listing's ref_le field)"),
+    seller: Optional[str] = Query(default=None, description="Seller scripthash, 32-byte hex"),
+    limit: int = Query(default=100, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """Active royalty-covenant listings. No filter -> the global feed (newest-first);
+    `ref` -> listings for one NFT; `seller` -> one seller's listings."""
+    _ensure_royalty()
+
+    try:
+        ref_bytes = bytes.fromhex(ref) if ref else None
+        seller_bytes = bytes.fromhex(seller) if seller else None
+        if seller_bytes is not None and len(seller_bytes) != 32:
+            raise HTTPException(status_code=400, detail="seller must be a 32-byte scripthash hex")
+        return _royalty_index.get_listings(
+            ref=ref_bytes, seller_scripthash=seller_bytes,
+            limit=limit, offset=offset,
+        )
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref/seller format")
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/royalties/stats", tags=["Royalties"])
+async def get_royalty_stats():
+    """Get royalty-listing indexing statistics."""
+    _ensure_royalty()
+
+    try:
+        return {
+            'enabled': getattr(_royalty_index, 'enabled', False),
+            'listing_cache_size': len(getattr(_royalty_index, 'listing_cache', {})),
         }
     except Exception as e:
         raise _internal_error(e)

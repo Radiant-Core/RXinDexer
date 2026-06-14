@@ -92,6 +92,10 @@ class Env(EnvBase):
         self.realm_index = False if minimal else self.boolean('REALM_INDEX', True)
         self.swap_index = False if minimal else self.boolean('SWAP_INDEX', True)
         self.predict_index = False if minimal else self.boolean('PREDICT_INDEX', True)
+        # Royalty-listing (RRYL beacon) discovery — default OFF: enabling it
+        # requires a reindex/backfill so historic listings populate (see
+        # docs / RoyaltyIndex). Turn on with ROYALTY_INDEX=1 after deploy.
+        self.royalty_index = False if minimal else self.boolean('ROYALTY_INDEX', False)
         self.analytics_index = False if minimal else self.boolean('ANALYTICS_INDEX', True)
         self.glyph_subscriptions = False if minimal else self.boolean('GLYPH_SUBSCRIPTIONS', True)
         self.mempool_glyph_index = False if minimal else self.boolean('MEMPOOL_GLYPH_INDEX', True)
