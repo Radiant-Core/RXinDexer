@@ -1,0 +1,10 @@
+# Local-only override: adds a PLAIN ws:// electrum service on 50013 so a browser
+# wallet (Photonic /predict e2e) can connect without a trusted TLS cert. The base
+# dev compose only exposes tcp/wss/ssl. Use with:
+#   docker compose -f docker-compose.dev.yaml -f docker-compose.wsdev.yaml up -d
+services:
+  electrumx:
+    ports:
+      - "50013:50013" # plain WS (no TLS) for loopback browser clients
+    environment:
+      - SERVICES=tcp://0.0.0.0:50010,ssl://0.0.0.0:50012,wss://0.0.0.0:50011,ws://0.0.0.0:50013,rpc://127.0.0.1:8001
