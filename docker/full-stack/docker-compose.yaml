@@ -172,6 +172,8 @@ services:
       - WAVE_GENESIS_REF=${WAVE_GENESIS_REF:-}
       # RXinDexer: Swap DEX order indexing
       - SWAP_INDEX=${SWAP_INDEX:-1}
+      # RXinDexer: Prediction-market (RMKT beacon) discovery -> market.list / market.get
+      - PREDICT_INDEX=${PREDICT_INDEX:-1}
       # RXinDexer: Real-time WebSocket subscriptions
       - GLYPH_SUBSCRIPTIONS=${GLYPH_SUBSCRIPTIONS:-1}
       # RXinDexer: Mempool indexing for unconfirmed transactions
