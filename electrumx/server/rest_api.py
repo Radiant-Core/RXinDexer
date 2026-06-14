@@ -421,6 +421,7 @@ async def _security_middleware(request: Request, call_next):
         '/v2', '/v2/',
         '/wave', '/wave/',
         '/swap', '/swap/', '/swaps', '/swaps/',
+        '/royalties', '/royalties/',
         '/mempool', '/mempool/',
         '/docs', '/openapi',
     )
