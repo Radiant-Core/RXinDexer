@@ -33,6 +33,17 @@ services:
     # connects to http://radiantd:7332/ (Host: radiantd) and the Caddy swap proxy
     # forwards Host: swap.radiantcore.org — both must be allowlisted or the
     # indexer/swap RPC breaks. (Loopback + IP-literal Hosts are exempt.)
+    #
+    # 2026-06-15 chain-split fix: a routine orphan race at block 438,204 became a
+    # PERSISTENT network partition because the v3.x defaults (parkdeepreorg=1 +
+    # finalizeheaders=1 + maxreorgdepth=6) made nodes finalize a branch within 6
+    # blocks and then REJECT the heavier chain as invalid — every 3.1.x node
+    # stranded at 438,216 while 2.1.x nodes (no finalization) followed most-work to
+    # 438,229. We disable that protection so this node always tracks the most-work
+    # chain and never strands. The matched indexer MUST retain enough undo to
+    # follow deep reorgs without a resync — see REORG_LIMIT=100 on rxindexer below.
+    # maxreorgdepth=100 documents the intended node/indexer bound (only enforced if
+    # finalizeheaders is re-enabled). Revisit once mainnet block production settles.
     command: >
       -server=1
       -printtoconsole
@@ -45,6 +56,9 @@ services:
       -txindex=1
       -swapindex=1
       -zmqpubhashblock=tcp://0.0.0.0:28332
+      -parkdeepreorg=0
+      -finalizeheaders=0
+      -maxreorgdepth=100
     healthcheck:
       test: ["CMD", "radiant-cli", "-rpcuser=${RPC_USER:-radiant}", "-rpcpassword=${RPC_PASS:?RPC_PASS must be set}", "getblockchaininfo"]
       interval: 30s
@@ -141,6 +155,14 @@ services:
       - MAX_SEND=10000000
       - MAX_RECV=10000000
       - REQUEST_TIMEOUT=60
+      # Reorg undo retention (blocks). Radiant's coin default is 6, which matched
+      # the node's old maxreorgdepth=6 (finalization guaranteed reorgs never went
+      # deeper). With finalization now DISABLED on radiantd (see the 2026-06-15
+      # chain-split note on that service), the node follows most-work to any depth,
+      # so the indexer must keep far more undo to follow deep reorgs WITHOUT a
+      # genesis resync. 100 gives ample margin over the ~13-28-block reorgs seen
+      # during the instability. (A reorg deeper than this still forces a resync.)
+      - REORG_LIMIT=100
       # Rate limiting (relaxed for local RPC to prevent throttling disconnects)
       - COST_SOFT_LIMIT=10000
       - COST_HARD_LIMIT=100000
