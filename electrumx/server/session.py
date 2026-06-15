@@ -1079,6 +1079,19 @@ class SessionManager:
         try:
             client_ip = limiter.client_ip(session)
             session.client_ip = client_ip
+            # Per-IP concurrent connection cap.  Refuse (and do NOT register, so
+            # it never counts toward the cap) when this IP already holds the
+            # max.  The session is flagged and closed on its first request via
+            # ReplyAndDisconnect (handle_request) — consistent with the existing
+            # request-triggered cost-kill path, and cheap now that a refused
+            # client backs off (Photonic reconnect backoff).  The limiter skips
+            # this cap for trusted-proxy / private IPs, so a missing
+            # X-Forwarded-For (every client collapsed onto the proxy IP) can't
+            # lock everyone out.
+            allowed, refuse_reason = limiter.check_can_register(client_ip)
+            if not allowed:
+                session._ip_conn_refused = refuse_reason
+                return
             persisted_cost = limiter.register_session(client_ip, session.session_id)
             # Seed the aiorpcx session cost from the persisted IP cost so the
             # throttle survives reconnects, but never lower the session's own
@@ -1187,6 +1200,10 @@ class SessionBase(RPCSession):
         # SessionManager.add_session.  Default None so the limiter degrades
         # gracefully if registration is skipped.
         self.client_ip = None
+        # Set to a reason string by add_session() when this connection is
+        # refused by the per-IP CONNECTION cap; handle_request() then replies
+        # with it and disconnects on the first request.
+        self._ip_conn_refused = None
         # Cost the session inherited from persisted per-IP state on connect.
         self._ip_seed_cost = 0.0
         self.daemon_request = self.session_mgr.daemon_request
@@ -1299,6 +1316,12 @@ class SessionBase(RPCSession):
         '''Handle an incoming request.  ElectrumX doesn't receive
         notifications from client sessions.
         '''
+        # Per-IP connection cap: this session's IP already held the maximum
+        # concurrent connections at accept time.  Reply with the reason and
+        # disconnect on the first request the client sends.
+        if self._ip_conn_refused:
+            raise ReplyAndDisconnect(
+                RPCError(BAD_REQUEST, self._ip_conn_refused))
         if isinstance(request, Request):
             handler = self.request_handlers.get(request.method)
         else:

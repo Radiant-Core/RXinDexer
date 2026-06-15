@@ -53,6 +53,16 @@ from typing import Dict, List, Optional, Set, Tuple
 # catches the many-connection / reconnect-loop bypass.
 DEFAULT_MAX_SUBS_PER_IP = 50000
 
+# Per-IP concurrent CONNECTION cap.  The global MAX_SESSIONS alone cannot stop
+# one host from filling every slot, so this bounds how many simultaneous
+# sessions a single client IP may hold.  Chosen generous so a shared NAT or a
+# power user (wallet + miner + a few tabs) is never affected — only a
+# single-host socket flood is.  SAFETY: never applied to a trusted-proxy /
+# private address (see check_can_register), so a missing or garbled
+# X-Forwarded-For — which collapses every real client onto the proxy's bridge
+# IP — can never lock everyone out at once.  0 disables the cap.
+DEFAULT_MAX_SESSIONS_PER_IP = 200
+
 # Hard cost ceiling per IP.  Mirrors the aiorpcx per-session cost scale
 # (cost_hard_limit defaults to 100000 in env.py); the per-IP ceiling is the
 # aggregate budget an IP may accumulate across reconnects before it is blocked.
@@ -172,6 +182,9 @@ class IPRateLimiter:
         self.trusted_proxies = self._resolve_trusted_proxies(env)
         self.max_subs_per_ip = self._resolve_int(
             env, 'max_subs_per_ip', 'MAX_SUBS_PER_IP', DEFAULT_MAX_SUBS_PER_IP)
+        self.max_sessions_per_ip = self._resolve_int(
+            env, 'max_sessions_per_ip', 'MAX_SESSIONS_PER_IP',
+            DEFAULT_MAX_SESSIONS_PER_IP)
         self.ip_cost_hard_limit = self._resolve_float(
             env, 'ip_cost_hard_limit', 'IP_COST_HARD_LIMIT',
             DEFAULT_IP_COST_HARD_LIMIT)
@@ -477,6 +490,49 @@ class IPRateLimiter:
         st.touch(now)
 
     # -- checks --------------------------------------------------------------
+
+    def connection_count(self, ip: Optional[str]) -> int:
+        """Number of live sessions currently attached to ``ip`` (0 if unknown)."""
+        if ip is None:
+            return 0
+        st = self._states.get(ip)
+        return len(st.sessions) if st is not None else 0
+
+    def check_can_register(self, ip: Optional[str],
+                           now: Optional[float] = None) -> Tuple[bool, str]:
+        """Return (allowed, reason) for opening a NEW session from ``ip``.
+
+        Enforces the per-IP concurrent CONNECTION cap — the protection the
+        global ``MAX_SESSIONS`` cannot give, since one host can otherwise fill
+        every slot.  Call this BEFORE :meth:`register_session`; a refused
+        connection must NOT be registered (so it never counts toward the cap)
+        and should be closed by the caller.
+
+        SAFETY VALVE: the cap is NEVER applied to an IP inside the
+        trusted-proxy allowlist.  Behind a reverse proxy, :meth:`client_ip`
+        returns the proxy's OWN address whenever ``X-Forwarded-For`` is missing
+        or garbled — collapsing every real client onto one IP.  Capping that
+        would lock out ALL clients simultaneously, so we decline to cap it
+        (better a no-op than a self-inflicted outage; the per-session caps and
+        the per-IP cost limit still apply).
+        """
+        if not self.enabled or ip is None or self.max_sessions_per_ip <= 0:
+            return True, ''
+        # Never cap a proxy / private address — see docstring.
+        if peer_in_networks(ip, self.trusted_proxies):
+            return True, ''
+        if now is None:
+            now = time.time()
+        st = self._states.get(ip)
+        if st is None:
+            return True, ''
+        if st.blocked_until > now:
+            return False, (f'rate limited: IP blocked for '
+                           f'{int(st.blocked_until - now)}s')
+        if len(st.sessions) >= self.max_sessions_per_ip:
+            return False, (f'connection limit reached '
+                           f'({self.max_sessions_per_ip} per IP)')
+        return True, ''
 
     def check_cost(self, ip: Optional[str],
                    now: Optional[float] = None) -> Tuple[bool, str]:

@@ -28,6 +28,7 @@ from electrumx.server.rate_limiter import (
     init_rate_limiters,
     get_ip_rate_limiter,
     DEFAULT_MAX_SUBS_PER_IP,
+    DEFAULT_MAX_SESSIONS_PER_IP,
     DEFAULT_IP_COST_HARD_LIMIT,
     DEFAULT_RATE_BLOCK_DURATION,
     DEFAULT_IP_STATE_TTL,
@@ -594,3 +595,64 @@ def test_ip_glyph_sub_count_aggregates_live_sessions():
     assert mgr.ip_glyph_sub_count(ip) == 3
     # The other IP only has its own one sub.
     assert mgr.ip_glyph_sub_count('203.0.113.71') == 1
+
+
+# --------------------------------------------------------------------------- #
+# Per-IP concurrent CONNECTION cap (check_can_register)
+# --------------------------------------------------------------------------- #
+
+def test_connection_cap_default(monkeypatch):
+    monkeypatch.delenv('MAX_SESSIONS_PER_IP', raising=False)
+    rl = IPRateLimiter(None)
+    assert rl.max_sessions_per_ip == DEFAULT_MAX_SESSIONS_PER_IP
+
+
+def test_connection_cap_enforced_for_public_ip():
+    # A public IP (not in the trusted-proxy allowlist) is subject to the cap.
+    rl = IPRateLimiter(_env(max_sessions_per_ip=2, trust_proxy=False))
+    ip = '203.0.113.7'
+    assert rl.check_can_register(ip)[0] is True
+    rl.register_session(ip, 1)
+    assert rl.check_can_register(ip)[0] is True
+    rl.register_session(ip, 2)
+    # At the cap (2 live sessions): a third connection is refused.
+    allowed, reason = rl.check_can_register(ip)
+    assert allowed is False
+    assert 'connection limit' in reason
+    assert rl.connection_count(ip) == 2
+    # Releasing one frees a slot — the cap is concurrent, not lifetime.
+    rl.release_session(ip, 1)
+    assert rl.connection_count(ip) == 1
+    assert rl.check_can_register(ip)[0] is True
+
+
+def test_connection_cap_safety_valve_skips_trusted_proxy():
+    # An IP inside the trusted-proxy allowlist (the docker bridge / the
+    # collapsed-XFF fallback) must NEVER be capped, else a missing
+    # X-Forwarded-For would lock out every real client at once.
+    rl = IPRateLimiter(_env(max_sessions_per_ip=2, trust_proxy=True,
+                            trusted_proxies='172.18.0.0/16'))
+    proxy_ip = '172.18.0.5'
+    for sid in range(10):
+        rl.register_session(proxy_ip, sid)
+    assert rl.connection_count(proxy_ip) == 10
+    # Far over the numeric cap, yet still allowed — the safety valve holds.
+    assert rl.check_can_register(proxy_ip)[0] is True
+
+
+def test_connection_cap_disabled_when_zero():
+    rl = IPRateLimiter(_env(max_sessions_per_ip=0, trust_proxy=False))
+    ip = '203.0.113.8'
+    for sid in range(50):
+        rl.register_session(ip, sid)
+    assert rl.check_can_register(ip)[0] is True
+
+
+def test_connection_cap_blocked_ip_refused():
+    rl = IPRateLimiter(_env(max_sessions_per_ip=100, trust_proxy=False))
+    ip = '203.0.113.9'
+    st = rl._state(ip, 1000.0)
+    st.blocked_until = 2000.0
+    allowed, reason = rl.check_can_register(ip, now=1000.0)
+    assert allowed is False
+    assert 'blocked' in reason

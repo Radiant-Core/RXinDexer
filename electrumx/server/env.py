@@ -145,6 +145,13 @@ class Env(EnvBase):
         # than the per-session cap so the per-session cap governs single
         # connections and this only catches the many-connection bypass.
         self.max_subs_per_ip = self.integer('MAX_SUBS_PER_IP', 50000)
+        # Per-IP concurrent CONNECTION cap: bounds how many simultaneous
+        # sessions one client IP may hold (the global MAX_SESSIONS can't stop a
+        # single host filling every slot).  Generous by default so shared NAT /
+        # a power user is unaffected; never applied to a trusted-proxy address
+        # by the limiter, so a missing X-Forwarded-For can't lock everyone out.
+        # 0 disables.
+        self.max_sessions_per_ip = self.integer('MAX_SESSIONS_PER_IP', 200)
         # Per-IP cost ceiling and block window.
         self.ip_cost_hard_limit = self.integer('IP_COST_HARD_LIMIT', 1_000_000)
         self.rate_block_duration = self.integer('RATE_BLOCK_DURATION', 300)
