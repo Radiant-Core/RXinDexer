@@ -39,9 +39,11 @@ class AnalyticsDBKeys:
     UNDO = b'AZU'
     # Checkpoint key: stores the last fully-processed UTXO iterator key so an
     # interrupted backfill can resume instead of restarting from scratch.
-    BACKFILL_CURSOR = b'ABFC'
+    # NOTE: must NOT start with 'AB' (BALANCE prefix) or any other analytics
+    # prefix — those iterators would pick them up and misparse the values.
+    BACKFILL_CURSOR = b'BFC'
     # Presence of this key means a backfill is in progress (not yet committed).
-    BACKFILL_IN_PROGRESS = b'ABFP'
+    BACKFILL_IN_PROGRESS = b'BFP'
 
 
 BALANCE_BUCKETS = [
