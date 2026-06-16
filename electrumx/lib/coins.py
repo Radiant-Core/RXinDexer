@@ -215,6 +215,15 @@ class Radiant(Coin):
     GENESIS_ACTIVATION = 0
     RPC_PORT = 7332
     SESSIONCLS = RadiantElectrumX  # Use custom session with token support
+    # Must stay matched (>=) with Radiant Core's DEFAULT_MAX_REORG_DEPTH (69 as
+    # of node v3.1.2). The indexer retains block-undo data only for the last
+    # REORG_LIMIT blocks; if the node reorgs deeper than the indexer can undo,
+    # the indexer raises ChainError and needs a full resync. The base Coin
+    # default (6) matched the node's old finalization depth; both were raised to
+    # 69 after the 2026-06-15 deep-reorg partition so ordinary orphan races no
+    # longer strand nodes. NOTE: env.py lets a REORG_LIMIT env var override this
+    # default — clear any stale `REORG_LIMIT=6` in .env/compose so it doesn't win.
+    REORG_LIMIT = 69
 
 
 class RadiantTestnetMixin:
