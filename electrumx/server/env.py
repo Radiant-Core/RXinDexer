@@ -74,7 +74,7 @@ class Env(EnvBase):
         self.drop_client = self.custom("DROP_CLIENT", None, re.compile)
         self.cache_MB = self.integer('CACHE_MB', 1200)
 
-        # R26: use coin.REORG_LIMIT as default (Radiant coin sets 6 = node max reorg depth)
+        # R26: use coin.REORG_LIMIT as default (Radiant coin sets 69 = node max reorg depth)
         # Warn if set to an unreasonably low value
         self.reorg_limit = self.integer('REORG_LIMIT', self.coin.REORG_LIMIT)
         if self.reorg_limit < 2:
