@@ -1211,7 +1211,7 @@ class BlockProcessor:
                 await group.spawn(self.prefetcher.main_loop(self.height))
                 await group.spawn(self._process_blocks())
                 if self.analytics_index and self.height >= 0:
-                    await group.spawn(self.analytics_index.backfill(self.height))
+                    await group.spawn(self.analytics_index.backfill(self.height, caught_up_event))
 
                 async for task in group:
                     if not task.cancelled():

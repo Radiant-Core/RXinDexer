@@ -441,7 +441,7 @@ class AnalyticsIndex:
             return True
         return False
 
-    async def backfill(self, height: int):
+    async def backfill(self, height: int, caught_up_event=None):
         '''Asynchronous, checkpoint/resume UTXO backfill.
 
         Safe to run as a background task concurrent with block processing —
@@ -453,9 +453,17 @@ class AnalyticsIndex:
         from where it left off rather than restarting from the beginning.
         Exceptions are caught and logged rather than propagated, so a backfill
         failure cannot kill the block-processing task group.
+
+        caught_up_event: if supplied, the backfill waits for it to be set
+        before touching the DB.  This guarantees the DB has been reopened for
+        serving (via open_for_serving() in _on_caught_up) before the scan
+        starts, avoiding a race where utxo_db is None during the
+        sync→serve transition.
         '''
         if not self.enabled:
             return
+        if caught_up_event is not None:
+            await caught_up_event.wait()
         try:
             await self._backfill_impl(height)
         except Exception:
