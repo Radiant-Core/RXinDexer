@@ -111,6 +111,20 @@ class Env(EnvBase):
         # dMint contracts configuration
         self.dmint_contracts_file = self.default('DMINT_CONTRACTS_FILE', 'data/contracts.json')
 
+        # dMint spam denylist — comma-separated token refs in txid_vout form.
+        # Mint events for these tokens are indexed for supply tracking but
+        # history entries and per-address balance writes are silently skipped,
+        # and any stored CBOR metadata blobs (GM keys) are scrubbed on startup.
+        # Does not affect the token's GT record (it remains queryable).
+        # Example: DMINT_DENYLIST=abc123_0,def456_1
+        raw_denylist = self.default('DMINT_DENYLIST', '')
+        self.dmint_denylist: set = set()
+        if raw_denylist.strip():
+            for entry in raw_denylist.split(','):
+                entry = entry.strip()
+                if entry:
+                    self.dmint_denylist.add(entry)
+
         # Server limits to help prevent DoS
 
         self.max_send = self.integer('MAX_SEND', self.coin.DEFAULT_MAX_SEND)

@@ -500,7 +500,23 @@ class GlyphIndex:
         reorg_limit = getattr(env, 'reorg_limit', 0)
         min_keep = max(0, current_height - reorg_limit + 1) if reorg_limit else 0
         self._last_undo_pruned = min_keep - 1
-        
+
+        # dMint spam denylist: set of 36-byte binary refs whose mint events
+        # are suppressed (history + balance writes skipped; GT supply tracking
+        # still updated so the token record remains accurate and queryable).
+        self._dmint_denylist: Set[bytes] = set()
+        raw_denylist: set = getattr(env, 'dmint_denylist', set())
+        if raw_denylist:
+            for ref_str in raw_denylist:
+                try:
+                    self._dmint_denylist.add(parse_ref_any(ref_str))
+                except Exception:
+                    self.logger.warning(f'DMINT_DENYLIST: invalid ref ignored: {ref_str!r}')
+            self.logger.info(
+                f'dMint denylist active: {len(self._dmint_denylist)} token(s) — '
+                f'mint history/balance writes suppressed'
+            )
+
         if self.enabled:
             self.logger.info('Glyph token indexing enabled')
 
@@ -508,6 +524,8 @@ class GlyphIndex:
         """Called after DB is opened (utxo_db is available). Deferred from __init__."""
         if self.enabled:
             self._check_schema_version()
+            if self._dmint_denylist:
+                self._scrub_denylist_metadata()
     
     def _check_schema_version(self):
         """R21 — Verify DB schema version. Hard fail on mismatch."""
@@ -525,6 +543,40 @@ class GlyphIndex:
                     f'Delete the DB directory and restart.'
                 )
             self.logger.info(f'Glyph DB schema version {v} OK')
+
+    def _scrub_denylist_metadata(self) -> None:
+        """Delete stored CBOR metadata blobs (GM keys) for all denylisted tokens.
+
+        Called once on startup when the denylist is non-empty.  The GT token
+        record is preserved (supply/dmint fields remain queryable); only the
+        raw CBOR payload — which holds the embedded JPEG — is erased.
+
+        Safe to call repeatedly: a missing GM key is silently ignored.
+        """
+        to_delete = []
+        for token_ref in self._dmint_denylist:
+            token = self.token_cache.get(token_ref) or self.get_token(token_ref)
+            if not token or not token.metadata_hash:
+                continue
+            gm_key = GlyphDBKeys.METADATA + token.metadata_hash
+            existing = self.db.utxo_db.get(gm_key)
+            if existing is not None:
+                to_delete.append((gm_key, token_ref, len(existing)))
+
+        if not to_delete:
+            return
+
+        with self.db.utxo_db.write_batch() as batch:
+            for gm_key, token_ref, size in to_delete:
+                batch.delete(gm_key)
+                self.logger.info(
+                    f'DMINT_DENYLIST: scrubbed GM metadata blob for '
+                    f'{hash_to_hex_str(token_ref[:32])} '
+                    f'({size:,} bytes freed)'
+                )
+        self.logger.info(
+            f'DMINT_DENYLIST: scrub complete — {len(to_delete)} blob(s) deleted'
+        )
 
     @staticmethod
     def _sanitize_str(s, max_len: int) -> Optional[str]:
@@ -1081,6 +1133,11 @@ class GlyphIndex:
         self.token_cache[token_ref] = token
         self.token_height[token_ref] = height
         
+        # Denylisted tokens: supply counters already updated above; skip the
+        # history event and per-address balance writes to keep the DB lean.
+        if token_ref in self._dmint_denylist:
+            return
+
         # Record MINT event in history
         history_key = pack_history_key(token_ref, height, tx_idx)
         history_value = (struct.pack('<B', GlyphEventType.MINT) + tx_hash +
