@@ -199,6 +199,167 @@ def test_top_addresses_offset_clamped_to_pool():
     assert db.utxo_db.balance_scan_count == 1
 
 
+# ---------------------------------------------------------------------------
+# Async backfill tests
+# ---------------------------------------------------------------------------
+
+def _make_utxo_key(hashX: bytes, tx_num: int, tx_pos: int) -> bytes:
+    """Build a fake UTXO 'u'-prefix key matching the format backfill() parses."""
+    # Format: b'u' + hashX (11 bytes) + tx_pos (4 bytes LE) + tx_num (5 bytes LE)
+    return b'u' + hashX + struct.pack('<I', tx_pos) + struct.pack('<Q', tx_num)[:5]
+
+
+def test_backfill_async_completes():
+    """Async backfill populates AU/AB/AS summaries from a UTXO set."""
+    import asyncio
+    from electrumx.server.analytics_index import AnalyticsDBKeys, AnalyticsIndex
+
+    db = FakeDB()
+    env = FakeEnv()
+
+    hashX1 = b'\x01' * 11
+    hashX2 = b'\x02' * 11
+    db.utxo_db._store[_make_utxo_key(hashX1, 0, 0)] = struct.pack('<Q', 5 * env.coin.VALUE_PER_COIN)
+    db.utxo_db._store[_make_utxo_key(hashX2, 1, 0)] = struct.pack('<Q', 15 * env.coin.VALUE_PER_COIN)
+
+    idx = AnalyticsIndex(db, env)
+    asyncio.run(idx.backfill(100))
+
+    assert db.utxo_db.get(AnalyticsDBKeys.BACKFILL_IN_PROGRESS) is None
+    assert db.utxo_db.get(AnalyticsDBKeys.BACKFILL_CURSOR) is None
+
+    ab1 = db.utxo_db.get(AnalyticsDBKeys.BALANCE + hashX1)
+    ab2 = db.utxo_db.get(AnalyticsDBKeys.BALANCE + hashX2)
+    assert ab1 is not None and struct.unpack('<Q', ab1)[0] == 5 * env.coin.VALUE_PER_COIN
+    assert ab2 is not None and struct.unpack('<Q', ab2)[0] == 15 * env.coin.VALUE_PER_COIN
+
+    import json as _json
+    aging_raw = db.utxo_db.get(AnalyticsDBKeys.SUMMARY + b'age_distribution')
+    aging = _json.loads(aging_raw.decode())
+    assert aging.get('<1d', 0) == 0 or aging.get('1w-1m', 0) > 0 or any(v > 0 for v in aging.values())
+
+    lph = db.utxo_db.get(AnalyticsDBKeys.SUMMARY + b'last_processed_height')
+    assert _json.loads(lph.decode()) == 100
+
+
+def test_backfill_idempotent_when_already_done():
+    """A second call to backfill() is a no-op when already complete."""
+    import asyncio
+    from electrumx.server.analytics_index import AnalyticsDBKeys, AnalyticsIndex
+    import json as _json
+
+    db = FakeDB()
+    env = FakeEnv()
+    hashX1 = b'\x01' * 11
+    db.utxo_db._store[_make_utxo_key(hashX1, 0, 0)] = struct.pack('<Q', env.coin.VALUE_PER_COIN)
+
+    idx = AnalyticsIndex(db, env)
+    asyncio.run(idx.backfill(100))
+
+    # Overwrite the age_distribution to have older buckets populated so
+    # _needs_backfill() considers this complete (not only-<1d).
+    age_dist = {'<1d': 0, '1d-1w': 0, '1w-1m': env.coin.VALUE_PER_COIN,
+                '1m-3m': 0, '3m-6m': 0, '6m-1y': 0, '1y-2y': 0, '2y-3y': 0, '3y+': 0}
+    db.utxo_db._store[AnalyticsDBKeys.SUMMARY + b'age_distribution'] = _json.dumps(age_dist).encode()
+
+    count_before = len(db.utxo_db._store)
+    asyncio.run(idx.backfill(200))
+    assert len(db.utxo_db._store) == count_before
+
+
+def test_backfill_resumes_from_cursor():
+    """An interrupted backfill (cursor present, IN_PROGRESS set) resumes from cursor."""
+    import asyncio
+    from electrumx.server.analytics_index import AnalyticsDBKeys, AnalyticsIndex, BACKFILL_CHUNK_SIZE
+
+    db = FakeDB()
+    env = FakeEnv()
+
+    # Seed two UTXOs with sortable keys so we can simulate a mid-scan interrupt.
+    hashX1 = b'\x01' * 11
+    hashX2 = b'\x09' * 11
+    key1 = _make_utxo_key(hashX1, 0, 0)
+    key2 = _make_utxo_key(hashX2, 1, 0)
+    db.utxo_db._store[key1] = struct.pack('<Q', 3 * env.coin.VALUE_PER_COIN)
+    db.utxo_db._store[key2] = struct.pack('<Q', 7 * env.coin.VALUE_PER_COIN)
+
+    # Simulate a previously interrupted run: cursor is at key1, IN_PROGRESS set.
+    db.utxo_db._store[AnalyticsDBKeys.BACKFILL_IN_PROGRESS] = b'1'
+    db.utxo_db._store[AnalyticsDBKeys.BACKFILL_CURSOR] = key1
+
+    idx = AnalyticsIndex(db, env)
+    asyncio.run(idx.backfill(100))
+
+    # Only key2 (past the cursor) should have been processed.
+    ab2 = db.utxo_db.get(AnalyticsDBKeys.BALANCE + hashX2)
+    assert ab2 is not None, 'hashX2 balance should be written after resume'
+    assert struct.unpack('<Q', ab2)[0] == 7 * env.coin.VALUE_PER_COIN
+
+    # hashX1 was before (or at) the cursor so it must NOT have been overwritten.
+    ab1 = db.utxo_db.get(AnalyticsDBKeys.BALANCE + hashX1)
+    assert ab1 is None, 'hashX1 was before the cursor and must not be re-processed'
+
+    assert db.utxo_db.get(AnalyticsDBKeys.BACKFILL_IN_PROGRESS) is None
+    assert db.utxo_db.get(AnalyticsDBKeys.BACKFILL_CURSOR) is None
+
+
+def test_startup_completes_before_large_backfill():
+    """Regression: a pending backfill must yield control so other tasks can run.
+
+    Simulates the production crash-loop: a coroutine that represents
+    'serving has started' must be able to run to completion even while
+    the backfill is processing many UTXOs.  This proves that
+    asyncio.sleep(0) calls inside the backfill actually yield.
+    """
+    import asyncio
+    from electrumx.server.analytics_index import AnalyticsDBKeys, AnalyticsIndex
+
+    db = FakeDB()
+    env = FakeEnv()
+
+    # Seed enough UTXOs to span multiple chunks (chunk size is 10k by default,
+    # but we use 3 rows and a tiny chunk size via monkeypatching).
+    hashX_list = [bytes([i]) * 11 for i in range(1, 6)]
+    for i, hx in enumerate(hashX_list):
+        db.utxo_db._store[_make_utxo_key(hx, i, 0)] = struct.pack('<Q', env.coin.VALUE_PER_COIN)
+
+    idx = AnalyticsIndex(db, env)
+
+    results = {}
+
+    async def run():
+        served_event = asyncio.Event()
+
+        async def fake_serve():
+            served_event.set()
+
+        import electrumx.server.analytics_index as ai_mod
+        original_chunk_size = ai_mod.BACKFILL_CHUNK_SIZE
+        ai_mod.BACKFILL_CHUNK_SIZE = 2  # force multiple yields
+        try:
+            backfill_task = asyncio.ensure_future(idx.backfill(100))
+            serve_task = asyncio.ensure_future(fake_serve())
+            # Give the event loop a turn: serve_task should complete before
+            # the backfill finishes its first yield.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            results['served_before_done'] = served_event.is_set() and not backfill_task.done()
+            results['served'] = served_event.is_set()
+            await backfill_task
+            await serve_task
+        finally:
+            ai_mod.BACKFILL_CHUNK_SIZE = original_chunk_size
+
+    asyncio.run(run())
+
+    assert results.get('served'), 'serve task must have run'
+    assert results.get('served_before_done'), (
+        'serve task must complete BEFORE backfill finishes — '
+        'backfill must yield to the event loop'
+    )
+    assert db.utxo_db.get(AnalyticsDBKeys.BACKFILL_IN_PROGRESS) is None
+
+
 def test_movement_stops_scanning_past_window():
     """get_movement must not read day-keys beyond current_day (bounded scan)."""
     from electrumx.server.analytics_index import AnalyticsDBKeys, AnalyticsIndex

@@ -1186,8 +1186,9 @@ class BlockProcessor:
             if count > 0:
                 async with self.state_lock:
                     await self.flush(True)
-        if self.analytics_index and self.height >= 0:
-            self.analytics_index.backfill(self.height)
+        # Analytics backfill is deferred to a background task spawned in
+        # fetch_and_process_blocks() so it does not block the startup critical
+        # path.
 
     # --- External API
 
@@ -1209,6 +1210,8 @@ class BlockProcessor:
             async with TaskGroup() as group:
                 await group.spawn(self.prefetcher.main_loop(self.height))
                 await group.spawn(self._process_blocks())
+                if self.analytics_index and self.height >= 0:
+                    await group.spawn(self.analytics_index.backfill(self.height))
 
                 async for task in group:
                     if not task.cancelled():

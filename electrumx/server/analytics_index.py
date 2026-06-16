@@ -1,3 +1,4 @@
+import asyncio
 import heapq
 import json
 import os
@@ -24,6 +25,11 @@ TOP_ADDRESSES_POOL_SIZE = TOP_ADDRESSES_MAX_OFFSET + TOP_ADDRESSES_MAX_LIMIT
 TOP_ADDRESSES_SCAN_TTL = int(os.getenv('ANALYTICS_TOP_SCAN_TTL', '120'))
 
 
+# How many UTXO-set rows to process between asyncio yields during backfill.
+# At ~1 µs per row this is ~10 ms per chunk — keeps the event loop responsive.
+BACKFILL_CHUNK_SIZE = int(os.getenv('ANALYTICS_BACKFILL_CHUNK_SIZE', '10000'))
+
+
 class AnalyticsDBKeys:
     BALANCE = b'AB'
     DISPLAY = b'AD'
@@ -31,6 +37,11 @@ class AnalyticsDBKeys:
     SUMMARY = b'AS'
     DAILY = b'AY'
     UNDO = b'AZU'
+    # Checkpoint key: stores the last fully-processed UTXO iterator key so an
+    # interrupted backfill can resume instead of restarting from scratch.
+    BACKFILL_CURSOR = b'ABFC'
+    # Presence of this key means a backfill is in progress (not yet committed).
+    BACKFILL_IN_PROGRESS = b'ABFP'
 
 
 BALANCE_BUCKETS = [
@@ -400,39 +411,98 @@ class AnalyticsIndex:
         self._set_summary(height, b'age_distribution', age_distribution)
         self._set_summary(height, b'last_processed_height', height)
 
-    def backfill(self, height: int):
+    def _needs_backfill(self) -> bool:
+        '''Return True if a fresh (or resumed) backfill is required.
+
+        A backfill that was previously interrupted is detected by the presence
+        of the BACKFILL_IN_PROGRESS sentinel in the DB; in that case we always
+        resume rather than treating it as a completed run.
+        '''
+        # An interrupted previous run is always resumed.
+        if self.db.utxo_db.get(AnalyticsDBKeys.BACKFILL_IN_PROGRESS):
+            return True
+        current = self._get_summary(AnalyticsDBKeys.SUMMARY + b'last_processed_height', None)
+        if current is None:
+            return True
+        age_dist = self._get_summary(AnalyticsDBKeys.SUMMARY + b'age_distribution', {})
+        has_only_new_utxos = age_dist.get('<1d', 0) > 0 and all(
+            age_dist.get(label, 0) == 0
+            for threshold, label in AGE_BUCKETS
+            if label != '<1d'
+        )
+        if has_only_new_utxos:
+            self.logger.warning(
+                'Age distribution shows only <1d UTXOs (%d) - '
+                're-running backfill to fix birth heights',
+                age_dist.get('<1d', 0)
+            )
+            return True
+        return False
+
+    async def backfill(self, height: int):
+        '''Asynchronous, checkpoint/resume UTXO backfill.
+
+        Safe to run as a background task concurrent with block processing —
+        writes go directly to write_batch (bypassing shared in-memory caches)
+        so there is no race with block_processor's periodic flush().  Yields
+        to the asyncio event loop every BACKFILL_CHUNK_SIZE rows so serving is
+        never blocked for more than a few milliseconds.  Progress is
+        checkpointed to disk after each chunk so an interrupted run resumes
+        from where it left off rather than restarting from the beginning.
+        Exceptions are caught and logged rather than propagated, so a backfill
+        failure cannot kill the block-processing task group.
+        '''
         if not self.enabled:
             return
-        current = self._get_summary(AnalyticsDBKeys.SUMMARY + b'last_processed_height', None)
+        try:
+            await self._backfill_impl(height)
+        except Exception:
+            self.logger.exception('Analytics backfill failed; will retry on next startup')
 
-        # Check if age_distribution exists but only has <1d populated (indicating
-        # the indexer synced without proper backfill - all UTXOs got birth_height=current)
-        needs_backfill = current is None
-        if not needs_backfill:
-            age_dist = self._get_summary(AnalyticsDBKeys.SUMMARY + b'age_distribution', {})
-            # If only <1d has data and all other buckets are 0, we need to backfill
-            has_only_new_utxos = age_dist.get('<1d', 0) > 0 and all(
-                age_dist.get(label, 0) == 0
-                for threshold, label in AGE_BUCKETS
-                if label != '<1d'
-            )
-            if has_only_new_utxos:
-                self.logger.warning(
-                    'Age distribution shows only <1d UTXOs (%d) - '
-                    're-running backfill to fix birth heights',
-                    age_dist.get('<1d', 0)
-                )
-                needs_backfill = True
-
-        if not needs_backfill:
+    async def _backfill_impl(self, height: int):
+        if not self._needs_backfill():
             return
 
-        balance_distribution = {label: 0 for _, label in BALANCE_BUCKETS}
-        balance_amounts = {label: 0 for _, label in BALANCE_BUCKETS}
+        # Mark in-progress *before* we start so that if we crash mid-scan the
+        # next startup knows to resume rather than incorrectly believing the
+        # previous (partial) results are complete.
+        with self.db.utxo_db.write_batch() as _b:
+            _b.put(AnalyticsDBKeys.BACKFILL_IN_PROGRESS, b'1')
+
+        # Reload cursor: if we were previously interrupted, continue from the
+        # last committed position.
+        cursor_raw = self.db.utxo_db.get(AnalyticsDBKeys.BACKFILL_CURSOR)
+        resume_cursor: Optional[bytes] = cursor_raw if cursor_raw else None
+
+        if resume_cursor:
+            self.logger.info(
+                'Resuming analytics backfill from cursor %s', resume_cursor.hex()
+            )
+        else:
+            self.logger.info('Starting analytics backfill (height=%d)', height)
+
         age_distribution = {label: 0 for _, label in AGE_BUCKETS}
+        # balance_by_hashX is kept for the full scan so that all UTXOs for an
+        # address are summed before a single final AB write, avoiding races with
+        # block_processor's flush() which also writes AB keys concurrently.
         balance_by_hashX: Dict[bytes, int] = defaultdict(int)
+        # Per-chunk AU/AD accumulators — written directly to DB each chunk.
+        chunk_utxo_meta: Dict[bytes, bytes] = {}
+        chunk_display: Dict[bytes, bytes] = {}
+
         prefix = b'u'
+        chunk_count = 0
+        total_utxos = 0
+        last_key: Optional[bytes] = None
+
         for db_key, db_value in self.db.utxo_db.iterator(prefix=prefix):
+            # Skip rows already processed in a previous (interrupted) run.
+            if resume_cursor is not None:
+                if db_key <= resume_cursor:
+                    continue
+                # Past the resume point — stop skipping.
+                resume_cursor = None
+
             hashX = db_key[1:1 + HASHX_LEN]
             tx_pos = struct.unpack('<I', db_key[-9:-5])[0]
             tx_num = struct.unpack('<Q', db_key[-5:] + bytes(3))[0]
@@ -440,26 +510,76 @@ class AnalyticsIndex:
             tx_hash, birth_height = self.db.fs_tx_hash(tx_num)
             if tx_hash is None:
                 continue
+
+            # Write AU (UTXO meta) directly — bypass shared utxo_meta_cache.
+            meta_key = self._utxo_meta_key(tx_hash, tx_pos)
+            chunk_utxo_meta[meta_key] = struct.pack('<IQ', birth_height, value) + hashX
+
+            # Accumulate per-address balance across the full scan.
             balance_by_hashX[hashX] += value
-            self._put_utxo_meta(height, tx_hash, tx_pos, birth_height, value, hashX)
+
+            # Write AD (display) if not already present — bypass display_cache.
             display_key = self._display_key(hashX)
-            if self.db.utxo_db.get(display_key) is None and display_key not in self.display_cache:
-                self.display_cache[display_key] = hashX.hex().encode()
-                self.display_height[display_key] = height
+            if display_key not in chunk_display and self.db.utxo_db.get(display_key) is None:
+                chunk_display[display_key] = hashX.hex().encode()
+
             age_days = max(0, self._estimate_block_day(height) - self._estimate_block_day(birth_height))
             age_distribution[self._age_bucket_name(age_days)] += value
+            last_key = db_key
+            total_utxos += 1
+            chunk_count += 1
 
-        for hashX, amount in balance_by_hashX.items():
-            self._put_balance(height, hashX, amount)
-            bucket = self._bucket_name(amount)
-            balance_distribution[bucket] += 1
-            balance_amounts[bucket] += amount
+            if chunk_count >= BACKFILL_CHUNK_SIZE:
+                # Flush AU/AD for this chunk directly to disk and checkpoint
+                # the cursor so a crash only loses at most one chunk of work.
+                with self.db.utxo_db.write_batch() as batch:
+                    for k, v in chunk_utxo_meta.items():
+                        batch.put(k, v)
+                    for k, v in chunk_display.items():
+                        batch.put(k, v)
+                    batch.put(AnalyticsDBKeys.BACKFILL_CURSOR, last_key)
+                chunk_utxo_meta.clear()
+                chunk_display.clear()
+                chunk_count = 0
+                self.logger.debug(
+                    'Backfill checkpoint: %d UTXOs processed so far', total_utxos
+                )
+                await asyncio.sleep(0)
 
-        self._set_summary(height, b'balance_distribution', balance_distribution)
-        self._set_summary(height, b'balance_distribution_amounts', balance_amounts)
-        self._set_summary(height, b'age_distribution', age_distribution)
-        self._set_summary(height, b'last_processed_height', height)
-        self.logger.info('Chain analytics backfill prepared')
+        # Final AU/AD flush for the trailing partial chunk.
+        with self.db.utxo_db.write_batch() as batch:
+            for k, v in chunk_utxo_meta.items():
+                batch.put(k, v)
+            for k, v in chunk_display.items():
+                batch.put(k, v)
+
+        # Write all AB (balance) keys in a single batch — this is safe because
+        # we accumulated the complete per-address total across the whole scan.
+        balance_distribution = {label: 0 for _, label in BALANCE_BUCKETS}
+        balance_amounts = {label: 0 for _, label in BALANCE_BUCKETS}
+        with self.db.utxo_db.write_batch() as batch:
+            for hashX, amount in balance_by_hashX.items():
+                if amount <= 0:
+                    continue
+                batch.put(self._balance_key(hashX), struct.pack('<Q', amount))
+                bucket = self._bucket_name(amount)
+                balance_distribution[bucket] += 1
+                balance_amounts[bucket] += amount
+
+        # Write final summaries + clear checkpoint sentinel atomically.
+        with self.db.utxo_db.write_batch() as batch:
+            for suffix, value in (
+                (b'balance_distribution', balance_distribution),
+                (b'balance_distribution_amounts', balance_amounts),
+                (b'age_distribution', age_distribution),
+                (b'last_processed_height', height),
+            ):
+                batch.put(AnalyticsDBKeys.SUMMARY + suffix, json.dumps(value).encode())
+            batch.delete(AnalyticsDBKeys.BACKFILL_CURSOR)
+            batch.delete(AnalyticsDBKeys.BACKFILL_IN_PROGRESS)
+        self.logger.info(
+            'Chain analytics backfill complete (%d UTXOs processed)', total_utxos
+        )
 
     def _recompute_balance_distribution(self) -> Dict[str, int]:
         """Recompute balance distribution from actual per-address balances."""
