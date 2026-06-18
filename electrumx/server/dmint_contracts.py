@@ -136,7 +136,7 @@ class DMintContractsManager:
         # Load existing contracts, then strip anything already on the denylist
         self._load_contracts()
         self._load_denylist()
-        self._purge_denied()
+        # self._purge_denied()  # Disabled to preserve token data
 
     def _load_denylist(self) -> bool:
         """Reload denylist if the file's mtime has changed. Returns True if reloaded."""
@@ -380,7 +380,7 @@ class DMintContractsManager:
         # Hot-reload denylist before sync so newly-added entries take effect on
         # this tick. If the denylist changed, purge in-memory matches up front.
         if self._load_denylist():
-            self._purge_denied()
+            # self._purge_denied()  # Disabled to preserve token data
 
         updated = 0
         # Track which refs the index knows about so we can detect orphans
@@ -582,14 +582,14 @@ class DMintContractsManager:
     def get_contracts_simple(self) -> List[List]:
         """Get contracts in simple format for basic miners."""
         if self._load_denylist():
-            self._purge_denied()
+            # self._purge_denied()  # Disabled to preserve token data
         return [[c['ref'], c['outputs']] for c in self.contracts
                 if c.get('active', True) and not self._is_denied(c.get('ref'))]
 
     def get_contracts_extended(self, active_only: bool = True) -> Dict[str, Any]:
         """Get contracts in extended format."""
         if self._load_denylist():
-            self._purge_denied()
+            # self._purge_denied()  # Disabled to preserve token data
 
         contracts = [c for c in self.contracts if not self._is_denied(c.get('ref'))]
         if active_only:
@@ -811,7 +811,7 @@ class DMintContractsManager:
         }
 
         if self._load_denylist():
-            self._purge_denied()
+            # self._purge_denied()  # Disabled to preserve token data
 
         # Reuse the memoized base list across requests at the same height; copy
         # it so the per-request filtering/sort/pagination below never mutate the
