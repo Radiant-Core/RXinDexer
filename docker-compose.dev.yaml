@@ -18,6 +18,7 @@ services:
       - "50010:50010"   # TCP (ElectrumX protocol)
       - "50011:50011"   # WSS
       - "50012:50012"   # SSL
+      - "50020:50020"   # WS (plain, for local browser apps / regtest dev)
       - "8000:8000"     # REST API
       - "127.0.0.1:8001:8001"  # Admin RPC (localhost only)
     environment:
