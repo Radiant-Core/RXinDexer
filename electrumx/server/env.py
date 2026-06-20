@@ -231,10 +231,20 @@ class Env(EnvBase):
         default_services['rpc'] = {ServicePart.HOST: 'localhost', ServicePart.PORT: 8001}
         services = self._parse_services(self.default('SERVICES', ''), default_part)
 
-        # Find onion hosts
+        # Find onion hosts; refuse to start if the operator RPC binds off-host
         for service in services:
             if str(service.host).endswith('.onion'):
                 raise ServiceError(f'bad host for SERVICES: {service}')
+            if service.protocol == 'rpc':
+                host = service.host
+                if isinstance(host, (IPv4Address, IPv6Address)):
+                    loopback = host.is_loopback
+                else:
+                    loopback = str(host).lower() == 'localhost'
+                if not loopback:
+                    raise ServiceError(
+                        f'rpc service must bind a loopback address '
+                        f'(localhost, 127.0.0.1 or ::1), not {host}')
 
         return services
 

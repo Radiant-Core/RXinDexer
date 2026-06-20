@@ -136,10 +136,10 @@ def test_SERVICES_default_rpc():
     # relies on the required vars (DB_DIRECTORY etc.) being present. Without
     # this it depends on environment left over from a prior test.
     setup_base_env()
-    # This has a blank entry between commas
-    os.environ['SERVICES'] = 'rpc://foo.bar'
+    # rpc must bind a loopback host; default RPC port is applied when omitted.
+    os.environ['SERVICES'] = 'rpc://127.0.0.1'
     e = Env()
-    assert e.services[0].host == 'foo.bar'
+    assert str(e.services[0].host) == '127.0.0.1'
     # Fork default RPC port (env.py services_to_run): 8001.
     assert e.services[0].port == 8001
     os.environ['SERVICES'] = 'rpc://:800'
@@ -150,6 +150,19 @@ def test_SERVICES_default_rpc():
     e = Env()
     assert e.services[0].host == 'localhost'
     assert e.services[0].port == 8001
+
+
+def test_rpc_must_be_loopback():
+    # The operator/admin RPC must refuse to start when bound off-host.
+    setup_base_env()
+    for bad in ('rpc://0.0.0.0:8001', 'rpc://1.2.3.4:8001', 'rpc://foo.bar:8001'):
+        os.environ['SERVICES'] = bad
+        with pytest.raises(ServiceError):
+            Env()
+    # Loopback bindings are accepted.
+    for good in ('rpc://127.0.0.1:8001', 'rpc://[::1]:8001', 'rpc://localhost:8001'):
+        os.environ['SERVICES'] = good
+        Env()
 
 
 def test_bad_SERVICES():

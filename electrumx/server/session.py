@@ -1961,6 +1961,26 @@ class ElectrumX(SessionBase):
 
         self.request_handlers = handlers
 
+def _peer_is_loopback(remote):
+    '''Return True if a remote NetAddress (or None for a unix-socket / not-yet-
+    connected peer) represents a loopback peer.
+
+    Defence-in-depth for the operator/admin RPC: the RPC interface must only ever
+    be reachable on-host.  A unix-socket transport reports no remote address, so
+    None is treated as local.'''
+    if remote is None:
+        return True
+    host = getattr(remote, 'host', remote)
+    if isinstance(host, (IPv4Address, IPv6Address)):
+        return host.is_loopback
+    try:
+        return ip_address(str(host)).is_loopback
+    except ValueError:
+        # Non-numeric host (e.g. 'localhost' on a unix-socket-less transport);
+        # only the literal loopback alias is acceptable.
+        return str(host).lower() == 'localhost'
+
+
 class LocalRPC(SessionBase):
     '''A local TCP RPC server session.'''
 
@@ -1969,6 +1989,22 @@ class LocalRPC(SessionBase):
         self.client = 'RPC'
         self.connection.max_response_size = 0
         self.request_handlers = self.session_mgr.rpc_request_handlers
+        # Defence-in-depth: the operator RPC must never accept off-host peers,
+        # even if SERVICES is misconfigured to bind a non-loopback address.
+        # Reject (and disconnect on the first request) any non-loopback peer.
+        if not _peer_is_loopback(self.remote_address()):
+            self.logger.warning(
+                f'RPC connection from non-loopback peer '
+                f'{self.remote_address_string(for_log=False)}; rejected')
+            self._rpc_non_loopback = True
+        else:
+            self._rpc_non_loopback = False
+
+    async def handle_request(self, request):
+        if self._rpc_non_loopback:
+            raise ReplyAndDisconnect(
+                RPCError(BAD_REQUEST, 'RPC is restricted to loopback connections'))
+        return await super().handle_request(request)
 
     def protocol_version_string(self):
         return 'RPC'
