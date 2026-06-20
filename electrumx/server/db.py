@@ -62,7 +62,17 @@ class DB(object):
     it was shutdown uncleanly.
     '''
 
-    DB_VERSIONS = [6, 7, 8]
+    # Bumped to 9 for the reorg undo-key fix: read_ref_loc_undo_info previously
+    # read ref-loc/WAVE undo info under the plain UTXO undo key (b'U' + height)
+    # instead of the writer's key (b'RU' + height), so any reorg processed by an
+    # older build restored the WRONG (missing) ref-loc undo info. An index built
+    # with that bug may carry latent corruption, so older DB versions are dropped.
+    #
+    # NOTE: bumping this does NOT auto-rebuild. An old-version DB is a HARD STOP:
+    # read_utxo_state() raises DBError ('your UTXO DB version is ...') and the node
+    # REFUSES TO START. The operator must manually wipe the DB and resync from
+    # genesis; there is no automatic migration for this bump.
+    DB_VERSIONS = [9]
 
     class DBError(Exception):
         '''Raised on general DB errors generally indicating corruption.'''
@@ -550,7 +560,10 @@ class DB(object):
 
     def read_ref_loc_undo_info(self, height):
         '''Read undo information from a file for the current height.'''
-        return self.utxo_db.get(self.undo_key(height))
+        # Must use the same key builder as the writer (flush_ref_loc_undo_infos
+        # writes under b'RU' + height). The previous code read with undo_key
+        # (b'U' + height) so ref-loc/WAVE undo info was never found on reorg.
+        return self.utxo_db.get(self.ref_loc_undo_key(height))
 
     def flush_ref_loc_undo_infos(self, batch_put, undo_infos):
         '''undo_infos is a list of (undo_info, height) pairs.'''
@@ -582,10 +595,22 @@ class DB(object):
 
     def clear_excess_undo_info(self):
         '''Clear excess undo info.  Only most recent N are kept.'''
-        prefix = b'U'
         min_height = self.min_undo_height(self.db_height)
         keys = []
-        for key, _hist in self.utxo_db.iterator(prefix=prefix):
+        # Plain UTXO undo (b'U' + height).  Both b'U' and b'RU' undo keys end in a
+        # 4-byte big-endian height, so heights are ascending within each prefix
+        # and we can stop at the first in-window key.
+        for key, _hist in self.utxo_db.iterator(prefix=b'U'):
+            height, = unpack_be_uint32(key[-4:])
+            if height >= min_height:
+                break
+            keys.append(key)
+
+        # Ref-loc/WAVE undo (b'RU' + height) sorts under b'R', NOT b'U', so the
+        # b'U' sweep above never reaches it — before this it grew unbounded.  GC it
+        # with the SAME keep-window/height logic.  Note iterator(prefix=b'R') would
+        # also span b'r*' UTXO tables, so scope strictly to the b'RU' prefix.
+        for key, _hist in self.utxo_db.iterator(prefix=b'RU'):
             height, = unpack_be_uint32(key[-4:])
             if height >= min_height:
                 break

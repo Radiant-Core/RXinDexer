@@ -21,7 +21,7 @@ import electrumx
 from electrumx.server.daemon import DaemonError
 from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 from electrumx.lib.glyph import GlyphProtocol
-from electrumx.lib.script import is_unspendable_legacy, is_unspendable_genesis, Script
+from electrumx.lib.script import is_unspendable_legacy, is_unspendable_genesis, Script, ScriptError
 from electrumx.lib.util import (
     class_logger, pack_le_uint32, pack_le_uint64, unpack_le_uint64, unpack_le_uint32_from
 )
@@ -415,7 +415,7 @@ class BlockProcessor:
             for n, (hash1, hash2) in enumerate(zip(hashes1, hashes2)):
                 if hash1 != hash2:
                     return n
-            return len(hashes)
+            return len(hashes1)
 
         if count < 0:
             # A real reorg
@@ -586,6 +586,35 @@ class BlockProcessor:
 
         await sleep(0)
 
+    # Exception types a malformed scriptPubKey may raise while being parsed.
+    # advance_txs and _backup_txs MUST catch the identical set so the add/spend
+    # decision is symmetric (see _output_indexable).
+    _SCRIPT_PARSE_ERRORS = (ScriptError, AssertionError, ValueError, IndexError)
+
+    @classmethod
+    def _output_indexable(cls, pk_script):
+        '''Return True iff this output's UTXO is added by advance_txs (and must
+        therefore be spent by _backup_txs on reorg).
+
+        Both paths route their add/spend decision through this one predicate so
+        they cover the IDENTICAL set of outputs, by construction.  An output is
+        skipped (returns False) when it is unspendable OR when the script-parse
+        that gates put_utxo in advance_txs (Script.zero_refs) raises.  A
+        consensus-valid but degenerate scriptPubKey such as b'\\x05ab'
+        (truncated pushdata) is not unspendable yet makes zero_refs raise; if
+        advance silently skipped it while backup still tried to spend it the
+        reorg would halt with ChainError 'UTXO not found'.  Returning False here
+        from both paths keeps the UTXO set symmetric.
+        '''
+        if is_unspendable_legacy(pk_script):
+            return False
+        try:
+            # IDENTICAL parse call + exception set as advance_txs's put_utxo gate.
+            Script.zero_refs(pk_script)
+        except cls._SCRIPT_PARSE_ERRORS:
+            return False
+        return True
+
     def advance_txs(self, txs, is_unspendable):
         self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
 
@@ -675,88 +704,117 @@ class BlockProcessor:
 
             # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
-                # Ignore unspendable outputs
-                if is_unspendable(txout.pk_script):
+                # P0.3: Add the UTXO iff _output_indexable is True.  This single
+                # shared predicate (is_unspendable_legacy OR Script.zero_refs
+                # raises) is the SAME one _backup_txs uses to decide whether to
+                # spend the output on reorg, so advance-add and backup-spend
+                # cover the identical output set by construction — a malformed
+                # but spendable script (e.g. truncated pushdata) can never cause
+                # a UTXO desync / reorg halt.  An unspendable or unparsable
+                # output is skipped here.
+                if not self._output_indexable(txout.pk_script):
                     continue
 
-                # Get the hashX
-                zero_refs = Script.zero_refs(txout.pk_script)
-                hashX = script_hashX(zero_refs)
-                codeScriptHash = script_codeScriptHash(txout.pk_script)
+                # _output_indexable guarantees zero_refs() will not raise here;
+                # keep the per-tx try/except as defence-in-depth so an
+                # unforeseen parse failure still logs-and-skips rather than
+                # halting the indexer.
+                try:
+                    # Get the hashX
+                    zero_refs = Script.zero_refs(txout.pk_script)
+                    hashX = script_hashX(zero_refs)
+                    codeScriptHash = script_codeScriptHash(txout.pk_script)
+                except self._SCRIPT_PARSE_ERRORS as e:
+                    self.logger.warning(
+                        'skipping unparsable output %s:%d (%s); '
+                        'treating as unspendable',
+                        hash_to_hex_str(tx_hash), idx, e)
+                    continue
                 append_hashX(hashX)
                 cache_key = tx_hash + to_le_uint32(idx)
                 put_utxo(cache_key, hashX + codeScriptHash + tx_numb + to_le_uint64(txout.value))
                 if self.analytics_index:
                     analytics_adds.append((tx_hash, idx, hashX, txout.value, zero_refs))
 
-                all_refs, normal_refs, singleton_refs = Script.get_push_input_refs(txout.pk_script)
-                all_refs_dedup = Script.dedup_refs(all_refs)
-                normal_refs_dedup = Script.dedup_refs(normal_refs)
-                singleton_refs_dedup = Script.dedup_refs(singleton_refs)
+                # P0.3: ref/owner extraction is the script-parsing-heavy path; if
+                # it raises on a malformed script, treat this output as ref-less
+                # (the UTXO is still indexed above) and carry on with the next
+                # output.  The deterministic UTXO bookkeeping (put_utxo) lives
+                # outside this guard so the UTXO set can never desync on reorg.
+                try:
+                    all_refs, normal_refs, singleton_refs = Script.get_push_input_refs(txout.pk_script)
+                    all_refs_dedup = Script.dedup_refs(all_refs)
+                    normal_refs_dedup = Script.dedup_refs(normal_refs)
+                    singleton_refs_dedup = Script.dedup_refs(singleton_refs)
 
-                # Collect ref data for glyph indexer
-                if all_refs_dedup:
-                    vout_refs = []
+                    # Collect ref data for glyph indexer
+                    if all_refs_dedup:
+                        vout_refs = []
+                        for ref_id in all_refs_dedup.keys():
+                            ref_type = 1 if singleton_refs_dedup.get(ref_id) and not normal_refs_dedup.get(ref_id) else 0
+                            vout_refs.append((ref_id, ref_type))
+                        output_refs_by_vout[idx] = vout_refs
+                    # Save all the refs if any for the utxo
+                    refs_value = b''
                     for ref_id in all_refs_dedup.keys():
-                        ref_type = 1 if singleton_refs_dedup.get(ref_id) and not normal_refs_dedup.get(ref_id) else 0
-                        vout_refs.append((ref_id, ref_type))
-                    output_refs_by_vout[idx] = vout_refs
-                # Save all the refs if any for the utxo
-                refs_value = b''
-                for ref_id in all_refs_dedup.keys():
-                    enc_ref_type = 0
-                    # check if it's a singleton ref by first ensuring it's not in the normal refs map
-                    if not normal_refs_dedup.get(ref_id):
-                        assert singleton_refs_dedup.get(ref_id)
-                        enc_ref_type = 1
-                    refs_value += ref_id + (enc_ref_type).to_bytes(1, "little")
-                
-                # Save the refs for the outpoint
-                if len(refs_value):
-                    put_refs(cache_key, refs_value)
+                        enc_ref_type = 0
+                        # check if it's a singleton ref by first ensuring it's not in the normal refs map
+                        if not normal_refs_dedup.get(ref_id):
+                            assert singleton_refs_dedup.get(ref_id)
+                            enc_ref_type = 1
+                        refs_value += ref_id + (enc_ref_type).to_bytes(1, "little")
 
-                for ref in singleton_refs_dedup.keys():
-                    if ref in spent_outpoints:  # R13: O(1) lookup
-                        # Track singleton ref mints
-                        mints.add(ref)
-                        put_ref_mint(ref, tx_hash)
-                    else:
-                        # Track location of singleton refs
-                        put_ref_loc(ref, tx_hash)
+                    # Save the refs for the outpoint
+                    if len(refs_value):
+                        put_refs(cache_key, refs_value)
 
-                        # Save previous block's ref location if it isn't already, and ref wasn't minted this block
-                        if ref not in mints and ref not in ref_loc_undo:
-                            cur_loc = self.db.utxo_db.get(b'rl' + ref)
-                            if cur_loc:
-                                set_ref_loc_undo(ref, cur_loc)
+                    for ref in singleton_refs_dedup.keys():
+                        if ref in spent_outpoints:  # R13: O(1) lookup
+                            # Track singleton ref mints
+                            mints.add(ref)
+                            put_ref_mint(ref, tx_hash)
+                        else:
+                            # Track location of singleton refs
+                            put_ref_loc(ref, tx_hash)
 
-                    append_ref(ref)
+                            # Save previous block's ref location if it isn't already, and ref wasn't minted this block
+                            if ref not in mints and ref not in ref_loc_undo:
+                                cur_loc = self.db.utxo_db.get(b'rl' + ref)
+                                if cur_loc:
+                                    set_ref_loc_undo(ref, cur_loc)
 
-                # Track normal ref mints
-                # Location for normal refs are not tracked
-                for ref in normal_refs_dedup.keys():
-                    if ref in spent_outpoints:  # R13: O(1) lookup
-                        put_ref_mint(ref, tx_hash)
                         append_ref(ref)
 
-                # We could check for refs used in inputs that are burnt in this tx,
-                # but current burn implementations are done using op return so this may not be needed
+                    # Track normal ref mints
+                    # Location for normal refs are not tracked
+                    for ref in normal_refs_dedup.keys():
+                        if ref in spent_outpoints:  # R13: O(1) lookup
+                            put_ref_mint(ref, tx_hash)
+                            append_ref(ref)
 
-                # Collect credit for Glyph balance tracking.  The ownership index
-                # is keyed by the recipient's *base address* hashX (the locking
-                # script with the Radiant ref preamble stripped) rather than the
-                # token output's own (ref-wrapped) hashX, so that a wallet can
-                # list the tokens it holds using its normal address scripthash.
-                # The base hashX is persisted per-outpoint (b'rb' + outpoint) so
-                # the matching debit can be applied symmetrically on spend.
-                if self.glyph_index and all_refs_dedup:
-                    base_script = Script.base_locking_script(txout.pk_script)
-                    base_hashX = script_hashX(base_script)
-                    put_data(b'rb' + cache_key, base_hashX)
-                    # Carry base_script so the glyph index can persist a
-                    # resolvable owner identity (GO: hashX -> base scriptPubKey).
-                    balance_credits.append((base_hashX, txout.value,
-                                            list(all_refs_dedup.keys()), base_script))
+                    # We could check for refs used in inputs that are burnt in this tx,
+                    # but current burn implementations are done using op return so this may not be needed
+
+                    # Collect credit for Glyph balance tracking.  The ownership index
+                    # is keyed by the recipient's *base address* hashX (the locking
+                    # script with the Radiant ref preamble stripped) rather than the
+                    # token output's own (ref-wrapped) hashX, so that a wallet can
+                    # list the tokens it holds using its normal address scripthash.
+                    # The base hashX is persisted per-outpoint (b'rb' + outpoint) so
+                    # the matching debit can be applied symmetrically on spend.
+                    if self.glyph_index and all_refs_dedup:
+                        base_script = Script.base_locking_script(txout.pk_script)
+                        base_hashX = script_hashX(base_script)
+                        put_data(b'rb' + cache_key, base_hashX)
+                        # Carry base_script so the glyph index can persist a
+                        # resolvable owner identity (GO: hashX -> base scriptPubKey).
+                        balance_credits.append((base_hashX, txout.value,
+                                                list(all_refs_dedup.keys()), base_script))
+                except (ScriptError, AssertionError, ValueError, IndexError) as e:
+                    self.logger.warning(
+                        'skipping refs for malformed output %s:%d (%s); '
+                        'treating output as ref-less',
+                        hash_to_hex_str(tx_hash), idx, e)
 
             append_hashXs(hashXs)
             update_touched(hashXs)
@@ -868,7 +926,19 @@ class BlockProcessor:
             tx_num += 1
 
         if self.analytics_index and (analytics_spends or analytics_adds):
-            self.analytics_index.process_block(self.height + 1, analytics_spends, analytics_adds)
+            # Best-effort analytics overlay: a single malformed block's
+            # adversarial data must not halt the indexer.  MemoryError is
+            # re-raised (resource pressure, not a parse bug); everything else is
+            # logged and skipped while the core UTXO/ref accounting commits.
+            try:
+                self.analytics_index.process_block(self.height + 1, analytics_spends, analytics_adds)
+            except MemoryError:
+                raise
+            except Exception:
+                self.logger.exception(
+                    'analytics_index.process_block failed at height %d; skipping',
+                    self.height + 1
+                )
 
         self.db.history.add_unflushed(hashXs_by_tx, self.tx_count)
 
@@ -939,19 +1009,40 @@ class BlockProcessor:
             }
 
             for idx, txout in enumerate(tx.outputs):
-                # Spend the TX outputs.  Be careful with unspendable
-                # outputs - we didn't save those in the first place.
-                if is_unspendable(txout.pk_script):
+                # P0.3: Spend the output iff _output_indexable is True — the SAME
+                # shared predicate advance_txs uses to decide whether to add it.
+                # This guarantees advance-add and backup-spend cover the identical
+                # output set by construction, so an unspendable OR unparsable
+                # output (e.g. a degenerate but consensus-valid scriptPubKey like
+                # b'\x05ab' whose zero_refs raises while is_unspendable_legacy is
+                # False) is skipped symmetrically on both paths.  Without this,
+                # advance skipped the output (never added) but backup still called
+                # spend_utxo on it → ChainError 'UTXO not found' → reorg HALT.
+                if not self._output_indexable(txout.pk_script):
                     continue
 
                 cache_value = spend_utxo(tx_hash, idx)
                 touched.add(cache_value[:HASHX_LEN])
-                
+
                 # Delete any refs for outpoint
                 self.delete_potential_refs(tx_hash, idx)
 
-                all_refs, _, _ = Script.get_push_input_refs(txout.pk_script)
-                all_refs_dedup = Script.dedup_refs(all_refs)
+                # _output_indexable guarantees zero_refs() parsed for this output,
+                # but get_push_input_refs is a separate parse pass.  In advance_txs
+                # the matching ref extraction is wrapped as defence-in-depth, so do
+                # the same here: a ref-parse failure must NOT abort the backup
+                # (which would halt the reorg).  The deterministic UTXO bookkeeping
+                # above (spend_utxo) stays outside the guard so the UTXO set can
+                # never desync — only the script-PARSING is guarded.
+                try:
+                    all_refs, _, _ = Script.get_push_input_refs(txout.pk_script)
+                    all_refs_dedup = Script.dedup_refs(all_refs)
+                except self._SCRIPT_PARSE_ERRORS as e:
+                    self.logger.warning(
+                        'skipping refs for malformed output %s:%d on backup (%s); '
+                        'treating output as ref-less',
+                        hash_to_hex_str(tx_hash), idx, e)
+                    all_refs_dedup = {}
 
                 for ref in all_refs_dedup.keys():
                     touched.add(script_hashX(ref))
