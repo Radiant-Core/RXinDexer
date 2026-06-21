@@ -264,32 +264,48 @@ class Deserializer(object):
             return self._read_le_uint32()
         return self._read_le_uint64()
 
+    def _ensure(self, n):
+        '''Raise ValueError (a caught parse error) instead of struct.error when
+        fewer than n bytes remain. Without this a truncated tx escapes the block/
+        mempool parse guards as an uncaught struct.error and halts the indexer.
+        One integer compare on the happy path — negligible vs the unpack.'''
+        if self.cursor + n > self.binary_length:
+            raise ValueError(
+                f'truncated tx: need {n} bytes at offset {self.cursor}, '
+                f'have {self.binary_length - self.cursor}')
+
     def _read_le_int32(self):
+        self._ensure(4)
         result, = unpack_le_int32_from(self.binary, self.cursor)
         self.cursor += 4
         return result
 
     def _read_le_int64(self):
+        self._ensure(8)
         result, = unpack_le_int64_from(self.binary, self.cursor)
         self.cursor += 8
         return result
 
     def _read_le_uint16(self):
+        self._ensure(2)
         result, = unpack_le_uint16_from(self.binary, self.cursor)
         self.cursor += 2
         return result
 
     def _read_be_uint16(self):
+        self._ensure(2)
         result, = unpack_be_uint16_from(self.binary, self.cursor)
         self.cursor += 2
         return result
 
     def _read_le_uint32(self):
+        self._ensure(4)
         result, = unpack_le_uint32_from(self.binary, self.cursor)
         self.cursor += 4
         return result
 
     def _read_le_uint64(self):
+        self._ensure(8)
         result, = unpack_le_uint64_from(self.binary, self.cursor)
         self.cursor += 8
         return result

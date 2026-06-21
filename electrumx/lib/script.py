@@ -260,8 +260,9 @@ class Script(object):
                         raise IndexError
                     n += dlen 
 
-        except Exception as e:
-            print(f'e {e}')
+        except Exception:
+            # Truncated/oversize script: surface as ScriptError (no stdout spam —
+            # this fires on every degenerate scriptPubKey during block sync).
             raise ScriptError('truncated script') from None
         # No state seperator found
         return 0
