@@ -46,15 +46,20 @@ def is_glyph_output(script: bytes) -> bool:
 |----|----------|-------------|
 | 1 | GLYPH_FT | Fungible Token |
 | 2 | GLYPH_NFT | Non-Fungible Token |
-| 3 | GLYPH_DAT | Data Attachment |
+| 3 | GLYPH_DAT | Data Storage |
 | 4 | GLYPH_DMINT | Decentralized Minting |
-| 5 | GLYPH_MUT | Mutable Metadata |
-| 6 | GLYPH_ENCRYPTED | Encrypted Content |
-| 7 | GLYPH_CONTAINER | Collection Container |
-| 8 | GLYPH_ROYALTY | On-chain Royalties |
-| 9 | GLYPH_TIMELOCK | Timelocked Reveals |
-| 10 | GLYPH_AUTH | Authority Tokens |
-| 11 | GLYPH_WAVE | WAVE Naming System |
+| 5 | GLYPH_MUT | Mutable State |
+| 6 | GLYPH_BURN | Explicit Burn |
+| 7 | GLYPH_CONTAINER | Container/Collection |
+| 8 | GLYPH_ENCRYPTED | Encrypted Content |
+| 9 | GLYPH_TIMELOCK | Timelocked Reveal |
+| 10 | GLYPH_AUTHORITY | Issuer Authority |
+| 11 | GLYPH_WAVE | WAVE Naming |
+
+> Note: these are **protocol IDs** (the values inside a payload's `p` array), not the
+> API `token_type` enum. `get_tokens_by_type` uses the separate `GlyphTokenType`
+> values (FT=1, NFT=2, DAT=3, DMINT=4, WAVE=5, CONTAINER=6, AUTHORITY=7). There is
+> no royalty *protocol*; royalties are a metadata field, not a `p` code.
 
 ### 1.3 Database Schema Extensions
 

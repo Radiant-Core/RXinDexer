@@ -148,7 +148,8 @@ class GlyphAPIMixin:
             metadata = parse_glyph_metadata(envelope)
             if metadata:
                 info = extract_token_info(metadata, envelope)
-                result['token_type'] = get_token_type(info.get('protocols', []) or [])
+                result['token_type'] = get_token_type(
+                    info.get('protocols', []) or [], metadata)
                 result['metadata'] = info
 
         # The decoded reveal metadata above (CBOR dict / CBORTag values, binary

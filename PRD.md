@@ -506,5 +506,5 @@ LOG_LEVEL=info
 3. **Backfill/reindex command:** CLI command `rxindexer_reindex --from-height=N --indexer=glyph` to rebuild specific indexes without a full resync.
 4. **DAT token content serving:** Optional endpoint to return raw embedded DAT content from the DB (base64-encoded), for DAT-aware explorers.
 5. **dMint contract live probing:** REST endpoint to query live contract UTXO state from node RPC for real-time `outputs` count (already partially implemented in Glyph-miner).
-6. **Token royalty tracking:** Index `GLYPH_ROYALTY` (protocol 8, per Glyph v2 spec) royalty basis points and beneficiary address for marketplaces.
+6. **Token royalty tracking:** Index the `royalty` *metadata field* (basis points + beneficiary address) for marketplaces. Note: royalty is a payload field, **not** a protocol `p` code — there is no `GLYPH_ROYALTY`; code 8 is `GLYPH_ENCRYPTED`.
 7. **Authority chain validation:** At index time, validate that an authority token's parent chain is intact before trusting metadata updates.

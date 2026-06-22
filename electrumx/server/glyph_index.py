@@ -726,7 +726,7 @@ class GlyphIndex:
                 continue
             
             protocols = metadata.get('p', [])
-            token_type = get_token_type(protocols)
+            token_type = get_token_type(protocols, metadata)
             self.logger.info(f'Glyph REVEAL: tx={hash_to_hex_str(tx_hash)} input={vin_idx} type={token_type} protocols={protocols}')
             
             if result_envelope is None:
@@ -780,7 +780,7 @@ class GlyphIndex:
                     continue
                 
                 protocols = metadata.get('p', [])
-                token_type = get_token_type(protocols)
+                token_type = get_token_type(protocols, metadata)
                 self.logger.info(
                     f'Glyph REVEAL (v2 Style A): tx={hash_to_hex_str(tx_hash)} '
                     f'output={vout_idx} type={token_type} protocols={protocols}'
@@ -1246,7 +1246,10 @@ class GlyphIndex:
         token = GlyphTokenInfo()
         token.ref = ref
         token.protocols = token_info['protocols']
-        token.token_type = get_token_type_id(token_info['protocols'])
+        # Pass the decoded metadata so collection parents minted without
+        # protocol code 7 (type:"container" only) still store as CONTAINER and
+        # remain queryable via glyph.get_tokens_by_type(CONTAINER).
+        token.token_type = get_token_type_id(token_info['protocols'], metadata)
         token.glyph_version = token_info.get('version', 1)
         token.name = self._sanitize_str(token_info.get('name'), 200)       # R9
         token.ticker = self._sanitize_str(token_info.get('ticker'), 16)     # R9

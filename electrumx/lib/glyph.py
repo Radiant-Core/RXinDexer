@@ -468,8 +468,33 @@ def parse_glyph_metadata(envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_token_type_id(protocols: List[int]) -> int:
-    """Map protocol list to a stable token type ID."""
+def meta_indicates_container(metadata: Optional[Dict[str, Any]]) -> bool:
+    """Heuristic container detection for tokens that omit protocol code 7.
+
+    The canonical encoding for a collection parent is ``p`` containing
+    GLYPH_CONTAINER (7).  However some wallet builds (notably the Photonic Mint
+    flow as of mid-2026) mint the parent as a plain or mutable NFT (``p=[2]`` or
+    ``p=[2,5]``) and record the "container" intent only in the metadata ``type``
+    string or a ``container`` object — they never add code 7.  Recognising those
+    here keeps such tokens classified as containers so explorers and
+    ``glyph.get_tokens_by_type(CONTAINER)`` still surface them.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get('type') == 'container':
+        return True
+    if isinstance(metadata.get('container'), dict):
+        return True
+    return False
+
+
+def get_token_type_id(protocols: List[int],
+                      metadata: Optional[Dict[str, Any]] = None) -> int:
+    """Map protocol list to a stable token type ID.
+
+    ``metadata`` is optional; when supplied it lets us recover containers that
+    were minted without protocol code 7 (see ``meta_indicates_container``).
+    """
     if not protocols:
         return GlyphTokenType.UNKNOWN
 
@@ -485,6 +510,9 @@ def get_token_type_id(protocols: List[int]) -> int:
             return GlyphTokenType.CONTAINER
         if GlyphProtocol.GLYPH_AUTHORITY in protocols:
             return GlyphTokenType.AUTHORITY
+        # Fallback for containers minted without code 7 (see helper docstring).
+        if meta_indicates_container(metadata):
+            return GlyphTokenType.CONTAINER
         return GlyphTokenType.NFT
 
     if GlyphProtocol.GLYPH_DAT in protocols:
@@ -663,29 +691,42 @@ def get_protocol_name(protocol_id: int) -> str:
     return PROTOCOL_NAMES.get(protocol_id, f'Unknown({protocol_id})')
 
 
-def get_token_type(protocols: List[int]) -> str:
-    """Get token type string from protocol list."""
+def get_token_type(protocols: List[int],
+                   metadata: Optional[Dict[str, Any]] = None) -> str:
+    """Get token type string from protocol list.
+
+    ``metadata`` is optional; when supplied it lets us recover containers that
+    were minted without protocol code 7 (see ``meta_indicates_container``).
+    """
     if GlyphProtocol.GLYPH_FT in protocols:
         if GlyphProtocol.GLYPH_DMINT in protocols:
             return 'dMint FT'
         return 'Fungible Token'
-    
+
     if GlyphProtocol.GLYPH_NFT in protocols:
         if GlyphProtocol.GLYPH_WAVE in protocols:
             return 'WAVE Name'
+        # CONTAINER is checked before AUTHORITY to match get_token_type_id's
+        # precedence, so a container+authority token ([2,7,10]) classifies
+        # consistently across both functions.
+        if GlyphProtocol.GLYPH_CONTAINER in protocols:
+            return 'Container'
         if GlyphProtocol.GLYPH_AUTHORITY in protocols:
             return 'Authority'
-        if GlyphProtocol.GLYPH_CONTAINER in protocols:
+        # Fallback for containers minted without code 7 (see helper docstring).
+        # Checked before the MUT/ENCRYPTED labels so a [2,5] container parent is
+        # reported as a Container rather than a "Mutable NFT".
+        if meta_indicates_container(metadata):
             return 'Container'
         if GlyphProtocol.GLYPH_ENCRYPTED in protocols:
             return 'Encrypted NFT'
         if GlyphProtocol.GLYPH_MUT in protocols:
             return 'Mutable NFT'
         return 'NFT'
-    
+
     if GlyphProtocol.GLYPH_DAT in protocols:
         return 'Data'
-    
+
     return 'Unknown'
 
 
@@ -709,9 +750,17 @@ def is_mutable(protocols: List[int]) -> bool:
     return GlyphProtocol.GLYPH_MUT in protocols
 
 
-def is_container(protocols: List[int]) -> bool:
-    """Check if protocols indicate a container."""
-    return GlyphProtocol.GLYPH_CONTAINER in protocols
+def is_container(protocols: List[int],
+                 metadata: Optional[Dict[str, Any]] = None) -> bool:
+    """Check if protocols indicate a container.
+
+    Recognises both the canonical encoding (protocol code 7) and containers
+    minted without it when ``metadata`` is supplied (see
+    ``meta_indicates_container``).
+    """
+    if GlyphProtocol.GLYPH_CONTAINER in protocols:
+        return True
+    return meta_indicates_container(metadata)
 
 
 def parse_dmint_contract_state(script: bytes) -> Optional[Dict[str, Any]]:
