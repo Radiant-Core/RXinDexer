@@ -378,9 +378,9 @@ class DMintContractsManager:
         from electrumx.lib.glyph import GlyphProtocol
 
         # Hot-reload denylist before sync so newly-added entries take effect on
-        # this tick. If the denylist changed, purge in-memory matches up front.
-        if self._load_denylist():
-            # self._purge_denied()  # Disabled to preserve token data
+        # this tick. The in-memory purge of denied matches is intentionally
+        # disabled (self._purge_denied) to preserve token data and history.
+        self._load_denylist()
 
         updated = 0
         # Track which refs the index knows about so we can detect orphans
@@ -581,15 +581,15 @@ class DMintContractsManager:
     
     def get_contracts_simple(self) -> List[List]:
         """Get contracts in simple format for basic miners."""
-        if self._load_denylist():
-            # self._purge_denied()  # Disabled to preserve token data
+        self._load_denylist()
+        # self._purge_denied() intentionally disabled to preserve token data
         return [[c['ref'], c['outputs']] for c in self.contracts
                 if c.get('active', True) and not self._is_denied(c.get('ref'))]
 
     def get_contracts_extended(self, active_only: bool = True) -> Dict[str, Any]:
         """Get contracts in extended format."""
-        if self._load_denylist():
-            # self._purge_denied()  # Disabled to preserve token data
+        self._load_denylist()
+        # self._purge_denied() intentionally disabled to preserve token data
 
         contracts = [c for c in self.contracts if not self._is_denied(c.get('ref'))]
         if active_only:
@@ -810,8 +810,8 @@ class DMintContractsManager:
             if isinstance(algo, (int, float, str))
         }
 
-        if self._load_denylist():
-            # self._purge_denied()  # Disabled to preserve token data
+        self._load_denylist()
+        # self._purge_denied() intentionally disabled to preserve token data
 
         # Reuse the memoized base list across requests at the same height; copy
         # it so the per-request filtering/sort/pagination below never mutate the
