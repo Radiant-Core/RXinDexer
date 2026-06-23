@@ -141,9 +141,62 @@ scripthash above. The zeroed-ref behavior only matters for token scripts; see §
 
 ### 3.3 Building and broadcasting a transaction
 
-Radiant transactions are Bitcoin-style (P2PKH inputs/outputs, standard signing). Sign
-as you would for a BCH/BSV-lineage chain, then `blockchain.transaction.broadcast` the
-raw hex. **Fee rate is the one thing you must get right — see §4.2.**
+Radiant transactions are Bitcoin-style (P2PKH inputs/outputs). Signing is standard ECDSA
+over **secp256k1**, DER + 1 sighash-type byte, low-S — same encoding as BCH/BSV. **Two
+things differ and you must get both right: the sighash *preimage* (§3.4) and the fee rate
+(§4.2).** Then `blockchain.transaction.broadcast` the raw hex.
+
+### 3.4 Signing — the Radiant sighash preimage (REQUIRED for on-device signing)
+
+A hardware wallet builds the signature digest on the secure element, so it must construct
+Radiant's preimage **exactly**. Radiant uses a BIP143/FORKID-style preimage (like BCH/BSV)
+with **one extra field**: a 32-byte `hashOutputHashes` inserted **immediately before** the
+standard `hashOutputs`. A vanilla BIP143 preimage (without it) yields signatures the node
+rejects. (Verified against Radiant Core `interpreter.cpp`, `@radiant-core/radiantjs`, and
+the C# port — they agree on layout, sizes, FORKID, and digest.)
+
+**Preimage field order** (each input signed independently):
+
+| # | Field | Bytes |
+|---|---|---|
+| 1 | `nVersion` | 4 (LE) |
+| 2 | `hashPrevouts` | 32 |
+| 3 | `hashSequence` | 32 |
+| 4 | `outpoint` of this input (32B txid + 4B vout LE) | 36 |
+| 5 | `scriptCode` (varint length + bytes) | var |
+| 6 | `value` of the UTXO being spent | 8 (LE) |
+| 7 | `nSequence` of this input | 4 |
+| 8 | **`hashOutputHashes`** ← Radiant-specific | 32 |
+| 9 | `hashOutputs` (standard BIP143) | 32 |
+| 10 | `nLockTime` | 4 |
+| 11 | `sighashType` | 4 (LE) |
+
+**Double-SHA256** the buffer → the 32-byte digest to sign. (Double-SHA256 — *not* the
+SHA512-256 used for block headers.) Sighash type = `SIGHASH_ALL | SIGHASH_FORKID = 0x41`,
+serialized as uint32 LE `0x00000041` (fork value 0).
+
+**Computing `hashOutputHashes`** (field 8): for **each output** build a 4-field summary,
+concatenate all summaries, then double-SHA256 the result:
+
+1. `value` — 8 bytes LE
+2. `scriptPubKeyHash` — **double-SHA256 of the output's scriptPubKey** (32 bytes)
+3. `totalRefs` — 4 bytes LE = count of distinct push-refs in the output
+4. `refsHash` — 32 bytes: all-zero if the output has no push-refs; else double-SHA256 of
+   the output's push-ref operands (each a 36-byte `uint288`), **deduplicated and sorted as
+   little-endian integers**, concatenated.
+
+"Push-refs" = the operands of `OP_PUSHINPUTREF` (`0xd0`) and `OP_PUSHINPUTREFSINGLETON`
+(`0xd8`) only (not the `REQUIRE`/`DISALLOW` ref opcodes).
+
+> ⚠️ **Ref sort order is consensus-critical.** Sort the 36-byte refs as **little-endian
+> integers** (compare from the last byte down), matching Radiant Core / the C# port — *not*
+> radiantjs's hex-string (big-endian) sort, which diverges when one output carries 2+
+> distinct refs. Single-ref outputs (the common token case) are unaffected.
+
+The preimage **structure is identical for plain-RXD and token inputs** — the only
+input-specific part is `scriptCode` (field 5 = that input's locking script). Tokens change
+only field 8's *value* (through outputs that carry refs), never its position or size. So
+one signer handles both RXD and token transfers.
 
 ---
 
@@ -193,57 +246,120 @@ critical consequence for coin selection, and a small API surface for display.
 `blockchain.scripthash.listunspent` returns a **`refs` array** on every UTXO:
 
 ```json
-{ "tx_hash": "…", "tx_pos": 0, "height": 812345, "value": 1000, "refs": [] }
-{ "tx_hash": "…", "tx_pos": 1, "height": 812345, "value": 1, "refs": [ { "ref": "<txid>_<vout>", "type": "normal" } ] }
+{ "tx_hash":"…", "tx_pos":0, "height":319, "value":1000, "refs":[] }
+{ "tx_hash":"…", "tx_pos":0, "height":319, "value":1,    "refs":[{ "ref":"<txid>i<vout>", "type":"single" }] }
+{ "tx_hash":"…", "tx_pos":0, "height":315, "value":300,  "refs":[{ "ref":"<txid>i<vout>", "type":"normal" }] }
 ```
 
 - **`refs` is empty (`[]`)** → plain RXD. Safe to spend as fee/change.
-- **`refs` is non-empty** → the UTXO **carries one or more tokens**. **Do not** select it
-  for fees or ordinary change — spending it as plain RXD **burns the token**.
+- **`refs` is non-empty** → the UTXO **carries a token**. **Do not** select it for fees or
+  ordinary change — spending it as plain RXD **burns the token**.
+- The ref `type` is the kind: **`"single"`** = NFT/singleton (`OP_PUSHINPUTREFSINGLETON`),
+  **`"normal"`** = FT (`OP_PUSHINPUTREF`). For an FT the UTXO's **`value` is the token
+  amount** (1 token = 1 photon). (Shapes above are from a live regtest run — §7.1.)
 
-> Even if you only support RXD send/receive, you should still honor this rule, because a
-> user's address can hold token UTXOs. Filter coin selection to `refs == []` outputs.
+> Even if you only support RXD send/receive, honor this rule — a user's address can hold
+> token UTXOs. Filter coin selection to `refs == []` outputs.
 
-### 5.2 Token query API (display)
+### 5.2 Finding an address's tokens — the zeroed-ref scripthash (IMPORTANT)
 
-RPC methods (same Electrum session as Tier 1):
+Token UTXOs are **not** indexed under the owner address's plain P2PKH scripthash. The
+indexer keys every UTXO by `sha256(zero_refs(scriptPubKey))` — it **zeroes the 36-byte ref
+operands** (of `0xd0`/`0xd8`) before hashing. So to find a token at an address, query the
+scripthash of the token's locking script **with the ref operand set to all zeros**. One
+scripthash per token *kind* per address.
 
-| Method | Use | Notes |
-|---|---|---|
-| `glyph.list_tokens` | tokens held by an address | params: `scripthash` (the standard 32-byte scripthash from §3.2), optional `limit`/`cursor`; returns `[{ref, name, balance}, …]` |
-| `glyph.get_by_ref` | token detail by ref | returns `protocols`, `type`, `name`, `ticker`, `decimals`, supply, `holder_count`, and **`deploy_txid`** |
-| `glyph.get_metadata` | parsed CBOR metadata | name/desc/image/attrs — no need to re-decode the reveal tx |
-| `glyph.get_balance` | balance for a token/address | fungible amounts |
+You still use the **same standard Electrum calls** as RXD —
+`blockchain.scripthash.listunspent` / `.subscribe` — the only trick is *which* scripthash
+you hash:
 
-REST equivalents (HTTP `:8000`; send `X-API-Key` if the operator set `REST_API_KEY`):
+**NFT scripthash** = `sha256(` these bytes `)`, then byte-reverse:
+```
+d8 <00 × 36> 75 76a914 <addr_hash160> 88ac
+└┘ └zeroed ref┘ └DROP┘ └──── P2PKH owner ────┘
+```
 
-| Endpoint | Use |
+**FT scripthash** = `sha256(` these bytes `)`, then byte-reverse:
+```
+76a914 <addr_hash160> 88ac bd d0 <00 × 36> dec0e9aa76e378e4a269e69d
+└──── P2PKH owner ────┘ └SEP┘└┘ └zeroed ref┘ └── value-sum covenant ──┘
+```
+
+Each returned UTXO carries `refs[0].ref` (the **real**, non-zeroed ref) and a `type`
+(§5.1). Rebuild the real locking script from that ref when you need to spend it (§5.3);
+sum FT UTXO `value`s for an FT balance. (Both scripthash recipes are verified end-to-end
+in §7.1.)
+
+> **Do not use `glyph.list_tokens` for wallet discovery** — the reference wallet does not,
+> and it does not return holdings keyed this way (it returns empty for the scripthashes
+> above). Discovery is purely the two zeroed-ref `listunspent`/`subscribe` queries. The
+> `glyph.*` RPCs below are for *metadata by ref*, not for enumerating an address.
+
+**Metadata / detail RPCs** (keyed by a token ref — for names, images, supply):
+
+| Method | Returns |
 |---|---|
-| `GET /glyphs/{ref}` | token detail (good for thumbnails/metadata) |
-| `GET /addresses/{ident}/glyphs` | all tokens at an address |
-| `GET /tokens/{ref}/holders` | holder list with balances |
+| `glyph.get_by_ref` | `type_name`, `name`, `ticker`, `decimals`, supply, `deploy_txid`, and a resolved `owner.address` |
+| `glyph.get_metadata` | parsed CBOR metadata (name / desc / image / attrs) |
+| `blockchain.ref.get` | a ref's current location / reveal txid |
 
-A **ref** is `"<txid>_<vout>"` (display form) or 72-hex (internal form); both are
-accepted. `glyph.get_by_ref` returns `deploy_txid`, the reveal tx that carries the
-token's CBOR envelope.
+REST equivalents (`:8000`, `X-API-Key` if `REST_API_KEY` is set): `GET /glyphs/{ref}`,
+`GET /tokens/{ref}/holders`.
 
-### 5.3 Transferring tokens (advanced)
+A **ref** is accepted as `"<txid>_<vout>"` or `"<txid>i<vout>"` (display) or 72-hex
+(internal LE). `glyph.get_by_ref` returns `deploy_txid` — the reveal tx carrying the
+token's CBOR metadata.
 
-Displaying tokens is read-only and easy (§5.2). **Transferring** a token requires
-building a Glyph-aware transaction that carries the token's input-ref through to the
-correct output — this is more than a standard P2PKH spend. We strongly recommend
-reusing the reference implementation rather than re-deriving it:
+### 5.3 Transferring tokens — wire-level construction (FT + NFT)
 
-- **`@photonic/lib`** (in the Photonic-Wallet repo) implements mint/transfer/coin-select
-  with the token-safety and ref-handling logic already correct (`coinSelect.ts`,
-  `tx.ts`, `feePolicy.ts`).
-- The **Glyph Token Standard** specifies the on-chain envelope/ref format.
+A transfer spends the token UTXO and **re-emits the ref** on the destination output's
+locking script. **No Glyph envelope (`gly`+CBOR) is emitted on a transfer** — the
+`gly`/CBOR payload exists only at mint; on every move the token survives purely via the
+colored-coin ref opcode, and the indexer recovers metadata by walking back to the genesis
+reveal.
 
-(The "zeroed-ref" detail: token-bearing scripts contain 36-byte ref operands that the
-indexer zeroes before hashing, so a token UTXO and a plain-RXD UTXO at the same address
-still index under the same Electrum scripthash. You don't need to handle this for
-display or for standard sends — only when constructing token-transfer scripts, which
-`@photonic/lib` handles for you.)
+**Rules common to FT and NFT:**
+
+- **Ref encoding:** the 36-byte ref operand is the outpoint **little-endian** — reverse
+  *both* the 32-byte txid and the 4-byte vout from display form. (vout 0 hides byte-order
+  bugs — reversed zeros are still zeros — so test with a non-zero vout.)
+- **Inputs:** spend the token UTXO(s) with a **normal `<sig> <pubkey>` P2PKH scriptSig** —
+  the ref opcodes are in the *locking* script you satisfy, not in the scriptSig. Fund the
+  fee from **separate plain-RXD inputs** (`refs == []`); never let a token UTXO pay the fee.
+- **Fee / change:** `fee = MIN_RELAY_FEE_RATE (10,000) × tx_size`; RXD change is a plain
+  P2PKH output. Size token inputs as P2PKH (~107-byte scriptSig), not by their longer
+  locking script.
+- **Signing:** the §3.4 preimage, `SIGHASH_ALL|FORKID` (`0x41`), per input.
+
+**NFT (singleton) — destination output script (63 bytes):**
+```
+d8 <ref:36 LE> 75 76a914 <recipient_hash160> 88ac
+```
+`OP_PUSHINPUTREFSINGLETON <ref> OP_DROP` + recipient P2PKH. Move the NFT UTXO (typically
+1 photon) to one such output. `0xd8` enforces the ref's global uniqueness.
+
+**FT (fungible amount) — destination/change output script (75 bytes):**
+```
+76a914 <hash160> 88ac bd d0 <ref:36 LE> dec0e9aa76e378e4a269e69d
+```
+P2PKH(owner) + `OP_STATESEPARATOR` + `OP_PUSHINPUTREF <ref>` + value-sum covenant tail.
+- **The amount IS the output's photon `value`** (1 token = 1 photon) — no separate field.
+- If the gathered FT inputs exceed the send amount, add a **second FT output back to the
+  sender** (same script with the sender's `hash160`) carrying the change — the FT analog of
+  UTXO change.
+- The covenant tail (bytes `dec0e9aa76e378e4a269e69d`) enforces on-chain that input
+  token-photons ≥ output token-photons under the same code-script, so send + change must
+  conserve value. ("Melt"/burn = simply omit the FT output: spend the token UTXO and emit
+  no `ftScript` output, so the token-photons go to plain RXD/fee.)
+
+**Opcode bytes** you must emit: `OP_STATESEPARATOR = 0xbd`, `OP_PUSHINPUTREF = 0xd0`,
+`OP_PUSHINPUTREFSINGLETON = 0xd8`, `OP_DROP = 0x75`.
+
+**Reference implementation (JS/TS):** `@photonic/lib` — `transfer.tsx`
+(`transferFungible` / `transferNonFungible`), `script.ts` (`ftScript` / `nftScript` /
+`ftScriptHash` / `nftScriptHash`), `coinSelect.ts` (token-safety guard + funding),
+`tx.ts` (signing), `feePolicy.ts` (the 10,000 floor). If your companion software is JS/TS,
+call these directly; otherwise mirror the byte layouts above.
 
 ---
 
@@ -252,11 +368,12 @@ display or for standard sends — only when constructing token-transfer scripts,
 1. **Phase 1 — RXD send/receive.** Standard Electrum (Tier 1) + the three §4 rules.
    Apply the §5.1 coin-selection filter so token UTXOs are never spent as fees. This
    alone is a complete, safe RXD wallet.
-2. **Phase 2 — Token display (read-only).** Add `glyph.list_tokens` / `glyph.get_by_ref`
-   / `glyph.get_metadata` (or the REST endpoints) to show balances, names, and images.
-   No signing changes.
-3. **Phase 3 — Token transfer.** Integrate Glyph-aware tx construction (reuse
-   `@photonic/lib`). Test heavily on regtest/testnet first.
+2. **Phase 2 — Token display (read-only).** Discover holdings via the §5.2 zeroed-ref
+   `listunspent` queries (one NFT + one FT scripthash per address), then `glyph.get_by_ref`
+   / `glyph.get_metadata` for names/images/supply. No signing changes.
+3. **Phase 3 — Token transfer.** Implement the §5.3 wire-level FT/NFT construction (or
+   reuse `@photonic/lib`) plus the §3.4 sighash preimage. Test heavily on regtest/testnet
+   first — the exact cycle is in §7.1.
 
 ---
 
@@ -274,8 +391,9 @@ display or for standard sends — only when constructing token-transfer scripts,
 # 3. UTXOs — verify the refs[] field is present (token-safety)
 {"id":2,"method":"blockchain.scripthash.listunspent","params":["<scripthash>"]}
 
-# 4. (tokens) list tokens at the address
-{"id":3,"method":"glyph.list_tokens","params":["<scripthash>"]}
+# 4. (tokens) find an address's tokens — listunspent on the ZEROED-REF scripthash (§5.2),
+#    NOT glyph.list_tokens. Each token UTXO carries refs[] with a type (single=NFT, normal=FT).
+{"id":3,"method":"blockchain.scripthash.listunspent","params":["<nft_or_ft_scripthash>"]}
 
 # 5. REST health / sync status
 curl http://electrumx.radiantcore.org:8000/health
@@ -284,6 +402,28 @@ curl http://electrumx.radiantcore.org:8000/health
 Do a full **regtest/testnet** cycle (derive address → fund → `listunspent` → build →
 sign → `broadcast` → confirm via `get_history`) before mainnet. For a local stack, see
 [`docs/ECOSYSTEM_SERVER_SETUP.md`](ECOSYSTEM_SERVER_SETUP.md).
+
+### 7.1 Verified end-to-end on regtest (FT + NFT)
+
+Everything in §5 is proven against a local Radiant regtest node + RXinDexer with real,
+confirmed transactions (`@photonic/lib`'s `sendFlows.regtest.test.ts`):
+
+- **FT:** mint 1000 → send 300 to B (700 change to A) → melt 700. On-chain assertions pass
+  (B = 300, A change = 700, melted output gone).
+- **NFT:** mint to A → send to B (at B, gone from A).
+
+The indexer independently confirmed each step:
+
+| Check | Result |
+|---|---|
+| Indexer logged the mints as it followed the chain | `Indexed Glyph token … type=1 name=E2E FT` and `type=2 name=E2E NFT` |
+| `glyph.get_by_ref` (NFT) | `type_name:"NFT"`, `name:"E2E NFT"`, resolved `owner.address` = recipient B |
+| **NFT discovery** — `listunspent` on the zeroed-ref `nftScriptHash(B)` | NFT UTXO: `value:1`, `refs:[{type:"single"}]` |
+| **FT discovery** — `listunspent` on the zeroed-ref `ftScriptHash(B')` | FT UTXO: `value:300`, `refs:[{type:"normal"}]` |
+| `glyph.list_tokens` on those scripthashes | **empty** — confirms discovery must use `listunspent`, not `glyph.list_tokens` |
+
+So the discovery recipe (§5.2), transfer construction (§5.3), and token-safety rule (§5.1)
+are confirmed against a live indexer, not merely described.
 
 ---
 
