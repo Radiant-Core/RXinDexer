@@ -32,8 +32,8 @@ standard used by the reference wallet, Photonic.)
 |---|---|---|
 | Coin name / ticker | `Radiant` / **RXD** | `COIN=Radiant`, `NET=mainnet\|testnet\|regtest` |
 | Base unit | **1 RXD = 100,000,000 photons** | "photon" = satoshi-equivalent; 8 decimals |
-| SLIP-44 coin type | **512** | legacy coin type `0` exists but is opt-in; use 512 |
-| Derivation (spending) | `m/44'/512'/0'/0/k` | standard BIP44 external chain |
+| SLIP-44 coin type | **512** (authoritative) **+ 0** (legacy) | use 512 going forward; **also** derive coin type `0` (Bitcoin's original path) to find legacy funds — see §3.1 |
+| Derivation (spending) | `m/44'/512'/0'/0/k` **and** legacy `m/44'/0'/0'/0/k` | external chain; scan **both** coin types for discovery |
 | Derivation (swap subaccount) | `m/44'/512'/0'/0/1` | optional, ecosystem convention |
 | Derivation (encryption key) | `m/44'/512'/0'/2/0` | optional; only if you use encrypted token payloads |
 | Address format | **legacy Base58Check** | no CashAddr; addresses look Bitcoin-style |
@@ -43,38 +43,42 @@ standard used by the reference wallet, Photonic.)
 | BIP32 xpub/xprv magic | standard Bitcoin (`0x0488B21E` / `0x0488ADE4`) | server does no key derivation |
 | Genesis hash (mainnet) | `0000000065d8ed5d8be28d6876b3ffb660ac2a6c0ca59e437e1f7a6f4e003fb4` | |
 | **Block header hash algo** | **double SHA512-256** ⚠️ | **NOT** double SHA256 — see §4.1 |
-| Electrum scripthash (plain addr) | standard `sha256(scriptPubKey)`, byte-reversed hex | see §3.1 |
+| Electrum scripthash (plain addr) | standard `sha256(scriptPubKey)`, byte-reversed hex | see §3.2 |
 | Electrum protocol version | **1.4 – 1.4.2** | negotiate via `server.version` |
 | **Mainnet min fee rate** | **10,000 photons/byte** | ⚠️ the `relayfee` RPC under-reports this — see §4.2 |
 
 ---
 
-## 2. Connecting
+## 2. Connecting (public WSS endpoint)
 
-RXinDexer can serve any combination of transports (set by the operator's `SERVICES`):
+You consume public infrastructure rather than self-hosting, and connect over
+**WebSocket Electrum (WSS)** — which is exactly the transport the community server
+exposes publicly.
 
-| Transport | Default port | Typical consumer |
+**Community endpoint (radiantcore):**
+
+| Service | Endpoint | Notes |
 |---|---|---|
-| TCP Electrum | `50010` | desktop/embedded Electrum clients, hardware-wallet backends |
-| SSL Electrum | `50012` | encrypted Electrum clients |
-| WSS (WebSocket TLS) | `50011` | browser wallets |
-| WS (plain, behind a proxy) | `50013` | reverse-proxied WebSocket |
-| REST (HTTP) | `8000` | metadata/explorer queries (optional) |
+| **WSS (WebSocket Electrum, TLS)** | **`wss://electrumx.radiantcore.org`** (port 443) | the Electrum protocol over a secure WebSocket — what you connect to |
+| REST (HTTP) | `http://electrumx.radiantcore.org:8000` (`/health`, `/glyphs/{ref}`, …) | optional; token metadata/thumbnails and a health probe |
 
-You have two options:
+A connection is exactly an ElectrumX session carried over the WebSocket: open the WSS
+socket, send `server.version`, then issue `blockchain.*` calls (newline-delimited
+JSON-RPC).
 
-1. **Use an existing public Radiant indexer.** The community server is
-   `electrumx.radiantcore.org`, exposed as **WSS on :443** (TLS-terminated by a reverse
-   proxy). If your wallet backend speaks **TCP/SSL Electrum** rather than WebSocket,
-   you'll want option 2, because the public endpoint only fronts WSS.
-2. **Run your own RXinDexer node** (recommended for a wallet vendor — you control
-   uptime, transports, and rate limits). One-page setup:
-   [`docs/ECOSYSTEM_SERVER_SETUP.md`](ECOSYSTEM_SERVER_SETUP.md). Expose whichever
-   transport your wallet uses (SSL `50012` is the usual choice for hardware wallets),
-   and front it with TLS.
+Two operational notes for depending on a public server:
 
-A connection is exactly an ElectrumX session: open the socket, send `server.version`,
-then issue `blockchain.*` calls.
+1. **Treat the endpoint as a live dependency.** The server is synced to the chain tip
+   and serving. As normal client hygiene, handle reconnects/backoff, and you can
+   sanity-check liveness at any time via `GET http://electrumx.radiantcore.org:8000/health`
+   (`status: healthy`, with `sync_height` tracking the chain tip).
+2. **Coordinate production use with the operator.** A public community server applies
+   per-IP rate limits and may change. For production wallet traffic, agree on rate-limit
+   headroom (or an allowlisted path) with the radiantcore operator before launch.
+
+(Raw TCP/SSL Electrum ports are firewalled on the public server; **WSS on :443 is the
+supported public transport**. Operators who would rather self-host can see
+[`docs/ECOSYSTEM_SERVER_SETUP.md`](ECOSYSTEM_SERVER_SETUP.md).)
 
 ---
 
@@ -97,7 +101,31 @@ These standard Electrum methods are implemented and behave as a wallet expects:
 That is the full send/receive/balance/history loop. If your firmware already supports
 an Electrum-backed coin (BTC/BCH/etc.), this tier is mostly configuration.
 
-### 3.1 Computing the scripthash
+### 3.1 Address derivation — support BOTH coin types (legacy `0` and `512`)
+
+Radiant has two HD derivation lineages, and a wallet should support **both**:
+
+- **Legacy / original — coin type `0`** (`m/44'/0'/0'/0/k`): the **same path as Bitcoin**.
+  Early Radiant wallets and some existing user funds live here.
+- **Authoritative — coin type `512`** (`m/44'/512'/0'/0/k`): the SLIP-0044-registered ID
+  for Radiant; the standard going forward.
+
+How to handle both:
+
+- **Discovery / balance:** scan addresses under **both** coin type `0` **and** `512`
+  (external `…/0/k` and change `…/1/k` chains, with your normal gap limit) and aggregate
+  the results. A wallet that derives only `512` will **miss** funds a user holds under the
+  legacy `0` path — and vice-versa.
+- **Receiving:** hand out **`512`** addresses by default (the path going forward).
+- **Spending:** inputs from either lineage are ordinary P2PKH UTXOs and can be mixed in
+  one transaction; sign each input with the key from its own path.
+- **Optional migration:** offer to sweep/consolidate legacy `0` funds onto a `512` address
+  so users converge on the authoritative path over time.
+
+The server is **path-agnostic** — it indexes by address/scripthash only — so both
+lineages work against the same endpoint with no special server support.
+
+### 3.2 Computing the scripthash
 
 For a normal P2PKH (or P2SH) address the Electrum scripthash is computed the
 **standard** way — no Radiant special-casing:
@@ -111,7 +139,7 @@ For a normal P2PKH (or P2SH) address the Electrum scripthash is computed the
 hash, but those are server internals — clients always use the standard 32-byte
 scripthash above. The zeroed-ref behavior only matters for token scripts; see §5.3.)
 
-### 3.2 Building and broadcasting a transaction
+### 3.3 Building and broadcasting a transaction
 
 Radiant transactions are Bitcoin-style (P2PKH inputs/outputs, standard signing). Sign
 as you would for a BCH/BSV-lineage chain, then `blockchain.transaction.broadcast` the
@@ -182,7 +210,7 @@ RPC methods (same Electrum session as Tier 1):
 
 | Method | Use | Notes |
 |---|---|---|
-| `glyph.list_tokens` | tokens held by an address | params: `scripthash` (the standard 32-byte scripthash from §3.1), optional `limit`/`cursor`; returns `[{ref, name, balance}, …]` |
+| `glyph.list_tokens` | tokens held by an address | params: `scripthash` (the standard 32-byte scripthash from §3.2), optional `limit`/`cursor`; returns `[{ref, name, balance}, …]` |
 | `glyph.get_by_ref` | token detail by ref | returns `protocols`, `type`, `name`, `ticker`, `decimals`, supply, `holder_count`, and **`deploy_txid`** |
 | `glyph.get_metadata` | parsed CBOR metadata | name/desc/image/attrs — no need to re-decode the reveal tx |
 | `glyph.get_balance` | balance for a token/address | fungible amounts |
@@ -235,8 +263,8 @@ display or for standard sends — only when constructing token-transfer scripts,
 ## 7. Verification / smoke test
 
 ```bash
-# 1. Handshake (replace host/port with your transport)
-#    Over TCP: e.g. `openssl s_client -connect host:50012` for SSL, then send JSON lines.
+# 1. Handshake — connect to wss://electrumx.radiantcore.org and send each request
+#    as a newline-delimited JSON-RPC frame over the WebSocket:
 {"id":0,"method":"server.version","params":["mywallet","1.4"]}
 # Expect a [server_string, "1.4.x"] result.
 
@@ -249,8 +277,8 @@ display or for standard sends — only when constructing token-transfer scripts,
 # 4. (tokens) list tokens at the address
 {"id":3,"method":"glyph.list_tokens","params":["<scripthash>"]}
 
-# 5. REST health (if you exposed :8000)
-curl http://<host>:8000/health
+# 5. REST health / sync status
+curl http://electrumx.radiantcore.org:8000/health
 ```
 
 Do a full **regtest/testnet** cycle (derive address → fund → `listunspent` → build →
