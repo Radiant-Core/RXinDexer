@@ -1260,12 +1260,23 @@ class WaveIndex:
         return results
     
     def reverse_lookup(self, scripthash: bytes, limit: int = 100) -> List[Dict[str, Any]]:
-        """Find WAVE names owned by a scripthash.
+        """Find WAVE names owned by an address.
 
-        Uses REVERSE_OWNER index: WR + scripthash + ref -> ''
+        Owners are indexed by the 11-byte ElectrumX hashX (sha256(scriptPubKey)
+        first 11 bytes, NOT reversed). Callers may pass that hashX directly, or a
+        32-byte Electrum scripthash (sha256(script) reversed, as wallets compute),
+        which we convert (reverse, then first 11 bytes). Without this, a 32-byte
+        value never prefix-matches the 11-byte owner keys and the lookup returns
+        nothing. Index: WR + hashX + ref -> ''.
         """
+        from electrumx.lib.hash import HASHX_LEN
+        if len(scripthash) == 32:
+            owner_key = scripthash[::-1][:HASHX_LEN]
+        else:
+            owner_key = scripthash[:HASHX_LEN]
+
         results = []
-        prefix = WaveDBKeys.REVERSE_OWNER + scripthash
+        prefix = WaveDBKeys.REVERSE_OWNER + owner_key
 
         for key, _value in self.db.utxo_db.iterator(prefix=prefix):
             if len(results) >= limit:
@@ -1276,9 +1287,9 @@ class WaveIndex:
             # Filter stale entries. When a name moves we update OWNER (authoritative)
             # and add a fresh reverse entry, but the previous owner's reverse entry
             # is left in place (deleting it would need reorg-fragile batch deletes).
-            # So only return refs whose CURRENT owner still matches this scripthash.
+            # So only return refs whose CURRENT owner still matches this hashX.
             owner_sh = self._get_owner(ref)
-            if owner_sh != scripthash:
+            if owner_sh != owner_key:
                 continue
 
             entry = {'ref': self._format_ref(ref)}

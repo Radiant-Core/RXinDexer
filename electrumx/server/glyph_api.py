@@ -1504,10 +1504,30 @@ class GlyphAPIMixin:
             return {'error': 'WAVE indexing not enabled'}
         
         try:
+            # reverse_lookup normalises a 32-byte scripthash or 11-byte hashX to
+            # the owner key, so either form works here.
             scripthash_bytes = bytes.fromhex(scripthash)
-            return self.wave_index.reverse_lookup(scripthash_bytes, limit=min(limit, 1000))
+            hits = self.wave_index.reverse_lookup(scripthash_bytes, limit=min(limit, 1000))
         except Exception as e:
             return {'error': str(e)}
+
+        # Enrich with the plaintext name (the wave index only stores a name_hash;
+        # the readable label lives in the Glyph token). Best-effort.
+        if getattr(self, 'glyph_index', None):
+            for hit in hits:
+                ref_str = hit.get('ref') if isinstance(hit, dict) else None
+                if not ref_str:
+                    continue
+                try:
+                    token = self.glyph_index.get_token_by_ref_str(ref_str)
+                    attrs = (token or {}).get('attrs') or {}
+                    name = attrs.get('name')
+                    if name:
+                        hit['name'] = name
+                        hit['full_name'] = f"{name}.{attrs.get('domain', 'rxd')}"
+                except Exception:
+                    pass
+        return hits
 
     async def wave_stats(self):
         """Get WAVE indexing statistics."""
