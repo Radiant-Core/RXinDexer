@@ -3,7 +3,7 @@ attrs
 plyvel
 pylru
 aiohttp>=3.3,<4.0
-websockets>=10.0,<16.0
+websockets>=16.0,<17.0
 psutil
 cbor2>=5.4.0
 
