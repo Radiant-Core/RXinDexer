@@ -342,7 +342,7 @@ class MemPool(object):
         new_hashes = list(all_hashes.difference(txs))
         if new_hashes:
             group = TaskGroup()
-            for hashes in chunks(new_hashes, 200):
+            for hashes in chunks(new_hashes, 500):
                 coro = self._fetch_and_accept(hashes, all_hashes, touched)
                 await group.spawn(coro)
 
