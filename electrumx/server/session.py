@@ -22,7 +22,7 @@ import attr
 from aiorpcx import (
     RPCSession, JSONRPCAutoDetect, JSONRPCConnection, serve_rs, serve_ws, NewlineFramer,
     TaskGroup, handler_invocation, RPCError, Request, sleep, Event, ReplyAndDisconnect,
-    timeout_after
+    timeout_after, run_in_thread
 )
 from electrumx.lib.util import (
     pack_le_uint32
@@ -1561,9 +1561,10 @@ class ElectrumX(SessionBase):
         effects.'''
         utxos = await self.db.all_utxos(hashX)
         utxos = sorted(utxos)
-        utxos.extend(await self.mempool.unordered_UTXOs(hashX))
+        mempool_utxos, spends, _delta = await run_in_thread(
+            self.mempool.combined_mempool_state, hashX)
+        utxos.extend(mempool_utxos)
         self.bump_cost(1.0 + len(utxos) / 50)
-        spends = await self.mempool.potential_spends(hashX)
 
         return [{'tx_hash': hash_to_hex_str(utxo.tx_hash),
                  'tx_pos': utxo.tx_pos,
@@ -1599,10 +1600,14 @@ class ElectrumX(SessionBase):
         return result
 
     async def get_balance(self, hashX):
-        utxos = await self.db.all_utxos(hashX)
-        confirmed = sum(utxo.value for utxo in utxos)
-        unconfirmed = await self.mempool.balance_delta(hashX)
-        self.bump_cost(1.0 + len(utxos) / 50)
+        confirmed = self.db.get_cached_balance(hashX)
+        if confirmed is None:
+            utxos = await self.db.all_utxos(hashX)
+            confirmed = sum(utxo.value for utxo in utxos)
+            self.db.set_cached_balance(hashX, confirmed)
+        _utxos, _spends, unconfirmed = await run_in_thread(
+            self.mempool.combined_mempool_state, hashX)
+        self.bump_cost(1.0 + confirmed / 500000)
         return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
 
     async def scripthash_get_balance(self, scripthash):

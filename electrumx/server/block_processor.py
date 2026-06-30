@@ -383,6 +383,8 @@ class BlockProcessor:
                 analytics_index=self.analytics_index,
                 dmint_contracts=self.dmint_contracts,
             )
+            # Reorg invalidates tx_num mappings; clear all caches.
+            self.db.invalidate_all_balances()
             height -= 1
 
         self.logger.info('backed up to height {:,d}'.format(self.height))
@@ -467,6 +469,9 @@ class BlockProcessor:
                          royalty_index=self.royalty_index,
                          analytics_index=self.analytics_index,
                          dmint_contracts=self.dmint_contracts)
+        # Invalidate cached balances for any addresses touched by this flush.
+        if self.touched:
+            self.db.invalidate_balance_cache(self.touched)
         elapsed = time.perf_counter() - t0
         _metrics.flush_seconds.observe(elapsed)  # R19
         _metrics.flush_total.inc()                # R18

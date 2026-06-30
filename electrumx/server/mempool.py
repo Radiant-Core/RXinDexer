@@ -498,6 +498,30 @@ class MemPool(object):
             result.update(tx.prevouts)
         return result
 
+    def combined_mempool_state(self, hashX):
+        '''Return (mempool_utxos, potential_spends, balance_delta) for hashX
+        in a single pass over the mempool txs touching hashX.
+
+        This replaces three separate iterations (unordered_UTXOs,
+        potential_spends, balance_delta) with one, cutting iteration
+        cost by 3x for listunspent and get_balance callers.
+        '''
+        utxos = []
+        spends = set()
+        delta = 0
+        for tx_hash in self.hashXs.get(hashX, ()):
+            tx = self.txs[tx_hash]
+            # UTXOs: outputs paying to hashX
+            for pos, (hX, value) in enumerate(tx.out_pairs):
+                if hX == hashX:
+                    utxos.append(UTXO(-1, pos, tx_hash, 0, value))
+            # Potential spends: all prevouts of txs touching hashX
+            spends.update(tx.prevouts)
+            # Balance delta: debits and credits
+            delta -= sum(v for h168, v in tx.in_pairs if h168 == hashX)
+            delta += sum(v for h168, v in tx.out_pairs if h168 == hashX)
+        return utxos, spends, delta
+
     async def codescripthash_potential_spends(self, codeScriptHash):
         """
         Return a set of (prev_hash, prev_idx) pairs from mempool

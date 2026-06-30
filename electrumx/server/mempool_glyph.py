@@ -122,6 +122,25 @@ class MempoolGlyphIndex:
         if self.swap_enabled:
             self.logger.info('Mempool Swap indexing enabled')
     
+    # Opcode bytes for fast pre-check (avoids full get_push_input_refs parse).
+    _REF_OP_BYTES = frozenset({0xd0, 0xd1, 0xd2, 0xd3, 0xd8})
+    _OP_RETURN = 0x6a
+
+    def _has_glyph_or_swap_content(self, memtx) -> bool:
+        '''Quick pre-check: do any output scripts contain ref opcodes or
+        OP_RETURN?  Plain P2PKH self-sends (cannon txs) have neither, so
+        we can skip the full Glyph/Swap processing entirely for them.
+        '''
+        for script in getattr(memtx, 'idx_to_script', None) or []:
+            if not script:
+                continue
+            if script[0] == self._OP_RETURN:
+                return True
+            for b in script:
+                if b in self._REF_OP_BYTES:
+                    return True
+        return False
+
     def process_mempool_tx(self, tx_hash: bytes, memtx) -> bool:
         """
         Process a mempool transaction (a ``MemPoolTx``) for Glyph/Swap content.
@@ -134,6 +153,12 @@ class MempoolGlyphIndex:
 
         Returns True if the transaction touched any indexed Glyph/Swap state.
         """
+        # Fast path: skip entirely for plain P2PKH txs with no ref/OP_RETURN
+        # outputs.  The debit side (spending known token outpoints) is also
+        # skipped, but a tx with no ref outputs cannot be a token transfer.
+        if not self._has_glyph_or_swap_content(memtx):
+            return False
+
         found_glyph = False
         found_swap = False
 

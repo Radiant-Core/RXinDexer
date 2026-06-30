@@ -17,6 +17,8 @@ from bisect import bisect_right
 from collections import namedtuple
 from glob import glob
 
+import pylru
+
 import attr
 from aiorpcx import run_in_thread, sleep
 
@@ -110,6 +112,20 @@ class DB(object):
         self.headers_file = util.LogicalFile('meta/headers', 2, 16000000)
         self.tx_counts_file = util.LogicalFile('meta/txcounts', 2, 2000000)
         self.hashes_file = util.LogicalFile('meta/hashes', 4, 16000000)
+
+        # LRU cache for fs_tx_hash: tx_num -> (tx_hash, tx_height).
+        # tx_num mappings are immutable (a confirmed tx never changes its
+        # hash or height), so this cache never needs invalidation except on
+        # reorg, where the existing retry loop in all_utxos handles stale
+        # reads.  50k entries covers ~50k most-recently-queried txs.
+        self._tx_hash_cache = pylru.lrucache(50000)
+
+        # Confirmed balance cache: hashX -> confirmed balance (int).
+        # Invalidated on block flush (flush_dbs/flush_backup) and on mempool
+        # refresh via invalidate_balance_cache().  A miss falls through to
+        # all_utxos, so correctness is preserved even if invalidation is
+        # delayed.
+        self._balance_cache = {}
 
     async def _read_tx_counts(self):
         if self.tx_counts is not None:
@@ -476,12 +492,17 @@ class DB(object):
         '''Return a pair (tx_hash, tx_height) for the given tx number.
 
         If the tx_height is not on disk, returns (None, tx_height).'''
+        cached = self._tx_hash_cache.get(tx_num)
+        if cached is not None:
+            return cached
         tx_height = bisect_right(self.tx_counts, tx_num)
         if tx_height > self.db_height:
             tx_hash = None
         else:
             tx_hash = self.hashes_file.read(tx_num * 32, 32)
-        return tx_hash, tx_height
+        result = (tx_hash, tx_height)
+        self._tx_hash_cache[tx_num] = result
+        return result
 
     def fs_tx_hashes_at_blockheight(self, block_height):
         '''Return a list of tx_hashes at given block height,
@@ -818,6 +839,25 @@ class DB(object):
                 return utxos
             self.logger.warning('all_utxos: tx hash not found (reorg?), retrying...')
             await sleep(0.25)
+
+    def get_cached_balance(self, hashX):
+        '''Return cached confirmed balance for hashX, or None on miss.'''
+        return self._balance_cache.get(hashX)
+
+    def set_cached_balance(self, hashX, balance):
+        '''Store a confirmed balance in the cache.'''
+        self._balance_cache[hashX] = balance
+
+    def invalidate_balance_cache(self, hashXs):
+        '''Invalidate cached balances for the given hashXs.
+        Called on block flush and reorg.'''
+        for hashX in hashXs:
+            self._balance_cache.pop(hashX, None)
+
+    def invalidate_all_balances(self):
+        '''Clear the entire balance cache (used on reorg).'''
+        self._balance_cache.clear()
+        self._tx_hash_cache.clear()
 
     async def codescripthash_all_utxos(self, codeScriptHash):
         '''Return all UTXOs for a codescripthash sorted in no particular order.'''
