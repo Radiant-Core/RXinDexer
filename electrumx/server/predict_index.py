@@ -37,7 +37,7 @@ SINGLETON_PUSH = bytes([OP_PUSHINPUTREFSINGLETON])  # followed by the 36-byte re
 RMKT_MAGIC = b'RMKT'
 RMKT_VERSION = 0x01
 STATE_LEN = 42
-STATE_LEN_OPT = 74
+STATE_LEN_OPT = 102
 QUESTION_MAX_BYTES = 1024  # SDK caps at 512; bound the stored/serialized question (anti chain-halt)
 
 

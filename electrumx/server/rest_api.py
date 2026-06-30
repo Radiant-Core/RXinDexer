@@ -407,6 +407,12 @@ async def _security_middleware(request: Request, call_next):
     # ServerErrorMiddleware, converting it to a 500. We catch it and return a
     # JSONResponse directly.
     path = request.url.path
+    # CORS preflight: an OPTIONS request carries no credentials and must reach
+    # CORSMiddleware (registered inside this one) so it can answer with the CORS
+    # headers. Gating it on the API key / rate limiter makes browsers receive a
+    # 401 on preflight and abort the real cross-origin request. Let it through.
+    if request.method == 'OPTIONS':
+        return await call_next(request)
     # Public read-only endpoints — no API key required.
     # Include both trailing-slash and bare forms so FastAPI's redirect logic
     # (which issues a 307 for /tokens → /tokens/) doesn't cause a spurious auth check.

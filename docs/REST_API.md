@@ -159,17 +159,103 @@ curl http://localhost:8000/v2/activation-status
 
 ## WAVE Naming System
 
-Endpoints for the WAVE decentralized naming protocol.
+Endpoints for the WAVE decentralized naming protocol — human-readable names
+(e.g. `alice.rxd`) backed by mutable Glyph NFTs. Names are **first-registration-wins**:
+the earliest registration of a name is *canonical* and is the only one returned by
+resolution; later duplicate registrations are tracked but never resolved.
 
-### Resolve WAVE Name
+> **Integrating a dapp?** A zero-dependency JavaScript resolver and a full guide live
+> at <https://radiantcore.org/docs/wave-names.html>
+> (source: <https://radiantcore.org/docs/wave-resolver.js>).
+
+All `/wave/*` routes are **public** (no API key) and **GET-only**.
+
+### Resolve a WAVE name
 
 -   **Endpoint**: `GET /wave/resolve/{name}`
--   **Description**: Resolves a WAVE name to its zone records (address, avatar, etc.).
+-   **Description**: Resolves a name to its canonical registration. Returns the current
+    `target` payment address, the `ref` (`"txid_vout"`), the `owner` scripthash, and a
+    `zone` record (address, display, avatar, url, TXT, …).
+-   **Query**: `include_duplicates=true` to also list non-canonical registrations.
 
-**Example Request:**
 ```bash
-curl http://localhost:8000/wave/resolve/alice
+curl https://radiantcore.org/api/wave/resolve/alice
 ```
+- Registered → `{ "name": "alice", "ref": "...", "target": "1Rxd...", "zone": {…}, "owner": "…", "available": false, "canonical": true }`
+- Unregistered → `{ "name": "nobody", "available": true, "resolved": false }`
+
+### Check availability
+
+-   **Endpoint**: `GET /wave/available/{name}`
+-   **Description**: Whether a name is free to register.
+
+```bash
+curl https://radiantcore.org/api/wave/available/myhandle
+```
+→ `{ "available": true, "name": "myhandle" }` or `{ "available": false, "ref": "…", "name": "alice" }`
+
+### List names (paginated)
+
+-   **Endpoint**: `GET /wave/names`
+-   **Description**: Lists all canonical names, newest-cursor paginated.
+-   **Query**: `limit` (default 500, max 2000); `cursor` (opaque token — pass the
+    previous response's `next_cursor`); `include_duplicates=true` optional.
+
+```bash
+curl "https://radiantcore.org/api/wave/names?limit=1000"
+# → { "names": [ { "name", "full_name", "target", "ref", "height", … } ], "total": N, "next_cursor": "…" }
+```
+Keep calling with the returned `cursor` until `next_cursor` is `null` (last page).
+
+### Other WAVE endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /wave/registrations/{name}` | Canonical registration + all duplicates. |
+| `GET /wave/reverse/{scripthash}` | All names owned by a scripthash. |
+| `GET /wave/stats` | Index health and totals. |
+
+---
+
+## Public Access: CORS & Rate Limits
+
+These apply to **every** public REST route, including `/wave/*`.
+
+### Rate limiting
+
+A per-IP token bucket guards the REST API:
+
+| Setting | Default | Env var |
+| --- | --- | --- |
+| Sustained rate | **600 req/min per IP** (10/s) | `REST_RATE_LIMIT_PER_MIN` |
+| Burst | **600** | `REST_RATE_LIMIT_BURST` |
+
+Exceeding it returns **HTTP 429** `{"detail": "Rate limit exceeded"}`. The default is
+comfortable for normal dapp use — a name lookup per payment is far below 10/s, so only
+abusive clients hit it. Behind a reverse proxy, set `TRUST_PROXY=1` and `TRUSTED_PROXIES`
+so the limiter keys on the real client IP; otherwise every user collapses into the
+proxy's single IP bucket and shares one limit.
+
+### CORS (browser dapps)
+
+Public read endpoints are meant to be callable from any origin. CORS is configured by
+FastAPI's `CORSMiddleware` via the **`ALLOWED_ORIGINS`** env var (comma-separated; use
+`*` for a fully public read API).
+
+**Single source of truth — do not also inject `Access-Control-Allow-Origin` at the
+reverse proxy (Caddy/nginx).** Two `Access-Control-Allow-Origin` headers on one response
+is invalid, and every browser rejects it — even though `curl`/Node (which don't enforce
+CORS) succeed, masking the bug. If the live deployment currently sets the header in both
+places, remove it from the proxy and let FastAPI emit the only copy.
+
+Verify exactly one header comes back:
+```bash
+curl -sD - -o /dev/null -H 'Origin: https://example.com' \
+  https://radiantcore.org/api/wave/resolve/alice | grep -ci '^access-control-allow-origin'
+# must print 1
+```
+Preflight `OPTIONS` requests are answered by `CORSMiddleware` (the API-key/rate-limit
+check skips `OPTIONS`), so a preflight returns `200`/`204`, never `401`.
 
 ---
 ## WebSocket Subscriptions

@@ -27,6 +27,8 @@
 - **Prefix Tree Index**: Efficient name resolution via character-based tree
 - **Zone Records**: Address, content hash, and custom record resolution
 - **Subdomain Support**: Hierarchical name resolution
+- **First-registration-wins**: earliest registration is canonical; duplicates tracked but never resolved
+- **Public REST + drop-in resolver**: `GET /wave/resolve/{name}`, `/wave/available/{name}`, `/wave/names` (paginated). Any dapp can integrate name→address lookup with the zero-dependency [`wave-resolver.js`](https://radiantcore.org/docs/wave-resolver.js) — see the [WAVE Names guide](https://radiantcore.org/docs/wave-names.html) and [REST API reference](docs/REST_API.md#wave-naming-system).
 
 ### Swap DEX
 - **Order Book Tracking**: RSWP on-chain swap advertisement indexing
