@@ -124,8 +124,9 @@ class DB(object):
         # Invalidated on block flush (flush_dbs/flush_backup) and on mempool
         # refresh via invalidate_balance_cache().  A miss falls through to
         # all_utxos, so correctness is preserved even if invalidation is
-        # delayed.
-        self._balance_cache = {}
+        # delayed.  Capped at 100k entries (~7MB) to prevent unbounded growth
+        # under high-throughput bursts (Photon Cannon).
+        self._balance_cache = pylru.lrucache(100000)
 
     async def _read_tx_counts(self):
         if self.tx_counts is not None:
