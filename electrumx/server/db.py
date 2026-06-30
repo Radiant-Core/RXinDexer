@@ -128,6 +128,12 @@ class DB(object):
         # under high-throughput bursts (Photon Cannon).
         self._balance_cache = pylru.lrucache(100000)
 
+        # UTXO list cache: hashX -> sorted list of UTXO namedtuples.
+        # Same invalidation semantics as the balance cache.  Avoids repeated
+        # RocksDB prefix scans in all_utxos for listunspent calls.  Capped
+        # at 10k entries (~50MB) — each entry is a list of UTXO tuples.
+        self._utxo_list_cache = pylru.lrucache(10000)
+
     async def _read_tx_counts(self):
         if self.tx_counts is not None:
             return
@@ -820,6 +826,10 @@ class DB(object):
 
     async def all_utxos(self, hashX):
         '''Return all UTXOs for an address sorted in no particular order.'''
+        cached = self._utxo_list_cache.get(hashX)
+        if cached is not None:
+            return cached
+
         def read_utxos():
             utxos = []
             utxos_append = utxos.append
@@ -837,6 +847,7 @@ class DB(object):
         while True:
             utxos = await run_in_thread(read_utxos)
             if all(utxo.tx_hash is not None for utxo in utxos):
+                self._utxo_list_cache[hashX] = utxos
                 return utxos
             self.logger.warning('all_utxos: tx hash not found (reorg?), retrying...')
             await sleep(0.25)
@@ -850,14 +861,16 @@ class DB(object):
         self._balance_cache[hashX] = balance
 
     def invalidate_balance_cache(self, hashXs):
-        '''Invalidate cached balances for the given hashXs.
+        '''Invalidate cached balances and UTXO lists for the given hashXs.
         Called on block flush and reorg.'''
         for hashX in hashXs:
             self._balance_cache.pop(hashX, None)
+            self._utxo_list_cache.pop(hashX, None)
 
     def invalidate_all_balances(self):
-        '''Clear the entire balance cache (used on reorg).'''
+        '''Clear the entire balance and UTXO list cache (used on reorg).'''
         self._balance_cache.clear()
+        self._utxo_list_cache.clear()
         self._tx_hash_cache.clear()
 
     async def codescripthash_all_utxos(self, codeScriptHash):
