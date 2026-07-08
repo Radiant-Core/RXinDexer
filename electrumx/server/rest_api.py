@@ -930,7 +930,7 @@ async def get_address_glyphs(
 async def get_address_history(
     ident: str = Path(..., min_length=1, max_length=128,
                       description="Electrum scripthash (64 hex) or base58 address"),
-    limit: int = Query(default=25, ge=1, le=100),
+    limit: int = Query(default=25, ge=1, le=200),
     offset: int = Query(default=0, ge=0, description="Skip this many recent txs"),
 ):
     """On-chain transaction history for an address, newest first.
@@ -955,10 +955,11 @@ async def get_address_history(
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid scripthash or address")
 
-        # Fetch history newest-first. We over-fetch to skip offset.
-        fetch_limit = limit + offset
-        history = await _db.limited_history(hashX, limit=fetch_limit, reverse=True)
-        total_fetched = len(history)
+        # Fetch full history newest-first to get the total count.
+        # tx hash retrieval is cheap; only getrawtransaction enrichment
+        # (below) is expensive, and that only runs on the page slice.
+        history = await _db.limited_history(hashX, limit=None, reverse=True)
+        total_count = len(history)
         page = history[offset:offset + limit]
 
         # Resolve the address for display from the owner index
@@ -1058,8 +1059,8 @@ async def get_address_history(
             'scripthash': sh.hex(),
             'history': results,
             'count': len(results),
-            'total_fetched': total_fetched,
-            'has_more': total_fetched > offset + limit,
+            'total_count': total_count,
+            'has_more': offset + limit < total_count,
             'limit': limit,
             'offset': offset,
         }
