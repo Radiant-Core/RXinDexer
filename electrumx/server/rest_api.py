@@ -56,6 +56,7 @@ import time
 from dataclasses import dataclass, field
 
 from electrumx.lib.glyph import MAX_JSONSAFE_NODES, MetadataTooComplex
+from electrumx.lib.hash import hash_to_hex_str
 from electrumx.server import metrics as _metrics
 from electrumx.server.rate_limiter import (
     DEFAULT_TRUSTED_PROXIES as _DEFAULT_TRUSTED_PROXIES,
