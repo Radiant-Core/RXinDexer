@@ -961,21 +961,24 @@ async def get_address_history(
         total_fetched = len(history)
         page = history[offset:offset + limit]
 
-        # Resolve the address for display
+        # Resolve the address for display from the owner index
         display_address = None
         try:
             from electrumx.lib.hash import sha256
             from electrumx.lib.script import Script
             coin = getattr(getattr(_glyph_index, 'env', None), 'coin', None)
             if coin:
-                # Try to get the scriptPubKey from the owner index
                 owner_key = b'GO' + hashX
                 base_script = _db.utxo_db.get(owner_key)
                 if base_script:
-                    script = Script(base_script)
-                    display_address = script.address(coin)
+                    display_address = Script(base_script).address(coin)
         except Exception:
             pass
+
+        # Compute the expected scripthash for matching outputs
+        # scripthash = sha256(scriptPubKey) reversed
+        import struct as _struct
+        from electrumx.lib.hash import sha256 as _sha256
 
         # Enrich each tx with direction and amount
         results = []
@@ -991,12 +994,12 @@ async def get_address_history(
             }
 
             # Get block timestamp from header
+            # Bitcoin header: version(4) + prevhash(32) + merkle(32) + time(4) + bits(4) + nonce(4)
+            # Timestamp is at offset 68
             try:
                 if height > 0:
                     header = await _db.raw_header(height)
-                    # Timestamp is at bytes 4-8 (little-endian uint32)
-                    import struct
-                    ts = struct.unpack_from('<I', header, 4)[0]
+                    ts = _struct.unpack_from('<I', header, 68)[0]
                     entry['timestamp'] = ts
             except Exception:
                 pass
@@ -1007,60 +1010,36 @@ async def get_address_history(
                 vin = raw_tx.get('vin', [])
                 vout = raw_tx.get('vout', [])
 
-                # Check if coinbase
                 is_coinbase = any('coinbase' in v for v in vin)
                 entry['is_coinbase'] = is_coinbase
 
-                # Determine direction: check if any input spends a UTXO
-                # that was sent to this address. We compare scriptPubKeys.
-                # For simplicity, check outputs first:
+                # Match outputs by computing sha256(scriptPubKey) and comparing
+                # to our scripthash (which is sha256(script) reversed)
                 received = 0
-                sent = 0
-                our_script_hex = None
-
-                # Get our scriptPubKey hex for matching
-                if display_address:
-                    try:
-                        our_script_hex = coin.pay_to_address_script(display_address).hex()
-                    except Exception:
-                        pass
-
-                if our_script_hex:
-                    # Sum received (outputs to our address)
-                    for v in vout:
-                        spk = v.get('scriptPubKey', {})
-                        if spk.get('hex') == our_script_hex:
+                for v in vout:
+                    spk = v.get('scriptPubKey', {})
+                    spk_hex = spk.get('hex', '')
+                    if spk_hex:
+                        spk_bytes = bytes.fromhex(spk_hex)
+                        out_sh = _sha256(spk_bytes)[::-1]
+                        if out_sh == sh:
                             received += v.get('value', 0)
 
-                    # Sum sent (inputs from our address) - need to check prev txs
-                    # This is expensive, so we use a heuristic: if we received
-                    # in this tx, it's at least partially "received". If we didn't
-                    # receive but the tx touched our history, we likely sent.
-                    if received > 0 and not is_coinbase:
-                        entry['direction'] = 'received'
-                        entry['amount'] = received
-                    elif is_coinbase:
-                        entry['direction'] = 'mined'
-                        entry['amount'] = sum(v.get('value', 0) for v in vout)
-                    else:
-                        # We didn't receive, so we must have sent (input was ours)
-                        entry['direction'] = 'sent'
-                        # Total output value is what we sent (minus change)
-                        entry['amount'] = sum(v.get('value', 0) for v in vout)
+                if is_coinbase:
+                    entry['direction'] = 'mined'
+                    entry['amount'] = sum(v.get('value', 0) for v in vout)
+                elif received > 0:
+                    entry['direction'] = 'received'
+                    entry['amount'] = received
                 else:
-                    # No script match possible; just report total
-                    total = sum(v.get('value', 0) for v in vout)
-                    entry['amount'] = total
-                    if is_coinbase:
-                        entry['direction'] = 'mined'
-                    elif total > 0:
-                        entry['direction'] = 'related'
+                    # No outputs to us → we must be a sender (input was ours)
+                    entry['direction'] = 'sent'
+                    entry['amount'] = sum(v.get('value', 0) for v in vout)
 
                 # Collect token refs from outputs
                 for v in vout:
                     spk = v.get('scriptPubKey', {})
                     asm = spk.get('asm', '')
-                    # Look for ref patterns in the script
                     if 'OP_REFTYPE_OUTPUT' in asm or 'ref' in str(spk):
                         entry['token_refs'].append({
                             'vout': v.get('n', 0),
