@@ -117,6 +117,25 @@ class SessionGroup:
     def cost(self):
         return self.retained_cost + self.session_cost()
 
+    def retain(self, delta, hard_limit):
+        '''Adjust retained cost by ``delta``, clamped to ``[0, hard_limit]``.
+
+        Retained cost ABOVE the per-session hard limit buys no extra throttling
+        — a group already at ``hard_limit`` fully throttles (concurrency→0)
+        every new session it holds — it only PROLONGS how long the group stays
+        saturated after the load has left.  Uncapped, a reconnect storm drove
+        per-/24 retained cost to millions (7x hard_limit, 2026-07-10 outage),
+        and because it decays at just ``hard_limit/5000`` per second that locked
+        a whole /24 out for HOURS.  Capping at ``hard_limit`` bounds post-storm
+        recovery to well under a couple of minutes without weakening any live
+        abuse protection.  ``hard_limit <= 0`` disables the cap (aiorpcx's
+        "unlimited" sentinel).
+        '''
+        value = max(0.0, self.retained_cost + delta)
+        if hard_limit and hard_limit > 0:
+            value = min(value, hard_limit)
+        self.retained_cost = value
+
 
 @attr.s(slots=True)
 class SessionReferences:
@@ -344,7 +363,10 @@ class SessionManager:
             refund = period * hard_limit / 5000
             dead_groups = []
             for group in self.session_groups.values():
-                group.retained_cost = max(0.0, group.retained_cost - refund)
+                # Decay AND clamp to hard_limit: a group left over-saturated by an
+                # earlier storm (or a pre-cap build) is pulled back down to the cap
+                # on the very next tick instead of bleeding off for hours.
+                group.retain(-refund, hard_limit)
                 if group.retained_cost == 0 and not group.sessions:
                     dead_groups.append(group)
             # Remove dead groups
@@ -1144,7 +1166,10 @@ class SessionManager:
         if session.session_id is not None:
             self.sessions_by_id.pop(session.session_id, None)
         for group in groups:
-            group.retained_cost += session.cost
+            # Fold this session's cost into the group's retained memory, capped at
+            # the per-session hard limit so a reconnect storm can't run it away to
+            # millions and lock the /24 out for hours (see SessionGroup.retain).
+            group.retain(session.cost, self.env.cost_hard_limit)
             group.sessions.remove(session)
 
     async def _notify_glyph_session(self, session_id, notification):
