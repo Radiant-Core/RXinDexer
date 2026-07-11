@@ -1625,14 +1625,22 @@ class ElectrumX(SessionBase):
         return result
 
     async def get_balance(self, hashX):
+        # Cost must track WORK done, never the balance value: `confirmed` is in
+        # photons, so a wallet holding ~5,000 RXD (5e11 photons) charged
+        # `confirmed / 500000` = 1,000,000 — a single get_balance instantly hit
+        # COST_HARD_LIMIT and (folded into the /24 group on disconnect) locked the
+        # player's whole subnet out with -101 for ~80 minutes (2026-07-11 incident).
         confirmed = self.db.get_cached_balance(hashX)
         if confirmed is None:
             utxos = await self.db.all_utxos(hashX)
             confirmed = sum(utxo.value for utxo in utxos)
             self.db.set_cached_balance(hashX, confirmed)
+            cost = 1.0 + len(utxos) / 50
+        else:
+            cost = 1.0
         _utxos, _spends, unconfirmed = await run_in_thread(
             self.mempool.combined_mempool_state, hashX)
-        self.bump_cost(1.0 + confirmed / 500000)
+        self.bump_cost(cost)
         return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
 
     async def scripthash_get_balance(self, scripthash):
