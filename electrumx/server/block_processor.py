@@ -846,10 +846,15 @@ class BlockProcessor:
                         hash_to_hex_str(tx_hash), self.height + 1
                     )
 
-                # Process for WAVE naming if this is a Glyph tx
-                if self.wave_index and glyph_envelope:
+                # Process for WAVE naming. Call wave_index when there's a WAVE
+                # envelope (registration / mod) OR when a singleton was spent — a
+                # PLAIN TRANSFER carries no envelope, and gating on the envelope
+                # here is exactly what stopped `_maybe_update_owner` from ever
+                # running for transfers, freezing reverse_lookup on the genesis
+                # holder (a transferred name never appeared under its new owner).
+                if self.wave_index and (glyph_envelope or spent_singleton_refs):
                     try:
-                        protocols = glyph_envelope.get('protocols', [])
+                        protocols = (glyph_envelope or {}).get('protocols', [])
                         if GlyphProtocol.GLYPH_WAVE in protocols:
                             self.logger.info(
                                 f'Passing WAVE envelope to wave_index: '
