@@ -1841,84 +1841,128 @@ async def wave_stats():
         raise _internal_error(e)
 
 
+# /wave/names post-filters the type-5 token list (duplicate registrations are
+# dropped), so it must scan more rows than it emits. These bound that scan:
+# rows are hydrated one get_token at a time, so an unbounded over-fetch turns
+# one request into tens of thousands of DB reads.
+_WAVE_NAMES_SCAN_CHUNK = 500   # rows fetched per underlying index page
+_WAVE_NAMES_MAX_SCAN = 5000    # hard ceiling on rows examined per request
+
+
+def _wave_name_entry(token: dict, include_duplicates: bool) -> Optional[dict]:
+    """Build a /wave/names entry, or None if this token is not a canonical
+    registration (duplicate, or absent from the wave index)."""
+    attrs = token.get('attrs') or {}
+    name = attrs.get('name', '')
+    if not name:
+        return None
+
+    # Is this token the canonical (first) registration? The wave index stores
+    # claim_ref = tx_hash+vout(0) for canonical entries, and the glyph token's
+    # deploy_txid is the same tx. canonical_ref[:32] is the tx_hash in
+    # little-endian; deploy_txid is hex in reversed (display) order.
+    canonical_ref = _wave_index._resolve_name_to_ref(name)
+    if canonical_ref is None:
+        return None
+    if canonical_ref[:32][::-1].hex() != token.get('deploy_txid', ''):
+        return None  # duplicate registration
+
+    domain = attrs.get('domain', 'rxd')
+    entry = {
+        'name': name,
+        'domain': domain,
+        'full_name': f"{name}.{domain}",
+        'target': attrs.get('target', ''),
+        'ref': token.get('ref', ''),
+        'height': token.get('deploy_height', 0),
+        'spent': token.get('is_spent', False),
+        'canonical': True,
+    }
+    if include_duplicates:
+        entry['has_duplicates'] = _wave_index._has_duplicates(name)
+    return entry
+
+
 @app.get("/wave/names", tags=["WAVE"])
 async def wave_list_names(
-    limit: int = Query(default=500, le=2000),
+    limit: int = Query(default=500, ge=1, le=2000),
     cursor: Optional[str] = Query(default=None, description="Pagination cursor"),
     include_duplicates: bool = Query(default=False, description="Include duplicate count for each name"),
 ):
     """List all registered WAVE names with their targets.
-    
+
     Returns a compact list sourced from the Glyph token index (type 5 = WAVE).
     Supports cursor-based pagination for large result sets.
-    
+
     Note: The canonical (first) registration is always returned for each name.
     Later registrations of the same name are tracked as duplicates but not used for resolution.
+
+    A page can be short without meaning the walk is over: duplicates are
+    filtered out after the index scan, and the scan is capped per request. Keep
+    following `next_cursor` until it comes back `null` — that, not a short
+    page, is the end of the list.
     """
     _ensure_wave()
     if not _glyph_index:
         raise HTTPException(status_code=503, detail="Glyph index not available")
 
     try:
-        # Decode cursor for glyph BY_TYPE pagination
-        result = _glyph_index.get_tokens_by_type(5, limit=limit * 3, cursor=cursor)
-        tokens = result.get('tokens', [])
+        from electrumx.lib.glyph import GlyphTokenType
 
-        # Deduplicate: for each name, keep only the canonical (first-registration) token.
-        # The wave index stores the canonical ref per name; any token whose glyph ref
-        # does NOT match the wave canonical ref is a duplicate.
+        names: list = []
         seen_names: set = set()
-        names = []
-        for token in tokens:
-            attrs = token.get('attrs') or {}
-            name = attrs.get('name', '')
-            domain = attrs.get('domain', 'rxd')
-            if not name:
-                continue
+        next_cursor = None
+        scan_cursor = cursor
+        scanned = 0
+        exhausted = False
 
-            full_name = f"{name}.{domain}"
-            token_ref_str = token.get('ref', '')
+        # Walk the type-5 index in bounded chunks until the page is full, the
+        # index runs out, or we hit the scan ceiling.
+        while len(names) < limit and scanned < _WAVE_NAMES_MAX_SCAN:
+            page = _glyph_index.get_tokens_by_type(
+                GlyphTokenType.WAVE,
+                limit=min(_WAVE_NAMES_SCAN_CHUNK, _WAVE_NAMES_MAX_SCAN - scanned),
+                cursor=scan_cursor,
+            )
+            tokens = page.get('tokens', [])
+            if not tokens:
+                exhausted = True
+                break
 
-            # Skip if we've already emitted this name
-            if full_name in seen_names:
-                continue
+            resume_at = None  # index of the first token this page did NOT consume
+            for i, token in enumerate(tokens):
+                scanned += 1
+                entry = _wave_name_entry(token, include_duplicates)
+                if entry is None or entry['full_name'] in seen_names:
+                    continue
+                seen_names.add(entry['full_name'])
+                names.append(entry)
+                if len(names) >= limit:
+                    resume_at = i + 1
+                    break
 
-            # Check wave index: is this token the canonical (first) registration?
-            # The wave index stores claim_ref = tx_hash+vout(0) for canonical entries.
-            # The glyph token's deploy_txid equals the claim_ref txid (same tx).
-            canonical_ref = _wave_index._resolve_name_to_ref(name)
-            if canonical_ref is None:
-                # Not in wave index — skip
-                continue
+            if resume_at is not None and resume_at < len(tokens):
+                # Stopped mid-page: resume at the first token we did not consume.
+                # The page's own next_cursor points past the whole chunk and
+                # would drop everything after the break.
+                next_cursor = _glyph_index.cursor_for_type_ref(
+                    GlyphTokenType.WAVE,
+                    bytes.fromhex(tokens[resume_at]['ref_hex']))
+                break
 
-            # canonical_ref[:32] is the tx_hash (little-endian), deploy_txid is hex (reversed)
-            canonical_txid_hex = canonical_ref[:32][::-1].hex()
-            token_deploy_txid = token.get('deploy_txid', '')
-            if canonical_txid_hex != token_deploy_txid:
-                # This is a duplicate registration — skip
-                continue
-
-            seen_names.add(full_name)
-            name_entry = {
-                'name': name,
-                'domain': domain,
-                'full_name': full_name,
-                'target': attrs.get('target', ''),
-                'ref': token_ref_str,
-                'height': token.get('deploy_height', 0),
-                'spent': token.get('is_spent', False),
-                'canonical': True,
-            }
-            if include_duplicates:
-                name_entry['has_duplicates'] = _wave_index._has_duplicates(name)
-            names.append(name_entry)
-            if len(names) >= limit:
+            # Consumed the chunk to its end — carry the index's own cursor.
+            scan_cursor = page.get('next_cursor')
+            next_cursor = scan_cursor
+            if scan_cursor is None:
+                exhausted = True
                 break
 
         return {
             'names': names,
             'total': len(names),
-            'next_cursor': result.get('next_cursor') if len(names) >= limit else None,
+            # None only when the underlying index is genuinely exhausted; a
+            # short page from the scan ceiling still returns a cursor.
+            'next_cursor': None if exhausted else next_cursor,
         }
     except Exception as e:
         raise _internal_error(e)

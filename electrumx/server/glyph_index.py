@@ -2306,6 +2306,25 @@ class GlyphIndex:
         """
         return base64.urlsafe_b64encode(raw_key).decode()
 
+    def cursor_for_type_ref(self, token_type: int, ref: bytes) -> str:
+        """Cursor that resumes a ``get_tokens_by_type(order='ref')`` walk *at*
+        ``ref`` — i.e. ``ref`` is the first token the next page returns.
+
+        For callers that post-filter a page and stop partway through it. The
+        cursor ``get_tokens_by_type`` hands back points past everything it
+        scanned, so a caller that consumed only a prefix of the page and then
+        reused that cursor would silently skip the remainder. Building the
+        resume point from the first *unconsumed* token instead keeps the walk
+        gap-free. Seeks are inclusive, so the named ref is returned, not
+        skipped.
+
+        Only valid for the default ``order='ref'`` index (BY_TYPE); the recency
+        index keys embed deploy_height, so its cursors are not reconstructible
+        from a ref alone.
+        """
+        return self._encode_cursor(
+            GlyphDBKeys.BY_TYPE + struct.pack('<B', token_type & 0xFF) + ref)
+
     def get_balances_for_scripthash(self, scripthash: bytes,
                                      limit: int = 100,
                                      cursor: Optional[str] = None) -> Dict[str, Any]:
