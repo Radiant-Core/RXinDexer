@@ -231,6 +231,15 @@ Get tokens by type.
 
 **Returns:** `{tokens, next_cursor}`
 
+> **List responses omit raw embed payloads** (since `3131999`, 2026-07-19). All paginated
+> lists (`glyph.get_tokens_by_type`, `glyph.get_recent`, by-proto, and the REST list
+> endpoints) keep the `embed` summary (`type`, `size`) but return `data: null` — icon-heavy
+> pages used to run 0.7–2 MB, so a client paging a full list exhausted its ElectrumX
+> per-session bandwidth budget and was silently disconnected mid-walk. Fetch the single
+> token (`glyph.get_metadata` / `glyph.get_by_ref`) for the embedded bytes — those
+> endpoints are unchanged. Bulk walkers should throttle (~20 req/s) and retry a dropped
+> page at the same cursor (cursors are stateless, so the walk resumes where it broke).
+
 ---
 
 ### glyph.get_recent
