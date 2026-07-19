@@ -25,6 +25,7 @@ from electrumx.lib.glyph import (
     DMINT_MAX_SCRIPTNUM,
     DMINT_MAX_TOTAL_SUPPLY,
 )
+from tests.support import FakeEnv
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +299,10 @@ def _fresh_token():
 
 
 def _indexer():
-    return GlyphIndex(db=Mock(db_height=0), env=Mock(glyph_index=True, reorg_limit=0))
+    # FakeEnv, not Mock: see tests/support.py — a Mock env auto-creates every
+    # attribute, so GlyphIndex's getattr(env, 'dmint_denylist', set()) default
+    # never applied and the constructor tried to iterate a Mock.
+    return GlyphIndex(db=Mock(db_height=0), env=FakeEnv(reorg_limit=0))
 
 
 class TestDeployContractStateIntegration:

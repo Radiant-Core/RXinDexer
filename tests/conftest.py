@@ -48,6 +48,16 @@ def _preserve_os_environ():
         os.environ.update(saved)
 
 
+from tests.support import FakeEnv  # noqa: E402  (re-exported for fixtures)
+
+
+@pytest.fixture
+def fake_env():
+    """A default :class:`~tests.support.FakeEnv`. Import the class directly
+    when a test needs to override a setting."""
+    return FakeEnv()
+
+
 # Verify that critical modules are available
 def pytest_configure(config):
     """Called after command line options have been parsed."""
