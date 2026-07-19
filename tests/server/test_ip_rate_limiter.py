@@ -656,3 +656,93 @@ def test_connection_cap_blocked_ip_refused():
     allowed, reason = rl.check_can_register(ip, now=1000.0)
     assert allowed is False
     assert 'blocked' in reason
+
+
+# --------------------------------------------------------------------------- #
+# Header discovery across websockets-library shapes.
+#
+# `websockets.serve` resolves to the legacy asyncio server below 14 and to
+# websockets.asyncio.server from 14 on. The legacy connection exposes
+# `request_headers`; the new one does NOT -- the handshake request moved to
+# `connection.request`, with headers underneath it. Verified live against 13.1
+# (request_headers present, request absent) and 16.1 (the reverse).
+#
+# _header falls back to None on a missing attribute, so a websockets upgrade
+# alone would not raise -- X-Forwarded-For would just never resolve again, and
+# with TRUST_PROXY on every client would collapse onto the proxy's own address
+# and share a single rate-limit bucket. These pin both shapes so the upgrade
+# cannot regress it silently.
+# --------------------------------------------------------------------------- #
+
+class _FakeRequest:
+    """websockets >=14: connection.request.headers."""
+
+    def __init__(self, headers):
+        self.headers = _FakeHeaders(headers)
+
+
+class _FakeWSLegacy:
+    """websockets <14: connection.request_headers."""
+
+    def __init__(self, headers):
+        self.request_headers = _FakeHeaders(headers)
+
+
+class _FakeWSNew:
+    def __init__(self, headers):
+        self.request = _FakeRequest(headers)
+
+
+class _FakeTransport:
+    def __init__(self, websocket):
+        self.websocket = websocket
+
+
+class _WSSession:
+    """A session whose headers are reachable only via transport.websocket,
+    as with the live WS transport (see HTTPTransport in httpserver.py)."""
+
+    def __init__(self, websocket, peer_host='127.0.0.1', port=50002):
+        self.transport = _FakeTransport(websocket)
+        self._peer = NetAddress(peer_host, port)
+        self.session_id = 0
+        self.client_ip = None
+
+    def remote_address(self):
+        return self._peer
+
+
+def test_xff_via_legacy_websocket_shape():
+    rl = IPRateLimiter(_env(trust_proxy=True, trust_proxy_hops=1))
+    sess = _WSSession(_FakeWSLegacy({'X-Forwarded-For': '203.0.113.7'}))
+    assert rl.client_ip(sess) == '203.0.113.7'
+
+
+def test_xff_via_new_websocket_request_shape():
+    """websockets >=14: headers live at connection.request.headers."""
+    rl = IPRateLimiter(_env(trust_proxy=True, trust_proxy_hops=1))
+    sess = _WSSession(_FakeWSNew({'X-Forwarded-For': '203.0.113.7'}))
+    assert rl.client_ip(sess) == '203.0.113.7'
+
+
+def test_x_real_ip_via_new_websocket_request_shape():
+    rl = IPRateLimiter(_env(trust_proxy=True))
+    sess = _WSSession(_FakeWSNew({'X-Real-IP': '203.0.113.42'}))
+    assert rl.client_ip(sess) == '203.0.113.42'
+
+
+def test_new_shape_multi_hop_selection():
+    rl = IPRateLimiter(_env(trust_proxy=True, trust_proxy_hops=2))
+    sess = _WSSession(_FakeWSNew(
+        {'X-Forwarded-For': '203.0.113.7, 198.51.100.9, 10.0.0.1'}))
+    assert rl.client_ip(sess) == '198.51.100.9'
+
+
+def test_websocket_without_either_shape_falls_back_to_peer():
+    """A connection object exposing neither attribute must degrade to the
+    socket peer rather than raising."""
+    class _Bare:
+        pass
+    rl = IPRateLimiter(_env(trust_proxy=True))
+    sess = _WSSession(_Bare(), peer_host='8.8.8.8')
+    assert rl.client_ip(sess) == '8.8.8.8'
