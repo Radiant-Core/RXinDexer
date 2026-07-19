@@ -8,6 +8,7 @@ Covers:
 - get_tokens_by_protocol (facets that are not a primary token_type)
 - Reorg: backup() removes the v4 rows written at a height (add/spend symmetry)
 - In-place v3 -> v4 backfill migration + schema-version gating
+- Curation of the recency feeds: UNKNOWN (type 0) and companion singletons
 """
 
 import contextlib
@@ -209,9 +210,16 @@ class TestGlobalRecentAndProto:
 
 # --------------------------------------------------------------------------- #
 # GLOBAL_RECENT excludes UNKNOWN (type 0) so it matches the per-type feeds.
-# (v4 launch-day report: the global feed was polluted with half-hydrated type-0
-# rows — empty/malformed reveals and partial WAVE-name owner rows — that the
-# per-type recency queries never surface.)
+#
+# Kept as a write-path invariant, NOT because of the launch-day report that
+# originally motivated it (423e020): that report was retracted — the reporting
+# client had a parameter-parsing bug and was querying token_type=0, i.e. the
+# UNKNOWN bucket itself, so the type-0 rows and apparent staleness it saw were
+# that bucket's honest contents. The real all-types feed measured clean before
+# and after. What survives is the code fact these tests pin: _discovery_rows
+# did unconditionally index type-0 records into GLOBAL_RECENT, so the feed
+# could surface half-hydrated rows (no name, no protocols) even though it
+# happened not to at the time.
 # --------------------------------------------------------------------------- #
 
 class TestGlobalRecentExcludesUnknown:
@@ -415,3 +423,281 @@ class TestMigration:
         db.utxo_db._store[GlyphDBKeys.SCHEMA_VERSION] = bytes([CURRENT_SCHEMA_VERSION + 1])
         with pytest.raises(RuntimeError):
             idx._check_schema_version()
+
+
+# --------------------------------------------------------------------------- #
+# Companion singletons: a mint's extra singleton outputs (WAVE zone/mutable
+# contract at vout 1, dMint mining contracts at vout 1..N) are Phase-1
+# registered as bare NFT/[2] records with no name. They are the parent's
+# plumbing, not separately discoverable assets, so they are kept out of BOTH
+# recency feeds. Verified on mainnet: every WAVE registration contributed one,
+# ~47% of the all-types feed.
+# --------------------------------------------------------------------------- #
+
+class _FakeOutput:
+    def __init__(self, script):
+        self.pk_script = script
+
+
+class _FakeTx:
+    """Minimal tx whose outputs carry OP_PUSHINPUTREFSINGLETON (0xd8) pushes."""
+    def __init__(self, *refs):
+        self.outputs = [_FakeOutput(b"\xd8" + r) for r in refs]
+
+
+def _token_at(name, txid_hex, vout, height, token_type, protocols,
+              revealed=True):
+    """Like _token but at an explicit vout, and optionally 'bare' (no metadata),
+    which is how Phase 1 leaves a singleton the reveal never enriched."""
+    t = GlyphTokenInfo()
+    t.ref = pack_ref(bytes.fromhex(txid_hex), vout)
+    t.name = name
+    t.token_type = token_type
+    t.protocols = list(protocols)
+    t.deploy_height = height
+    t.deploy_txid = bytes.fromhex(txid_hex)
+    t.metadata_hash = bytes(32) if revealed else b""
+    return t
+
+
+WAVE_TXID = "76a32cb6" * 8
+
+
+def _wave_registration(height=447893):
+    """The real on-chain shape: name singleton at vout 0, zone contract at
+    vout 1 (mainnet example 76a32cb6_0 = '440000.rxd' / 76a32cb6_1 = nameless)."""
+    name = _token_at("440000.rxd", WAVE_TXID, 0, height, GlyphTokenType.WAVE,
+                     [GlyphProtocol.GLYPH_NFT, GlyphProtocol.GLYPH_MUT,
+                      GlyphProtocol.GLYPH_WAVE])
+    zone = _token_at(None, WAVE_TXID, 1, height, GlyphTokenType.NFT,
+                     [GlyphProtocol.GLYPH_NFT], revealed=False)
+    return name, zone
+
+
+class TestCompanionSingletonMarking:
+    def test_reveal_marks_sibling_singleton(self):
+        idx, _db = _make_index()
+        name, zone = _wave_registration()
+        for t in (name, zone):
+            idx.token_cache[t.ref] = t
+            idx.token_height[t.ref] = t.deploy_height
+
+        marked = idx._mark_companion_singletons(
+            name.ref, _FakeTx(name.ref, zone.ref), name.deploy_height)
+
+        assert marked == 1
+        assert zone.is_companion is True
+        # Back-link is the canonical txid_vout display form, directly
+        # comparable to the 'ref' field of the parent's API row.
+        assert zone.parent_ref == idx._token_to_dict(name)["ref"]
+        assert name.is_companion is False  # never demotes itself
+
+    def test_named_sibling_is_not_demoted(self):
+        """A sibling that was revealed in its own right is a real asset."""
+        idx, _db = _make_index()
+        name, _zone = _wave_registration()
+        sibling = _token_at("REAL", WAVE_TXID, 1, 447893, GlyphTokenType.NFT,
+                            [GlyphProtocol.GLYPH_NFT])
+        for t in (name, sibling):
+            idx.token_cache[t.ref] = t
+            idx.token_height[t.ref] = t.deploy_height
+
+        assert idx._mark_companion_singletons(
+            name.ref, _FakeTx(name.ref, sibling.ref), 447893) == 0
+        assert sibling.is_companion is False
+
+    def test_marking_is_idempotent(self):
+        idx, _db = _make_index()
+        name, zone = _wave_registration()
+        for t in (name, zone):
+            idx.token_cache[t.ref] = t
+            idx.token_height[t.ref] = t.deploy_height
+        tx = _FakeTx(name.ref, zone.ref)
+
+        assert idx._mark_companion_singletons(name.ref, tx, 447893) == 1
+        assert idx._mark_companion_singletons(name.ref, tx, 447893) == 0
+
+
+class TestCompanionExcludedFromRecencyFeeds:
+    def _seed(self, mark=True):
+        idx, db = _make_index()
+        name, zone = _wave_registration()
+        other = _token_at("PLAIN", "aa" * 32, 0, 447800, GlyphTokenType.NFT,
+                          [GlyphProtocol.GLYPH_NFT])
+        if mark:
+            zone.is_companion = True
+            zone.parent_ref = idx._token_to_dict(name)["ref"]
+        _deploy(idx, db, name, zone, other)
+        return idx, db, name, zone
+
+    def test_write_path_omits_both_recency_rows(self):
+        _idx, db, _name, _zone = self._seed()
+        store = db.utxo_db._store
+        gq = [k for k in store if k.startswith(GlyphDBKeys.GLOBAL_RECENT)]
+        gz2 = [k for k in store if k.startswith(
+            GlyphDBKeys.BY_TYPE_RECENT + struct.pack("<B", GlyphTokenType.NFT))]
+        # GLOBAL_RECENT: the WAVE name + the standalone NFT, not the zone.
+        assert len(gq) == 2
+        # BY_TYPE_RECENT type 2: only the standalone NFT.
+        assert len(gz2) == 1
+        # ...but the protocol facet row survives, so nothing vanishes entirely.
+        gp = [k for k in store if k.startswith(
+            GlyphDBKeys.BY_PROTO + struct.pack("<B", GlyphProtocol.GLYPH_NFT))]
+        assert len(gp) == 3
+
+    def test_global_feed_has_no_nameless_companion(self):
+        idx, _db, _name, _zone = self._seed()
+        assert _names(idx.get_recent_tokens(limit=10)) == ["440000.rxd", "PLAIN"]
+
+    def test_by_type_recent_excludes_companion(self):
+        idx, _db, _name, _zone = self._seed()
+        r = idx.get_tokens_by_type(GlyphTokenType.NFT, order="recent")
+        assert _names(r) == ["PLAIN"]
+
+    def test_legacy_ref_order_still_enumerates_companion(self):
+        """order='ref' stays a complete enumeration — the row is curated out of
+        the *feeds*, not hidden from the index."""
+        idx, _db, _name, zone = self._seed()
+        r = idx.get_tokens_by_type(GlyphTokenType.NFT, order="ref")
+        assert len(r["tokens"]) == 2
+        assert any(t["is_companion"] for t in r["tokens"])
+        assert zone.ref.hex() in [t["ref_hex"] for t in r["tokens"]]
+
+    def test_companion_still_reachable_by_ref(self):
+        idx, _db, name, zone = self._seed()
+        got = idx.get_token(zone.ref)
+        assert got is not None and got.is_companion
+        assert got.parent_ref == idx._token_to_dict(name)["ref"]
+
+
+class TestCompanionLegacyRecordsFilteredOnRead:
+    """A DB indexed before the flag existed holds unmarked companion records
+    with live GQ/GZ rows. The read predicate re-derives the property so those
+    backends serve clean feeds with no reindex."""
+
+    def _seed_legacy(self):
+        # mark=False => flushed exactly as a pre-fix build would have.
+        idx, db, name, zone = TestCompanionExcludedFromRecencyFeeds()._seed(
+            mark=False)
+        return idx, db, name, zone
+
+    def test_legacy_rows_are_present_in_the_index(self):
+        _idx, db, _name, _zone = self._seed_legacy()
+        gq = [k for k in db.utxo_db._store
+              if k.startswith(GlyphDBKeys.GLOBAL_RECENT)]
+        assert len(gq) == 3  # the unmarked companion IS indexed
+
+    def test_read_predicate_hides_unmarked_companion(self):
+        idx, _db, _name, zone = self._seed_legacy()
+        assert zone.is_companion is False  # nothing rewrote the record
+        assert _names(idx.get_recent_tokens(limit=10)) == ["440000.rxd", "PLAIN"]
+        assert _names(idx.get_tokens_by_type(
+            GlyphTokenType.NFT, order="recent")) == ["PLAIN"]
+
+    def test_cursor_walk_over_filtered_rows_has_no_dupes(self):
+        idx, _db, _name, _zone = self._seed_legacy()
+        seen, cur = [], None
+        for _ in range(10):
+            p = idx.get_recent_tokens(limit=1, cursor=cur)
+            seen += _names(p)
+            cur = p["next_cursor"]
+            if cur is None:
+                break
+        assert seen == ["440000.rxd", "PLAIN"]
+
+
+class TestCompanionDerivationDoesNotOverReach:
+    """Guards on the legacy derivation: it must only catch plumbing."""
+
+    def test_standalone_bare_nft_at_vout_zero_is_kept(self):
+        idx, db = _make_index()
+        bare = _token_at(None, "bb" * 32, 0, 447900, GlyphTokenType.NFT,
+                         [GlyphProtocol.GLYPH_NFT], revealed=False)
+        _deploy(idx, db, bare)
+        assert idx._is_companion_singleton(bare) is False
+        assert len(idx.get_recent_tokens()["tokens"]) == 1
+
+    def test_bare_nft_with_no_vout_zero_sibling_is_kept(self):
+        idx, db = _make_index()
+        orphan = _token_at(None, "cc" * 32, 1, 447900, GlyphTokenType.NFT,
+                           [GlyphProtocol.GLYPH_NFT], revealed=False)
+        _deploy(idx, db, orphan)
+        assert idx._is_companion_singleton(orphan) is False
+
+    def test_bare_nft_whose_vout_zero_sibling_is_unnamed_is_kept(self):
+        idx, db = _make_index()
+        a = _token_at(None, "dd" * 32, 0, 447900, GlyphTokenType.NFT,
+                      [GlyphProtocol.GLYPH_NFT], revealed=False)
+        b = _token_at(None, "dd" * 32, 1, 447900, GlyphTokenType.NFT,
+                      [GlyphProtocol.GLYPH_NFT], revealed=False)
+        _deploy(idx, db, a, b)
+        assert idx._is_companion_singleton(b) is False
+
+    def test_revealed_sibling_is_kept(self):
+        idx, db = _make_index()
+        name, _zone = _wave_registration()
+        revealed = _token_at(None, WAVE_TXID, 1, 447893, GlyphTokenType.NFT,
+                             [GlyphProtocol.GLYPH_NFT], revealed=True)
+        _deploy(idx, db, name, revealed)
+        assert idx._is_companion_singleton(revealed) is False
+
+    def test_non_nft_sibling_is_kept(self):
+        """An FT minted at vout 1 alongside a named token is a real asset."""
+        idx, db = _make_index()
+        name, _zone = _wave_registration()
+        ft = _token_at(None, WAVE_TXID, 1, 447893, GlyphTokenType.FT,
+                       [GlyphProtocol.GLYPH_FT], revealed=False)
+        _deploy(idx, db, name, ft)
+        assert idx._is_companion_singleton(ft) is False
+
+
+class TestCompanionWriteDeleteSymmetry:
+    """_discovery_rows must stay a pure function of (ref, token) so write,
+    re-write dedup, delete and the v3->v4 migration derive the same key set."""
+
+    def test_migration_reproduces_the_same_exclusions(self):
+        idx, db = _make_index()
+        name, zone = _wave_registration()
+        zone.is_companion = True
+        # Seed GT rows only, as a v3 DB would have them.
+        store = db.utxo_db._store
+        for t in (name, zone):
+            store[pack_token_key(t.ref)] = t.to_bytes()
+        assert not any(k.startswith(GlyphDBKeys.GLOBAL_RECENT) for k in store)
+
+        idx._migrate_3_to_4()
+
+        gq = [k for k in store if k.startswith(GlyphDBKeys.GLOBAL_RECENT)]
+        assert len(gq) == 1  # the companion is not backfilled into the feed
+        assert _names(idx.get_recent_tokens()) == ["440000.rxd"]
+
+    def test_delete_removes_exactly_what_write_created(self):
+        idx, db = _make_index()
+        name, zone = _wave_registration()
+        zone.is_companion = True
+        _deploy(idx, db, name, zone)
+        store = db.utxo_db._store
+        before = set(store)
+
+        with db.utxo_db.write_batch() as batch:
+            for t in (name, zone):
+                idx._delete_discovery_rows(batch, t.ref, t, t.deploy_height)
+
+        # Every discovery row is gone; nothing orphaned, nothing left behind.
+        for pfx in (GlyphDBKeys.GLOBAL_RECENT, GlyphDBKeys.BY_TYPE_RECENT,
+                    GlyphDBKeys.BY_PROTO):
+            assert not any(k.startswith(pfx) for k in store)
+        assert before - set(store)  # it actually deleted something
+
+    def test_is_companion_survives_serialisation_round_trip(self):
+        _name, zone = _wave_registration()
+        zone.is_companion = True
+        zone.parent_ref = "abc_0"
+        back = GlyphTokenInfo.from_bytes(zone.to_bytes())
+        assert back.is_companion is True
+        assert back.parent_ref == "abc_0"
+
+    def test_absent_flag_defaults_false(self):
+        _name, zone = _wave_registration()
+        back = GlyphTokenInfo.from_bytes(zone.to_bytes())
+        assert back.is_companion is False

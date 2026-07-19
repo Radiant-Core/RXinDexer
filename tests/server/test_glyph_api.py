@@ -335,3 +335,79 @@ class TestGetHeightForTx:
         """Mempool entries in blockchain.ref.get must use height=0"""
         mempool_entry = {'tx_hash': 'ff' * 32, 'height': 0}
         assert mempool_entry['height'] == 0
+
+
+class TestListLimitClamping:
+    """The v4 recency handlers were passing `limit` straight through to
+    _paginate_hydrated, which does a get_token DB read per scanned row — at
+    cost 2.0, and with hydration predicates that read rows without counting
+    them toward the page. Every sibling list handler in this module clamps."""
+
+    def test_clamps_to_max(self):
+        from electrumx.server.glyph_api import _clamp_list_limit, _MAX_LIST_LIMIT
+        assert _clamp_list_limit(10 ** 9) == _MAX_LIST_LIMIT
+        assert _clamp_list_limit(_MAX_LIST_LIMIT + 1) == _MAX_LIST_LIMIT
+
+    def test_passes_through_normal_values(self):
+        from electrumx.server.glyph_api import _clamp_list_limit
+        assert _clamp_list_limit(1) == 1
+        assert _clamp_list_limit(100) == 100
+        assert _clamp_list_limit(500) == 500
+
+    def test_floors_at_one(self):
+        """limit<=0 would make _paginate_hydrated return an empty page *with* a
+        cursor (it breaks on len(results) >= limit), which a paginating client
+        follows forever."""
+        from electrumx.server.glyph_api import _clamp_list_limit
+        assert _clamp_list_limit(0) == 1
+        assert _clamp_list_limit(-5) == 1
+
+    def test_non_numeric_falls_back_to_max(self):
+        from electrumx.server.glyph_api import _clamp_list_limit
+        assert _clamp_list_limit(None) == 500
+        assert _clamp_list_limit("abc") == 500
+
+    def test_numeric_string_is_coerced(self):
+        from electrumx.server.glyph_api import _clamp_list_limit
+        assert _clamp_list_limit("250") == 250
+
+
+@pytest.mark.asyncio
+class TestRecencyHandlersClampLimit:
+    """End-to-end: the handler must not hand an unbounded limit to the index."""
+
+    def _session(self):
+        from electrumx.server.glyph_api import GlyphAPIMixin
+
+        class _S(GlyphAPIMixin):
+            def __init__(self):
+                self.glyph_index = Mock()
+                self.glyph_index.get_recent_tokens = Mock(
+                    return_value={'tokens': [], 'next_cursor': None})
+                self.glyph_index.get_tokens_by_type = Mock(
+                    return_value={'tokens': [], 'next_cursor': None})
+
+            def bump_cost(self, _n):
+                pass
+
+        return _S()
+
+    async def test_get_recent_clamps(self):
+        s = self._session()
+        await s.glyph_get_recent(limit=10 ** 9)
+        assert s.glyph_index.get_recent_tokens.call_args.kwargs['limit'] == 500
+
+    async def test_get_recent_with_type_clamps(self):
+        s = self._session()
+        await s.glyph_get_recent(limit=10 ** 9, token_type=2)
+        assert s.glyph_index.get_tokens_by_type.call_args.kwargs['limit'] == 500
+
+    async def test_get_tokens_by_type_clamps(self):
+        s = self._session()
+        await s.glyph_get_tokens_by_type(token_type=2, limit=10 ** 9)
+        assert s.glyph_index.get_tokens_by_type.call_args.kwargs['limit'] == 500
+
+    async def test_zero_limit_becomes_one(self):
+        s = self._session()
+        await s.glyph_get_recent(limit=0)
+        assert s.glyph_index.get_recent_tokens.call_args.kwargs['limit'] == 1

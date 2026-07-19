@@ -258,6 +258,8 @@ class GlyphTokenInfo:
         'is_timelocked', 'timelock_mode', 'timelock_unlock_at', 'timelock_cek_hash', 'timelock_hint',
         # WAVE naming (REP-3011)
         'is_wave_duplicate',  # True if this WAVE name token is a duplicate (not canonical)
+        # Companion/plumbing singleton (see _mark_companion_singletons)
+        'is_companion',  # True if this is a sibling singleton owned by another token
     )
     
     def __init__(self):
@@ -321,6 +323,10 @@ class GlyphTokenInfo:
         self.timelock_hint = None       # Optional viewer hint
         # WAVE naming (REP-3011)
         self.is_wave_duplicate = False  # True if this WAVE name is a duplicate (not canonical)
+        # Companion/plumbing singleton owned by another token in the same tx
+        # (WAVE zone contract, dMint mining contract). See
+        # _mark_companion_singletons; parent_ref points at the owning token.
+        self.is_companion = False
     
     def to_bytes(self) -> bytes:
         """Serialize token info to CBOR bytes for flexible storage."""
@@ -382,6 +388,8 @@ class GlyphTokenInfo:
             'th': self.timelock_hint,
             # WAVE naming
             'wd': self.is_wave_duplicate or None,
+            # Companion singleton
+            'cn': self.is_companion or None,
         }
         # Remove None values to save space
         data = {k: v for k, v in data.items() if v is not None and v != 0 and v != b''}
@@ -456,7 +464,11 @@ class GlyphTokenInfo:
         info.timelock_hint = d.get('th')
         # WAVE naming
         info.is_wave_duplicate = bool(d.get('wd', False))
-        
+        # Companion singleton (absent on records written before this field
+        # existed — the read-side filter derives it for those, see
+        # _is_companion_singleton).
+        info.is_companion = bool(d.get('cn', False))
+
         return info
     
     def percent_mined(self) -> float:
@@ -1093,6 +1105,16 @@ class GlyphIndex:
 
         Returns a set of 36-byte contract refs (may be empty).
         """
+        return self._find_sibling_singletons(tx, token_ref)
+
+    def _find_sibling_singletons(self, tx: 'Tx', token_ref: bytes) -> set:
+        """Singleton refs minted by the same tx as ``token_ref``, excluding it.
+
+        The shared primitive behind ``_find_all_contract_refs`` (dMint mining
+        contracts) and ``_mark_companion_singletons`` (WAVE zone contracts):
+        both are "extra singleton outputs a mint created alongside the token
+        itself", and both use the same on-chain-verified filter.
+        """
         token_txid = token_ref[:32]
         found = set()
         for output in tx.outputs:
@@ -1102,6 +1124,63 @@ class GlyphIndex:
                         and ref_bytes[:32] == token_txid):
                     found.add(ref_bytes)
         return found
+
+    def _mark_companion_singletons(self, ref: bytes, tx: 'Tx',
+                                   height: int) -> int:
+        """Flag the sibling singletons a revealed token minted alongside itself.
+
+        A Glyph mint routinely creates more than one singleton output in one tx.
+        A WAVE registration mints the name singleton at vout 0 and its
+        zone/mutable contract at vout 1; a dMint deploy mints the token at
+        vout 0 and one contract singleton per parallel miner at vout 1..N.
+        Phase 1 registers *every* previously-unseen ref it finds in the outputs
+        as a token, but only the ref ``_find_output_ref`` returns (the first
+        singleton, i.e. vout 0) is later enriched by the reveal — so the
+        siblings persist as bare ``NFT`` / protocols ``[2]`` records with
+        ``name=None`` and no metadata.
+
+        Those records are honest: the outputs really are distinct on-chain
+        singletons, and they stay fully queryable by ref, by BY_TYPE and by
+        BY_PROTO. But they are the parent's plumbing rather than separately
+        discoverable assets, and on mainnet they are not a rare edge case —
+        every WAVE registration contributes one, so they were ~47% of the
+        all-types recency feed. Marking them here keeps them out of the
+        recency feeds (see ``_discovery_rows``) and gives clients an explicit
+        ``is_companion`` flag plus a ``parent_ref`` back-link, so nobody has to
+        reconstruct the pairing with a txid heuristic that breaks across page
+        boundaries.
+
+        The flag lives on the token record rather than being recomputed at
+        index-write time on purpose: ``_discovery_rows`` must stay a pure
+        function of ``(ref, token)`` so the live write path, the re-write
+        dedup, ``_delete_discovery_rows`` and the migration all derive the
+        exact same key set.
+
+        Returns the number of newly-marked siblings.
+        """
+        marked = 0
+        for sib_ref in self._find_sibling_singletons(tx, ref):
+            sib = self.token_cache.get(sib_ref)
+            if sib is None:
+                # Reveal landed in a later block than the mint: pull the record
+                # back into the cache so this flush rewrites it (the re-write
+                # path in flush() drops its stale discovery rows first).
+                sib = self.get_token(sib_ref)
+                if sib is None:
+                    continue
+                self.token_cache[sib_ref] = sib
+            if sib.is_companion:
+                continue
+            # Only ever demote a bare Phase-1 record. A sibling that carries its
+            # own name or metadata was revealed in its own right and is a real
+            # asset, not plumbing.
+            if sib.name or sib.metadata_hash:
+                continue
+            sib.is_companion = True
+            sib.parent_ref = ref_to_display(ref)  # canonical txid_vout
+            self.token_height[sib_ref] = height
+            marked += 1
+        return marked
 
     def _parse_deploy_contract_state(self, token: 'GlyphTokenInfo', tx: 'Tx'):
         """
@@ -1500,6 +1579,17 @@ class GlyphIndex:
         self.token_cache[ref] = token
         self.token_height[ref] = height
 
+        # Demote any sibling singletons this mint created (WAVE zone contract,
+        # dMint mining contracts) so they stay out of the recency feeds. Runs
+        # after the token is cached so a self-referential tx can't mark the
+        # revealed token itself.
+        companions = self._mark_companion_singletons(ref, tx, height)
+        if companions:
+            self.logger.info(
+                f'Glyph companion singletons: {companions} sibling output(s) of '
+                f'{ref_to_display(ref)} marked as plumbing (excluded from '
+                f'recency feeds)')
+
         # Add deploy event to history
         history_key = pack_history_key(ref, height, tx_idx)
         history_value = struct.pack('<B', GlyphEventType.DEPLOY) + tx_hash
@@ -1772,21 +1862,60 @@ class GlyphIndex:
         together and can be recreated/deleted deterministically from a token
         record.
 
-        GLOBAL_RECENT deliberately omits ``UNKNOWN`` (type 0) records so the
-        global ``glyph.get_recent`` feed matches the union of the per-type
-        recency lists. Type 0 is the catch-all for records that never resolved a
-        primary type — empty/malformed reveals (no protocols, no name) and
-        partial WAVE-name owner rows (protocol 11 without NFT, cf. wave_index
-        "track name owner on plain transfers"). Those still get a
-        BY_TYPE_RECENT row under type 0 (reachable via
-        ``get_recent(token_type=0)``) and their BY_PROTO facet rows, so nothing
-        is dropped — they are just kept out of the curated global feed, where
-        they surfaced as half-hydrated noise (v4 launch-day report). ``get_token``
-        hydration is symmetric across both feeds; this is the one point where the
-        global feed and the per-type indexes are intentionally allowed to differ.
+        Two kinds of record are curated out of the recency feeds. Both remain
+        fully queryable by ref (``get_token``), by BY_TYPE and by BY_PROTO —
+        the exclusions are about feed density, not about hiding data.
+
+        1. ``UNKNOWN`` (type 0) is omitted from GLOBAL_RECENT, so the global
+           feed matches the union of the per-type recency lists. Type 0 is the
+           catch-all for records that never resolved a primary type —
+           empty/malformed reveals (no protocols, no name) and partial
+           WAVE-name owner rows (protocol 11 without NFT, cf. wave_index
+           "track name owner on plain transfers"). They keep their
+           BY_TYPE_RECENT row under type 0, reachable via
+           ``get_recent(token_type=0)``, which is the *only* way to list them.
+
+           Provenance note: this exclusion was introduced in 423e020 citing a
+           launch-day report of a polluted global feed. That report was later
+           retracted — the reporting client was passing ``token_type=0``
+           through a parameter-parsing bug, so it was querying the UNKNOWN
+           bucket directly and seeing its honest contents; the real all-types
+           feed measured clean both before and after the fix. The exclusion is
+           kept on its own merits (the write path genuinely did index type-0
+           records here, so the feed *could* surface them), not on that
+           evidence. The same commit's "per-backend skew from load-balanced
+           backends" aside described a staleness symptom that never happened;
+           there is one backend. Do not go hunting it.
+
+        2. Companion singletons (``token.is_companion``) are omitted from both
+           GLOBAL_RECENT *and* BY_TYPE_RECENT. These are the extra singleton
+           outputs a mint creates alongside the token itself — a WAVE
+           registration's zone/mutable contract at vout 1, a dMint deploy's
+           mining contracts at vout 1..N — which Phase 1 registers as bare
+           ``NFT``/``[2]`` records with no name and no metadata. See
+           ``_mark_companion_singletons``. On mainnet every WAVE registration
+           contributed one, so before this exclusion they were ~47% of the
+           all-types feed and a comparable share of the type-2 feed; unlike the
+           type-0 case there is no separate bucket they would land in, so they
+           are dropped from the recency indexes outright and located instead
+           via the ``parent_ref`` back-link on the record.
+
+        ``get_token`` hydration is symmetric across all feeds; this generator is
+        the one point where the global feed and the per-type indexes are
+        intentionally allowed to differ.
+
+        Must stay a pure function of ``(ref, token)``: the live write path, the
+        re-write dedup in ``flush()``, ``_delete_discovery_rows`` and
+        ``_migrate_3_to_4`` all call it and must derive an identical key set, or
+        rows orphan.
         """
         dh = token.deploy_height
         tt = token.token_type
+        if token.is_companion:
+            # No recency rows at all — only the protocol facets.
+            for proto in set(token.protocols or ()):
+                yield pack_proto_key(proto, dh, ref), b''
+            return
         yield pack_type_recent_key(tt, dh, ref), b''
         if tt != GlyphTokenType.UNKNOWN:
             yield pack_global_recent_key(dh, ref), struct.pack('<B', tt & 0xFF)
@@ -2177,6 +2306,25 @@ class GlyphIndex:
         """
         return base64.urlsafe_b64encode(raw_key).decode()
 
+    def cursor_for_type_ref(self, token_type: int, ref: bytes) -> str:
+        """Cursor that resumes a ``get_tokens_by_type(order='ref')`` walk *at*
+        ``ref`` — i.e. ``ref`` is the first token the next page returns.
+
+        For callers that post-filter a page and stop partway through it. The
+        cursor ``get_tokens_by_type`` hands back points past everything it
+        scanned, so a caller that consumed only a prefix of the page and then
+        reused that cursor would silently skip the remainder. Building the
+        resume point from the first *unconsumed* token instead keeps the walk
+        gap-free. Seeks are inclusive, so the named ref is returned, not
+        skipped.
+
+        Only valid for the default ``order='ref'`` index (BY_TYPE); the recency
+        index keys embed deploy_height, so its cursors are not reconstructible
+        from a ref alone.
+        """
+        return self._encode_cursor(
+            GlyphDBKeys.BY_TYPE + struct.pack('<B', token_type & 0xFF) + ref)
+
     def get_balances_for_scripthash(self, scripthash: bytes,
                                      limit: int = 100,
                                      cursor: Optional[str] = None) -> Dict[str, Any]:
@@ -2448,6 +2596,44 @@ class GlyphIndex:
                 results.append(self._token_to_dict(token, include_embed_data=False))
         return {'tokens': results, 'next_cursor': next_cursor}
 
+    def _is_companion_singleton(self, token: 'GlyphTokenInfo') -> bool:
+        """Whether a hydrated record is a companion/plumbing singleton.
+
+        Prefers the stored ``is_companion`` flag. Records written before that
+        flag existed do not carry it, so for those the property is re-derived
+        here — which lets a DB indexed by an earlier build serve clean recency
+        feeds immediately, with no reindex (same approach 423e020 took for its
+        UNKNOWN read predicate).
+
+        The derivation mirrors ``_mark_companion_singletons``: a companion is a
+        bare Phase-1 singleton (no name, no metadata, plain ``NFT``/``[2]``) at
+        a non-zero vout whose vout-0 sibling in the same tx is a named token.
+        The structural checks run first and are pure record reads, so the extra
+        ``get_token`` only happens for rows that already look like plumbing.
+
+        Known trade-off: a batch mint that put several *genuinely distinct*
+        bare NFTs in one tx behind a named vout-0 token would also be filtered.
+        Such records are indistinguishable from plumbing at the record level —
+        this indexer only enriches one ref per reveal, so the others carry no
+        name or metadata either — and they are equally uninformative in a feed.
+        They stay reachable by ref, by BY_TYPE and by BY_PROTO.
+        """
+        if token.is_companion:
+            return True
+        if token.name or token.metadata_hash or token.parent_ref:
+            return False
+        if token.token_type != GlyphTokenType.NFT:
+            return False
+        if list(token.protocols or ()) != [GlyphProtocol.GLYPH_NFT]:
+            return False
+        if len(token.ref or b'') != 36:
+            return False  # malformed record — never raise from a list page
+        txid, vout = unpack_ref(token.ref)
+        if vout == 0:
+            return False  # vout 0 is the owning token, never the plumbing
+        parent = self.get_token(pack_ref(txid, 0))
+        return bool(parent is not None and parent.name)
+
     def get_tokens_by_type(self, token_type: int, limit: int = 100,
                            cursor: Optional[str] = None,
                            order: str = 'ref') -> Dict[str, Any]:
@@ -2458,27 +2644,37 @@ class GlyphIndex:
         cursors keep working. ``order='recent'`` — newest-deployed first via the
         v4 BY_TYPE_RECENT index. Cursors are order-specific (opaque raw keys) and
         must not be carried across a change of ``order``.
+
+        ``order='recent'`` additionally hides companion singletons (see
+        ``_discovery_rows``); ``order='ref'`` does not, so the legacy listing
+        stays a complete enumeration of the type.
         """
         if order == 'recent':
             prefix = GlyphDBKeys.BY_TYPE_RECENT + struct.pack('<B', token_type & 0xFF)
+            predicate = lambda t: not self._is_companion_singleton(t)  # noqa: E731
         else:
             prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', token_type & 0xFF)
-        return self._paginate_hydrated(prefix, limit, cursor)
+            predicate = None
+        return self._paginate_hydrated(prefix, limit, cursor, predicate=predicate)
 
     def get_recent_tokens(self, limit: int = 100,
                           cursor: Optional[str] = None) -> Dict[str, Any]:
         """Newest-deployed *typed* tokens across every type (v4 GLOBAL_RECENT).
 
         Matches the union of the per-type recency lists. The write path no
-        longer indexes UNKNOWN (type 0) records here, but a DB backfilled by an
-        earlier v4 build still holds those rows; the ``token_type != UNKNOWN``
-        predicate skips them on read so every backend serves a clean feed
+        longer indexes UNKNOWN (type 0) records or companion singletons here,
+        but a DB backfilled by an earlier build still holds those rows; the
+        read predicate skips both so every backend serves a clean feed
         immediately, without a re-migration. The cursor still advances over
         skipped rows (see ``_paginate_hydrated``), so pagination is unaffected.
+
+        See ``_discovery_rows`` for what each exclusion covers and why.
         """
         return self._paginate_hydrated(
             GlyphDBKeys.GLOBAL_RECENT, limit, cursor,
-            predicate=lambda token: token.token_type != GlyphTokenType.UNKNOWN)
+            predicate=lambda token: (
+                token.token_type != GlyphTokenType.UNKNOWN
+                and not self._is_companion_singleton(token)))
 
     def get_tokens_by_protocol(self, proto: int, limit: int = 100,
                                cursor: Optional[str] = None) -> Dict[str, Any]:
@@ -2559,6 +2755,11 @@ class GlyphIndex:
             'container_ref': token.container_ref,
             'authority_ref': token.authority_ref,
             'parent_ref': token.parent_ref,
+            # True for a sibling singleton owned by another token minted in the
+            # same tx (WAVE zone contract, dMint mining contract). Such rows are
+            # hidden from the recency feeds but still returned by direct and
+            # by-type lookups, so clients can drop them without txid pairing.
+            'is_companion': token.is_companion,
         }
         
         # Include image/content info

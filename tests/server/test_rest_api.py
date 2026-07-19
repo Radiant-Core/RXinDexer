@@ -1100,3 +1100,178 @@ class TestQueryParamLengthBounds:
     def test_protocols_within_bound_accepted(self, client, mock_glyph_index):
         resp = client.get('/glyphs/search?q=x&protocols=1,2,3')
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /wave/names — bounded scan + gap-free pagination
+#
+# The endpoint post-filters the type-5 token list (duplicate registrations are
+# dropped after the index scan), so it must scan more rows than it emits. It
+# used to do that with a single get_tokens_by_type(limit=limit*3) call, which
+# (a) hydrated up to 6000 rows per request and (b) returned that page's
+# next_cursor even when the dedup loop broke partway through it — silently
+# skipping every name between the break point and row 3*limit.
+# ---------------------------------------------------------------------------
+
+class _FakeTypeIndex:
+    """Models get_tokens_by_type(order='ref') with inclusive-seek cursors.
+
+    Cursor == ref_hex of the first row to return (None = start), which is
+    exactly the contract cursor_for_type_ref relies on.
+    """
+
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.calls = []  # (limit, cursor) per call
+
+    def get_tokens_by_type(self, token_type, limit=100, cursor=None, order='ref'):
+        self.calls.append((limit, cursor))
+        start = 0
+        if cursor is not None:
+            start = next((i for i, t in enumerate(self.tokens)
+                          if t['ref_hex'] == cursor), len(self.tokens))
+        page = self.tokens[start:start + limit]
+        nxt = start + limit
+        return {
+            'tokens': page,
+            'next_cursor': (self.tokens[nxt]['ref_hex']
+                            if nxt < len(self.tokens) else None),
+        }
+
+    @staticmethod
+    def cursor_for_type_ref(token_type, ref):
+        return ref.hex()
+
+
+def _wave_token(name, i, canonical=True):
+    """A type-5 token row as _token_to_dict would render it."""
+    txid = f'{i:064x}'
+    dup_txid = f'{i + 900000:064x}'
+    return {
+        'ref': f'{txid}_0',
+        'ref_hex': txid + '00000000',
+        'attrs': {'name': name, 'domain': 'rxd', 'target': f'addr{i}'},
+        'deploy_txid': txid if canonical else dup_txid,
+        'deploy_height': 400000 + i,
+        'is_spent': False,
+    }
+
+
+def _wire_wave_names(monkeypatch, tokens):
+    """Point the endpoint's module globals at a fake index + wave index."""
+    import electrumx.server.rest_api as api
+
+    fake = _FakeTypeIndex(tokens)
+    wave = Mock()
+    # Canonical ref for a name = the txid of its canonical token, little-endian.
+    canon = {}
+    for t in tokens:
+        nm = t['attrs']['name']
+        if t['deploy_txid'] == t['ref_hex'][:64]:
+            canon[nm] = bytes.fromhex(t['deploy_txid'])[::-1] + b'\x00' * 4
+    wave._resolve_name_to_ref = Mock(side_effect=lambda n: canon.get(n))
+    wave._has_duplicates = Mock(return_value=False)
+
+    monkeypatch.setattr(api, '_glyph_index', fake)
+    monkeypatch.setattr(api, '_wave_index', wave)
+    return fake
+
+
+def _walk_wave_names(client, limit, max_pages=50):
+    """Follow next_cursor to exhaustion; return the full name list."""
+    out, cursor, pages = [], None, 0
+    while pages < max_pages:
+        pages += 1
+        q = f'/wave/names?limit={limit}'
+        if cursor:
+            q += f'&cursor={cursor}'
+        r = client.get(q)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        out += [n['full_name'] for n in body['names']]
+        cursor = body['next_cursor']
+        if cursor is None:
+            return out
+    raise AssertionError('pagination did not terminate')
+
+
+class TestWaveNamesPagination:
+
+    def test_walk_is_gap_free_and_dupe_free(self, client, monkeypatch):
+        """The regression: a mid-page break must resume at the first
+        unconsumed row, not past the whole scanned chunk."""
+        tokens = [_wave_token(f'n{i:03d}', i) for i in range(120)]
+        _wire_wave_names(monkeypatch, tokens)
+
+        got = _walk_wave_names(client, limit=10)
+
+        assert got == [f'n{i:03d}.rxd' for i in range(120)]
+        assert len(got) == len(set(got))
+
+    def test_duplicate_registrations_are_filtered_but_not_skipped(
+            self, client, monkeypatch):
+        """Non-canonical rows are dropped, and dropping them must not consume
+        canonical rows that follow."""
+        tokens = []
+        for i in range(60):
+            # Every canonical row is trailed by a duplicate registration of the
+            # same name at its own distinct ref.
+            tokens.append(_wave_token(f'n{i:03d}', 2 * i))
+            tokens.append(_wave_token(f'n{i:03d}', 2 * i + 1, canonical=False))
+        _wire_wave_names(monkeypatch, tokens)
+
+        got = _walk_wave_names(client, limit=7)
+
+        assert got == [f'n{i:03d}.rxd' for i in range(60)]
+
+    def test_scan_is_bounded_per_request(self, client, monkeypatch):
+        """No single request may hand an unbounded limit to the index."""
+        tokens = [_wave_token(f'n{i:04d}', i) for i in range(3000)]
+        fake = _wire_wave_names(monkeypatch, tokens)
+
+        r = client.get('/wave/names?limit=2000')
+        assert r.status_code == 200
+
+        assert fake.calls, 'index was never queried'
+        assert max(limit for limit, _c in fake.calls) <= 500
+
+    def test_scan_ceiling_still_returns_a_cursor(self, client, monkeypatch):
+        """A page cut short by the scan ceiling must not look like the end of
+        the list, or a walker silently loses the tail."""
+        # 6000 rows, none canonical => nothing is emitted, but there IS more.
+        tokens = [_wave_token(f'n{i:04d}', i, canonical=False)
+                  for i in range(6000)]
+        _wire_wave_names(monkeypatch, tokens)
+
+        body = client.get('/wave/names?limit=10').json()
+
+        assert body['names'] == []
+        assert body['next_cursor'] is not None
+
+    def test_exhausted_index_returns_null_cursor(self, client, monkeypatch):
+        tokens = [_wave_token(f'n{i}', i) for i in range(3)]
+        _wire_wave_names(monkeypatch, tokens)
+
+        body = client.get('/wave/names?limit=100').json()
+
+        assert [n['full_name'] for n in body['names']] == ['n0.rxd', 'n1.rxd', 'n2.rxd']
+        assert body['next_cursor'] is None
+
+    def test_empty_index(self, client, monkeypatch):
+        _wire_wave_names(monkeypatch, [])
+        body = client.get('/wave/names?limit=10').json()
+        assert body['names'] == []
+        assert body['next_cursor'] is None
+
+    def test_full_page_ending_exactly_on_chunk_boundary(self, client, monkeypatch):
+        """limit filled by the last row of a chunk: resume must come from the
+        index's own cursor, not a mid-page reconstruction."""
+        tokens = [_wave_token(f'n{i:03d}', i) for i in range(20)]
+        _wire_wave_names(monkeypatch, tokens)
+
+        got = _walk_wave_names(client, limit=20)
+        assert got == [f'n{i:03d}.rxd' for i in range(20)]
+
+    def test_limit_zero_is_rejected(self, client, monkeypatch):
+        _wire_wave_names(monkeypatch, [])
+        assert client.get('/wave/names?limit=0').status_code == 422
