@@ -229,6 +229,10 @@ Get tokens by type.
 | `cursor` | string | Opaque pagination cursor from previous `next_cursor` |
 | `order` | string | `ref` (default, legacy ref-hash order) or `recent` (newest-deployed first). Cursors are order-specific. |
 
+`order: "recent"` omits companion singletons (see
+[glyph.get_recent](#glyphget_recent)); `order: "ref"` does not, so the legacy
+listing stays a complete enumeration of the type.
+
 **Returns:** `{tokens, next_cursor}`
 
 > **List responses omit raw embed payloads** (since `3131999`, 2026-07-19). All paginated
@@ -252,6 +256,16 @@ that never resolved a type (`UNKNOWN`/0 — empty or malformed reveals, and
 partial WAVE-name owner rows) are excluded here; query them explicitly with
 `token_type: 0`.
 
+> **`token_type: 0` is the only way to list UNKNOWN records.** They carry no
+> other primary type, so they appear in no other recency feed. This is
+> intended — but it also means an *absent* type filter and `token_type: 0` are
+> very different queries, not "all" and "all, redundantly". If your client
+> builds the filter by parsing a possibly-empty string, make sure the empty
+> case yields *no* filter rather than `[0]`; the `0` bucket is small and
+> advances only when a malformed reveal lands, so a client that accidentally
+> pins it sees a sparse, stale-looking feed of nameless type-0 rows and can
+> easily mistake that for a broken index.
+
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
@@ -260,6 +274,49 @@ partial WAVE-name owner rows) are excluded here; query them explicitly with
 | `token_type` | int | Optional GlyphTokenType filter; omit for all *typed* tokens. Pass `0` for the UNKNOWN bucket. |
 
 **Returns:** `{tokens, next_cursor}`
+
+#### Companion singletons are excluded from the recency feeds
+
+A single mint often creates more than one glyph output. A WAVE name
+registration mints the **name singleton at vout 0** (type 5, named, protocols
+`[2, 5, 11]`) *and* its **zone/mutable contract at vout 1**, which is a real
+on-chain token in its own right but is indexed with no name and no metadata
+(type 2, `name: null`, protocols `[2]`). A dMint deploy does the same thing
+with one mining-contract singleton per parallel contract at vout 1..N.
+
+These companion outputs are the parent token's plumbing, not separately
+discoverable assets. Before they were excluded, every WAVE registration put a
+nameless twin in the feed — on mainnet that was **47% of an all-types page**
+(28 nameless companions against 28 registrations in 60 rows). They are now
+omitted from both `glyph.get_recent` (all-types and per-type) and
+`glyph.get_tokens_by_type` with `order: "recent"`.
+
+They are **not** hidden generally. A companion is still returned by:
+
+- `glyph.get_by_ref` / `glyph.get_metadata` — direct lookup by ref
+- `glyph.get_tokens_by_type` with the default `order: "ref"`, which remains a
+  complete enumeration of the type
+- the by-protocol facet lists
+
+Every token row carries two fields for this:
+
+| Field | Meaning |
+|-------|---------|
+| `is_companion` | `true` if this row is a sibling singleton owned by another token minted in the same tx |
+| `parent_ref` | canonical `txid_vout` of the owning token (the WAVE name / dMint token), directly comparable to another row's `ref` |
+
+Clients that previously paired a nameless type-2 row against a type-5 row
+sharing its txid should drop that heuristic: it cannot work across a page
+boundary, where only one half of the pair is visible. Filter on
+`is_companion` instead, or simply rely on the feeds, which no longer contain
+them.
+
+> **Backends indexed before this change** still hold the companion rows in
+> their discovery index. The read path re-derives the property for records that
+> predate the `is_companion` field, so those backends serve clean feeds
+> immediately without a reindex — but on such a backend `is_companion` itself
+> reads `false` on the older rows. Treat the *feeds* as authoritative and the
+> field as a bonus until the backend has reindexed.
 
 ---
 
