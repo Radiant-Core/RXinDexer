@@ -208,6 +208,73 @@ class TestGlobalRecentAndProto:
 
 
 # --------------------------------------------------------------------------- #
+# GLOBAL_RECENT excludes UNKNOWN (type 0) so it matches the per-type feeds.
+# (v4 launch-day report: the global feed was polluted with half-hydrated type-0
+# rows — empty/malformed reveals and partial WAVE-name owner rows — that the
+# per-type recency queries never surface.)
+# --------------------------------------------------------------------------- #
+
+class TestGlobalRecentExcludesUnknown:
+    def _seed(self):
+        idx, db = _make_index()
+        real = _token("REAL", "e1" * 32, 200, GlyphTokenType.NFT,
+                      [GlyphProtocol.GLYPH_NFT])
+        # Partial WAVE-name owner row: WAVE protocol without NFT -> UNKNOWN type.
+        wave = _token("altapi.rxd", "e2" * 32, 210, GlyphTokenType.UNKNOWN,
+                      [GlyphProtocol.GLYPH_WAVE])
+        # Empty/malformed reveal: no protocols, no name -> UNKNOWN type.
+        junk = _token(None, "e3" * 32, 220, GlyphTokenType.UNKNOWN, [])
+        newer = _token("NEWER", "e4" * 32, 230, GlyphTokenType.NFT,
+                       [GlyphProtocol.GLYPH_NFT])
+        _deploy(idx, db, real, wave, junk, newer)
+        return idx, db
+
+    def test_write_path_omits_unknown_from_global(self):
+        idx, db = self._seed()
+        # Only the two typed tokens get a GLOBAL_RECENT (GQ) row.
+        gq = [k for k, _ in db.utxo_db.iterator(prefix=GlyphDBKeys.GLOBAL_RECENT)]
+        assert len(gq) == 2
+        # ...but every token still has a BY_TYPE_RECENT (GZ) row (type-0 bucket
+        # for the UNKNOWNs) — nothing is dropped from the index entirely.
+        gz = [k for k, _ in db.utxo_db.iterator(prefix=GlyphDBKeys.BY_TYPE_RECENT)]
+        assert len(gz) == 4
+
+    def test_global_feed_is_typed_only_newest_first(self):
+        idx, _ = self._seed()
+        r = idx.get_recent_tokens(limit=10)
+        assert _names(r) == ["NEWER", "REAL"]  # 230, 200 — UNKNOWNs excluded
+        assert r["next_cursor"] is None
+
+    def test_unknown_bucket_still_queryable_by_type(self):
+        idx, _ = self._seed()
+        u = idx.get_tokens_by_type(GlyphTokenType.UNKNOWN, order="recent")
+        assert _names(u) == [None, "altapi.rxd"]  # 220, 210
+
+    def test_legacy_global_rows_filtered_on_read(self):
+        """A DB backfilled by an earlier v4 build still holds UNKNOWN GQ rows;
+        the read predicate hides them without a re-migration, and paginated
+        cursors stay newest-first with no duplicates across skipped rows."""
+        idx, db = self._seed()
+        # Simulate the pre-fix backfill: force the UNKNOWN rows back into GQ.
+        from electrumx.server.glyph_index import pack_global_recent_key
+        for ref_hex, h in (("e2" * 32, 210), ("e3" * 32, 220)):
+            key = pack_global_recent_key(h, pack_ref(bytes.fromhex(ref_hex), 0))
+            db.utxo_db._store[key] = struct.pack("<B", 0)
+        assert len([k for k, _ in
+                    db.utxo_db.iterator(prefix=GlyphDBKeys.GLOBAL_RECENT)]) == 4
+
+        # Walk one row at a time; leading/interleaved junk must not stall or dup.
+        seen, cur = [], None
+        for _ in range(10):
+            p = idx.get_recent_tokens(limit=1, cursor=cur)
+            seen += _names(p)
+            cur = p["next_cursor"]
+            if cur is None:
+                break
+        assert seen == ["NEWER", "REAL"]
+
+
+# --------------------------------------------------------------------------- #
 # Re-write (mutable metadata UPDATE) must not duplicate a token
 # --------------------------------------------------------------------------- #
 
