@@ -38,6 +38,27 @@ from electrumx.server.glyph_subscriptions import SubscriptionLimitError
 # See docs/pagination-cursors.md.
 _CURSOR_UNSET = object()
 
+# Upper bound for hydrated list pages. Matches the REST side, where FastAPI
+# already enforces it via Query(le=500).
+_MAX_LIST_LIMIT = 500
+
+
+def _clamp_list_limit(limit: int, maximum: int = _MAX_LIST_LIMIT) -> int:
+    """Clamp a client-supplied page size for a hydrated list endpoint.
+
+    Every row a list endpoint scans costs a ``get_token`` DB read, and rows
+    dropped by a hydration predicate are read without counting toward the page
+    — so an unbounded ``limit`` lets one cheap (cost 2.0) call walk an entire
+    index. The floor of 1 matters too: ``_paginate_hydrated`` breaks on
+    ``len(results) >= limit``, so ``limit <= 0`` would return an empty page
+    *with* a cursor, which a paginating client follows forever.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return maximum
+    return max(1, min(limit, maximum))
+
 
 class GlyphAPIMixin:
     """
@@ -514,7 +535,9 @@ class GlyphAPIMixin:
 
         Args:
             token_type: GlyphTokenType ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, etc.)
-            limit: Maximum results
+            limit: Maximum results (clamped to 1..500 — each row costs a
+                   get_token DB read, and filtered rows are hydrated without
+                   counting toward the page)
             cursor: Opaque pagination cursor from previous response next_cursor
             order: 'ref' (default, legacy ref-hash order) or 'recent'
                    (newest-deployed first, via the v4 recency index). Cursors
@@ -529,7 +552,7 @@ class GlyphAPIMixin:
             return {'error': 'Glyph indexing not enabled'}
 
         return self.glyph_index.get_tokens_by_type(
-            token_type, limit=limit, cursor=cursor, order=order
+            token_type, limit=_clamp_list_limit(limit), cursor=cursor, order=order
         )
 
     async def glyph_get_recent(self, limit: int = 100, cursor: str = None,
@@ -538,7 +561,8 @@ class GlyphAPIMixin:
         Newest-deployed Glyph tokens (v4 discovery index).
 
         Args:
-            limit: Maximum results
+            limit: Maximum results (clamped to 1..500 — see
+                   glyph_get_tokens_by_type)
             cursor: Opaque pagination cursor from previous response next_cursor
             token_type: Optional GlyphTokenType filter. When given, lists newest
                         tokens of that type; otherwise newest across all types.
@@ -551,6 +575,7 @@ class GlyphAPIMixin:
         if not hasattr(self, 'glyph_index') or not self.glyph_index:
             return {'error': 'Glyph indexing not enabled'}
 
+        limit = _clamp_list_limit(limit)
         if token_type is not None:
             return self.glyph_index.get_tokens_by_type(
                 token_type, limit=limit, cursor=cursor, order='recent'

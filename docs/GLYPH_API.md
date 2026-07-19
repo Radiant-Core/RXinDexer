@@ -225,7 +225,7 @@ Get tokens by type.
 | Name | Type | Description |
 |------|------|-------------|
 | `token_type` | int | GlyphTokenType ID (1=FT, 2=NFT, etc.) |
-| `limit` | int | Maximum results (default 100) |
+| `limit` | int | Maximum results (default 100, **clamped to 500**) |
 | `cursor` | string | Opaque pagination cursor from previous `next_cursor` |
 | `order` | string | `ref` (default, legacy ref-hash order) or `recent` (newest-deployed first). Cursors are order-specific. |
 
@@ -269,7 +269,7 @@ partial WAVE-name owner rows) are excluded here; query them explicitly with
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
-| `limit` | int | Maximum results (default 100) |
+| `limit` | int | Maximum results (default 100, **clamped to 500**) |
 | `cursor` | string | Opaque pagination cursor from previous `next_cursor` |
 | `token_type` | int | Optional GlyphTokenType filter; omit for all *typed* tokens. Pass `0` for the UNKNOWN bucket. |
 
