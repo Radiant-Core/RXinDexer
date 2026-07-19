@@ -2429,7 +2429,8 @@ class GlyphIndex:
                 break
             token = self.get_token(key[-36:])
             if token and (predicate is None or predicate(token)):
-                results.append(self._token_to_dict(token))
+                # No raw embed payloads in LIST pages — see _token_to_dict.
+                results.append(self._token_to_dict(token, include_embed_data=False))
         return {'tokens': results, 'next_cursor': next_cursor}
 
     def get_tokens_by_type(self, token_type: int, limit: int = 100,
@@ -2485,11 +2486,17 @@ class GlyphIndex:
         return None
     
     def _token_to_dict(self, token: GlyphTokenInfo, include_dmint: bool = True,
-                        include_content: bool = True) -> Dict[str, Any]:
+                        include_content: bool = True,
+                        include_embed_data: bool = True) -> Dict[str, Any]:
         """
         Convert token info to API dict.
-        
+
         Returns all fields needed by explorers, wallets, and exchanges.
+        ``include_embed_data=False`` keeps the ``embed`` summary (type/size)
+        but omits the raw hex payload — LIST responses must use it, because a
+        page of icon-heavy tokens otherwise ships megabytes per page and blows
+        the ElectrumX per-session bandwidth budget (the session gets dropped
+        mid-pagination). Single-token endpoints keep the full payload.
         """
         txid, vout = unpack_ref(token.ref)
         
@@ -2570,7 +2577,8 @@ class GlyphIndex:
                             result['embed'] = {
                                 'type': file_obj.get('t') or file_obj.get('type'),
                                 'size': len(b) if isinstance(b, (bytes, bytearray)) else None,
-                                'data': bytes(b).hex() if isinstance(b, (bytes, bytearray)) else None,
+                                'data': (bytes(b).hex() if isinstance(b, (bytes, bytearray)) else None)
+                                        if include_embed_data else None,
                             }
         
         # Include dMint-specific fields for minable tokens
