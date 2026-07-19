@@ -3,7 +3,15 @@ attrs
 plyvel
 pylru
 aiohttp>=3.3,<4.0
-websockets>=10.0,<16.0
+# Must track requirements.txt exactly. websockets 14 swapped `websockets.serve`
+# from the legacy asyncio server to websockets.asyncio.server, and the two
+# expose the handshake differently (legacy: connection.request_headers; new:
+# connection.request.headers). This file used to allow <16.0 while the runtime
+# pinned <14.0, so CI resolved 15.0.1 against a production that runs 13.1 —
+# i.e. CI exercised a different websockets implementation than the server
+# actually uses, on the exact axis where they diverge. Bump both together,
+# deliberately, not one as a side effect.
+websockets>=10.0,<14.0
 psutil
 cbor2>=5.4.0
 

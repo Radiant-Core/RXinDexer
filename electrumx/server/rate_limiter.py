@@ -334,8 +334,21 @@ class IPRateLimiter:
         """Best-effort read of a request header from a (WS) session/transport.
 
         Supports several shapes so tests and the live WS transport both work:
-        ``session.request_headers``, ``session.transport.websocket.request_headers``
-        and a plain ``session.headers`` mapping.  Returns None if unavailable.
+        ``session.request_headers``, ``session.transport.websocket.request_headers``,
+        ``…websocket.request.headers`` and a plain ``session.headers`` mapping.
+        Returns None if unavailable.
+
+        The two websocket shapes are a library-version split, and getting it
+        wrong fails *silently* rather than loudly — which is why both are
+        covered here. ``websockets.serve`` resolves to the legacy asyncio
+        server below 14 and to ``websockets.asyncio.server`` from 14 on, and
+        the new server does not carry ``request_headers`` at all; the handshake
+        request moved to ``websocket.request``. Since this helper falls back to
+        None on a missing attribute, a version bump alone would leave
+        X-Forwarded-For permanently unresolved: with TRUST_PROXY on, every
+        client would collapse onto the proxy's own address and share one
+        rate-limit bucket. Verified against 13.1 (``request_headers`` present,
+        ``request`` absent) and 16.1 (the reverse).
         """
         candidates = []
         for obj in (session, getattr(session, 'transport', None)):
@@ -344,6 +357,8 @@ class IPRateLimiter:
             ws = getattr(obj, 'websocket', None)
             if ws is not None:
                 candidates.append(getattr(ws, 'request_headers', None))
+                candidates.append(
+                    getattr(getattr(ws, 'request', None), 'headers', None))
             candidates.append(getattr(obj, 'request_headers', None))
             candidates.append(getattr(obj, 'headers', None))
         for headers in candidates:
