@@ -2,7 +2,7 @@ aiorpcx[ws]>=0.22,<0.26
 attrs
 plyvel
 pylru
-aiohttp>=3.3,<4.0
+aiohttp>=3.14.1,<4.0
 # Must track requirements.txt exactly. websockets 14 swapped `websockets.serve`
 # from the legacy asyncio server to websockets.asyncio.server, and the two
 # expose the handshake differently (legacy: connection.request_headers; new:
