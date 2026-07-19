@@ -246,12 +246,18 @@ Get tokens by type.
 
 Newest-deployed tokens (v4 discovery index), across all types or one type.
 
+The all-types feed (no `token_type`) lists only tokens with a resolved
+primary type, so it matches the union of the per-type recency lists. Records
+that never resolved a type (`UNKNOWN`/0 — empty or malformed reveals, and
+partial WAVE-name owner rows) are excluded here; query them explicitly with
+`token_type: 0`.
+
 **Parameters:**
 | Name | Type | Description |
 |------|------|-------------|
 | `limit` | int | Maximum results (default 100) |
 | `cursor` | string | Opaque pagination cursor from previous `next_cursor` |
-| `token_type` | int | Optional GlyphTokenType filter; omit for all types |
+| `token_type` | int | Optional GlyphTokenType filter; omit for all *typed* tokens. Pass `0` for the UNKNOWN bucket. |
 
 **Returns:** `{tokens, next_cursor}`
 

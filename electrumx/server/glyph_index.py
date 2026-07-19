@@ -1767,14 +1767,29 @@ class GlyphIndex:
     def _discovery_rows(self, ref: bytes, token: 'GlyphTokenInfo'):
         """Yield (key, value) for the v4 discovery rows a token owns.
 
-        One BY_TYPE_RECENT + one GLOBAL_RECENT + one BY_PROTO per distinct
-        protocol. All keyed on ``token.deploy_height`` so they stay together and
-        can be recreated/deleted deterministically from a token record.
+        One BY_TYPE_RECENT + (for a real type) one GLOBAL_RECENT + one BY_PROTO
+        per distinct protocol. All keyed on ``token.deploy_height`` so they stay
+        together and can be recreated/deleted deterministically from a token
+        record.
+
+        GLOBAL_RECENT deliberately omits ``UNKNOWN`` (type 0) records so the
+        global ``glyph.get_recent`` feed matches the union of the per-type
+        recency lists. Type 0 is the catch-all for records that never resolved a
+        primary type — empty/malformed reveals (no protocols, no name) and
+        partial WAVE-name owner rows (protocol 11 without NFT, cf. wave_index
+        "track name owner on plain transfers"). Those still get a
+        BY_TYPE_RECENT row under type 0 (reachable via
+        ``get_recent(token_type=0)``) and their BY_PROTO facet rows, so nothing
+        is dropped — they are just kept out of the curated global feed, where
+        they surfaced as half-hydrated noise (v4 launch-day report). ``get_token``
+        hydration is symmetric across both feeds; this is the one point where the
+        global feed and the per-type indexes are intentionally allowed to differ.
         """
         dh = token.deploy_height
         tt = token.token_type
         yield pack_type_recent_key(tt, dh, ref), b''
-        yield pack_global_recent_key(dh, ref), struct.pack('<B', tt & 0xFF)
+        if tt != GlyphTokenType.UNKNOWN:
+            yield pack_global_recent_key(dh, ref), struct.pack('<B', tt & 0xFF)
         for proto in set(token.protocols or ()):
             yield pack_proto_key(proto, dh, ref), b''
 
@@ -2452,8 +2467,18 @@ class GlyphIndex:
 
     def get_recent_tokens(self, limit: int = 100,
                           cursor: Optional[str] = None) -> Dict[str, Any]:
-        """Newest-deployed tokens across every type (v4 GLOBAL_RECENT index)."""
-        return self._paginate_hydrated(GlyphDBKeys.GLOBAL_RECENT, limit, cursor)
+        """Newest-deployed *typed* tokens across every type (v4 GLOBAL_RECENT).
+
+        Matches the union of the per-type recency lists. The write path no
+        longer indexes UNKNOWN (type 0) records here, but a DB backfilled by an
+        earlier v4 build still holds those rows; the ``token_type != UNKNOWN``
+        predicate skips them on read so every backend serves a clean feed
+        immediately, without a re-migration. The cursor still advances over
+        skipped rows (see ``_paginate_hydrated``), so pagination is unaffected.
+        """
+        return self._paginate_hydrated(
+            GlyphDBKeys.GLOBAL_RECENT, limit, cursor,
+            predicate=lambda token: token.token_type != GlyphTokenType.UNKNOWN)
 
     def get_tokens_by_protocol(self, proto: int, limit: int = 100,
                                cursor: Optional[str] = None) -> Dict[str, Any]:
