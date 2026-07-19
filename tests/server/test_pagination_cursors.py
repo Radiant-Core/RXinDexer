@@ -595,3 +595,44 @@ class TestWaveSubdomainsCursor:
         assert cursor_shape == {
             'entries': [], 'next_cursor': None, 'has_more': False,
         }
+
+
+class TestCursorUrlSafety:
+    """Cursors travel in REST query strings, where a raw '+' is form-decoded
+    to a space. Encoders must emit the URL-safe alphabet; decoders must accept
+    URL-safe, legacy standard, AND space-mangled legacy cursors. Regression for
+    the live bug where /glyphs/recent page 2 re-served page 1 (decode failed ->
+    seek silently fell back to the prefix)."""
+
+    # A key whose standard-b64 encoding contains BOTH '+' and '/'.
+    RAW = bytes(range(248, 256)) * 3
+
+    def _codecs(self):
+        from electrumx.server.glyph_index import GlyphIndex
+        from electrumx.server import swap_index
+        return [
+            (GlyphIndex._encode_cursor, GlyphIndex._decode_cursor),
+            (swap_index._encode_cursor, swap_index._decode_cursor),
+        ]
+
+    def test_encoders_emit_urlsafe(self):
+        for enc, _dec in self._codecs():
+            c = enc(self.RAW)
+            assert '+' not in c and '/' not in c
+
+    def test_roundtrip_urlsafe(self):
+        for enc, dec in self._codecs():
+            assert dec(enc(self.RAW)) == self.RAW
+
+    def test_decodes_legacy_standard_alphabet(self):
+        import base64
+        legacy = base64.b64encode(self.RAW).decode()
+        assert '+' in legacy or '/' in legacy
+        for _enc, dec in self._codecs():
+            assert dec(legacy) == self.RAW
+
+    def test_decodes_space_mangled_legacy(self):
+        import base64
+        mangled = base64.b64encode(self.RAW).decode().replace('+', ' ')
+        for _enc, dec in self._codecs():
+            assert dec(mangled) == self.RAW

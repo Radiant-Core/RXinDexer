@@ -1214,7 +1214,10 @@ class WaveIndex:
             start_char = 0
             if cursor:
                 try:
-                    decoded = base64.b64decode(cursor)
+                    # URL-safe first; tolerate legacy standard-alphabet cursors
+                    # and a '+' that a query-string parser turned into a space.
+                    decoded = base64.b64decode(
+                        cursor.replace(' ', '+').replace('-', '+').replace('_', '/'))
                     if len(decoded) == 1:
                         start_char = decoded[0]
                 except Exception:
@@ -1226,7 +1229,7 @@ class WaveIndex:
                 if not child_ref:
                     continue
                 if len(entries) >= limit:
-                    next_cursor = base64.b64encode(bytes([char_idx])).decode()
+                    next_cursor = base64.urlsafe_b64encode(bytes([char_idx])).decode()
                     break
                 entries.append({
                     'char': index_to_char(char_idx),

@@ -28,19 +28,26 @@ except ImportError:
 
 
 def _encode_cursor(raw_key: bytes) -> str:
-    """Encode raw RocksDB seek key to opaque base64 cursor.
+    """Encode raw RocksDB seek key to an opaque cursor.
 
-    Shared helper for cursor pagination. See docs/pagination-cursors.md.
+    URL-safe base64 (``-_`` not ``+/``): cursors travel in REST query strings,
+    where a ``+`` is form-decoded to a space and silently reset pagination to
+    page 1. Shared helper for cursor pagination. See docs/pagination-cursors.md.
     """
-    return base64.b64encode(raw_key).decode()
+    return base64.urlsafe_b64encode(raw_key).decode()
 
 
 def _decode_cursor(cursor: Optional[str]) -> Optional[bytes]:
-    """Decode opaque cursor back to seek key. Returns None on failure."""
+    """Decode opaque cursor back to seek key. Returns None on failure.
+
+    Accepts both the URL-safe and legacy standard alphabets, and restores a
+    ``+`` that a query-string parser turned into a space.
+    """
     if not cursor:
         return None
     try:
-        return base64.b64decode(cursor)
+        normalised = cursor.replace(' ', '+').replace('-', '+').replace('_', '/')
+        return base64.b64decode(normalised)
     except Exception:
         return None
 

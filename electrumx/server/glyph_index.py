@@ -2135,18 +2135,32 @@ class GlyphIndex:
     
     @staticmethod
     def _decode_cursor(cursor: Optional[str]) -> Optional[bytes]:
-        """R16: Decode opaque base64 cursor to raw RocksDB seek key."""
+        """R16: Decode an opaque base64 cursor to a raw RocksDB seek key.
+
+        Accepts BOTH the URL-safe alphabet (what ``_encode_cursor`` now emits)
+        and the legacy standard alphabet (cursors already held by clients).
+        A ``+`` that a query-string parser turned into a space is restored
+        before decoding — that mangling silently reset REST pagination to
+        page 1 (decode failed → seek fell back to the prefix).
+        """
         if not cursor:
             return None
         try:
-            return base64.b64decode(cursor)
+            normalised = cursor.replace(' ', '+').replace('-', '+').replace('_', '/')
+            return base64.b64decode(normalised)
         except Exception:
             return None
 
     @staticmethod
     def _encode_cursor(raw_key: bytes) -> str:
-        """R16: Encode raw RocksDB key to opaque base64 cursor."""
-        return base64.b64encode(raw_key).decode()
+        """R16: Encode a raw RocksDB key as an opaque cursor.
+
+        URL-safe alphabet (``-_`` instead of ``+/``): cursors travel in REST
+        query strings, where ``+`` is form-decoded to a space and breaks the
+        round-trip. ``_decode_cursor`` still accepts old standard-alphabet
+        cursors.
+        """
+        return base64.urlsafe_b64encode(raw_key).decode()
 
     def get_balances_for_scripthash(self, scripthash: bytes,
                                      limit: int = 100,
