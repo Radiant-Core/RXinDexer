@@ -883,6 +883,32 @@ async def get_glyphs_recent(
         raise _internal_error(e)
 
 
+@app.get("/glyphs/encrypted", tags=["Encrypted"])
+async def list_encrypted_tokens(
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+    timelocked_only: bool = Query(default=False, description="Only return timelocked tokens"),
+):
+    """
+    List encrypted Glyph tokens.
+
+    Privacy-preserving: only returns ciphertext hashes and metadata
+    commitments — never plaintext content or CEKs.
+
+    NB: registered BEFORE /glyphs/{ref} — FastAPI matches routes in
+    registration order, and the catch-all {ref} route otherwise swallows
+    the literal path segment "encrypted" and 422s on ref validation.
+    """
+    _ensure_glyph_index()
+    try:
+        result = _glyph_index.list_encrypted_tokens(
+            limit=limit, cursor=cursor, timelocked_only=timelocked_only
+        )
+        return {**result, "timelocked_only": timelocked_only}
+    except Exception as e:
+        raise _internal_error(e)
+
+
 @app.get("/glyphs/{ref}", tags=["Glyphs"])
 async def get_glyph(ref: str = _REF_PATH):
     """Get Glyph token by reference (72 hex chars = 36 bytes)."""
@@ -1274,28 +1300,6 @@ async def get_token_metadata(ref: str = _REF_PATH):
 # =============================================================================
 # ENCRYPTED TOKENS (Phase 6 / REP-3008 + REP-3009)
 # =============================================================================
-
-@app.get("/glyphs/encrypted", tags=["Encrypted"])
-async def list_encrypted_tokens(
-    limit: int = Query(default=100, le=500),
-    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
-    timelocked_only: bool = Query(default=False, description="Only return timelocked tokens"),
-):
-    """
-    List encrypted Glyph tokens.
-
-    Privacy-preserving: only returns ciphertext hashes and metadata
-    commitments — never plaintext content or CEKs.
-    """
-    _ensure_glyph_index()
-    try:
-        result = _glyph_index.list_encrypted_tokens(
-            limit=limit, cursor=cursor, timelocked_only=timelocked_only
-        )
-        return {**result, "timelocked_only": timelocked_only}
-    except Exception as e:
-        raise _internal_error(e)
-
 
 @app.get("/glyphs/{ref}/key-reveal", tags=["Encrypted"])
 async def get_key_reveal(ref: str = _REF_PATH):

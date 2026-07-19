@@ -357,6 +357,15 @@ class TestGlyphEndpoints:
         assert resp.status_code == 200
         mock_glyph_index.get_tokens_by_type.assert_called_with(2, limit=100, cursor=None, order='recent')
 
+    def test_glyphs_encrypted_not_shadowed_by_ref_route(self, client, mock_glyph_index):
+        """Regression: /glyphs/encrypted must be registered BEFORE /glyphs/{ref},
+        else the catch-all ref route swallows the literal segment and 422s."""
+        mock_glyph_index.list_encrypted_tokens.return_value = {'tokens': [], 'next_cursor': None}
+        resp = client.get('/glyphs/encrypted')
+        assert resp.status_code == 200
+        assert resp.json()['timelocked_only'] is False
+        mock_glyph_index.list_encrypted_tokens.assert_called_once()
+
     def test_get_glyph_by_ref(self, client, mock_glyph_index):
         ref = _make_ref()
         token = Mock()
