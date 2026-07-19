@@ -57,11 +57,24 @@ class GlyphDBKeys:
     CONTRACT_TO_TOKEN = b'GC'  # GC + contract_ref(36) -> token_ref(36) (R6 reverse index)
     STATS = b'GSTAT'           # GSTAT -> CBOR {total, ft, nft, dat, dmint, v1, v2} (R11)
     SCHEMA_VERSION = b'GVER'   # GVER -> uint8 schema version (R21)
+    # --- v4 discovery indexes (recency-ordered; see _migrate_3_to_4) ---
+    # inv_height = 0xFFFFFFFF - deploy_height, so a *forward* prefix scan
+    # yields newest-first without a reverse iterator (which has mishandled
+    # `seek` here before — see reverse-cursor-storage fix). Prefixes are chosen
+    # to avoid the GY* aliasing trap (a GY-prefixed key would collide with the
+    # BY_TYPE prefix scan `GY + type_byte`; cf. realm_index "no prefix may be a
+    # prefix of another").
+    BY_TYPE_RECENT = b'GZ'     # GZ + type(1) + inv_height(4 be) + ref(36) -> b''
+    BY_PROTO = b'GP'           # GP + proto(1) + inv_height(4 be) + ref(36) -> b''
+    GLOBAL_RECENT = b'GQ'      # GQ + inv_height(4 be) + ref(36) -> type(1)
 
 
 # v3: per-dMint-contract liveness (`live_contracts`) for correct burn detection.
-# Requires a full reindex to backfill the live-contract set for existing tokens.
-CURRENT_SCHEMA_VERSION = 3
+#     Requires a full reindex to backfill the live-contract set for existing tokens.
+# v4: recency-ordered discovery indexes (BY_TYPE_RECENT / BY_PROTO / GLOBAL_RECENT).
+#     Backfillable in place from existing GT rows (deploy_height + protocols are
+#     already stored) — no radiantd rescan; see _migrate_3_to_4.
+CURRENT_SCHEMA_VERSION = 4
 
 
 # History event types
@@ -181,8 +194,38 @@ def pack_token_key(ref: bytes) -> bytes:
 
 def pack_history_key(ref: bytes, height: int, tx_idx: int) -> bytes:
     """Pack a history key."""
-    return (GlyphDBKeys.HISTORY + ref + 
+    return (GlyphDBKeys.HISTORY + ref +
             struct.pack('>I', height) + struct.pack('>H', tx_idx))
+
+
+# v4 discovery indexes ------------------------------------------------------
+# All three encode the deploy height as its 32-bit complement so a forward
+# RocksDB prefix scan (the cursor machinery here only seeks forward) returns
+# newest-first. Height is well under 2**32, so the complement never underflows.
+INV_HEIGHT_MAX = 0xFFFFFFFF
+
+
+def _inv_height(deploy_height: int) -> bytes:
+    """4-byte big-endian complement of a deploy height (newest sorts first)."""
+    h = deploy_height if 0 <= deploy_height <= INV_HEIGHT_MAX else 0
+    return pack_be_uint32(INV_HEIGHT_MAX - h)
+
+
+def pack_type_recent_key(token_type: int, deploy_height: int, ref: bytes) -> bytes:
+    """GZ + type(1) + inv_height(4) + ref — newest-first list within a type."""
+    return (GlyphDBKeys.BY_TYPE_RECENT + struct.pack('<B', token_type & 0xFF)
+            + _inv_height(deploy_height) + ref)
+
+
+def pack_proto_key(proto: int, deploy_height: int, ref: bytes) -> bytes:
+    """GP + proto(1) + inv_height(4) + ref — newest-first list per protocol."""
+    return (GlyphDBKeys.BY_PROTO + struct.pack('<B', proto & 0xFF)
+            + _inv_height(deploy_height) + ref)
+
+
+def pack_global_recent_key(deploy_height: int, ref: bytes) -> bytes:
+    """GQ + inv_height(4) + ref — newest-first list across every type."""
+    return GlyphDBKeys.GLOBAL_RECENT + _inv_height(deploy_height) + ref
 
 
 class GlyphTokenInfo:
@@ -528,21 +571,110 @@ class GlyphIndex:
                 self._scrub_denylist_metadata()
     
     def _check_schema_version(self):
-        """R21 — Verify DB schema version. Hard fail on mismatch."""
+        """R21 — Verify/upgrade DB schema version.
+
+        Three cases:
+          * Fresh DB (no version key): stamp CURRENT and return. A from-scratch
+            reindex replays every block through the token write path, which now
+            populates the v4 discovery indexes natively — no migration needed.
+          * Up to date: log and return.
+          * Behind: apply in-place migrations one step at a time where an
+            in-place migrator exists; hard-fail (full reindex required) for any
+            gap without one. This preserves the old safety net for schema
+            changes that genuinely need a rescan, while letting the v3->v4
+            discovery-index upgrade run without deleting the DB.
+        """
         raw = self.db.utxo_db.get(GlyphDBKeys.SCHEMA_VERSION)
         if raw is None:
             self.db.utxo_db.put(GlyphDBKeys.SCHEMA_VERSION,
                                 bytes([CURRENT_SCHEMA_VERSION]))
             self.logger.info(f'Glyph DB schema version initialised to {CURRENT_SCHEMA_VERSION}')
-        else:
-            v = raw[0]
-            if v < CURRENT_SCHEMA_VERSION:
+            return
+
+        v = raw[0]
+        if v > CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f'FATAL: Glyph DB schema version {v} > {CURRENT_SCHEMA_VERSION} — '
+                f'the DB was written by a newer RXinDexer. Upgrade the software '
+                f'or reindex.'
+            )
+        if v == CURRENT_SCHEMA_VERSION:
+            self.logger.info(f'Glyph DB schema version {v} OK')
+            return
+
+        # v < CURRENT — walk the in-place migration chain.
+        migrations = {3: self._migrate_3_to_4}
+        while v < CURRENT_SCHEMA_VERSION:
+            migrator = migrations.get(v)
+            if migrator is None:
                 raise RuntimeError(
-                    f'FATAL: Glyph DB schema version {v} < {CURRENT_SCHEMA_VERSION}. '
-                    f'A full reindex is required. '
+                    f'FATAL: Glyph DB schema version {v} < {CURRENT_SCHEMA_VERSION} '
+                    f'has no in-place migration. A full reindex is required. '
                     f'Delete the DB directory and restart.'
                 )
-            self.logger.info(f'Glyph DB schema version {v} OK')
+            self.logger.info(f'Glyph DB schema migration v{v} -> v{v + 1} starting…')
+            migrator()
+            v += 1
+            self.db.utxo_db.put(GlyphDBKeys.SCHEMA_VERSION, bytes([v]))
+            self.logger.info(f'Glyph DB schema upgraded to v{v}')
+
+    def _migrate_3_to_4(self) -> int:
+        """v3 -> v4: backfill the recency-ordered discovery indexes in place.
+
+        Walks existing GT rows — each already stores ``deploy_height`` and
+        ``protocols`` — and writes the BY_TYPE_RECENT / BY_PROTO / GLOBAL_RECENT
+        rows. No radiantd rescan and no block reprocessing.
+
+        Notes:
+          * Idempotent — re-writing the same derived keys is a no-op, so a run
+            interrupted before the version stamp is safe to repeat.
+          * Page-committed via ``seek`` so it never holds a RocksDB iterator open
+            across a ``write_batch`` commit and never buffers the whole keyspace.
+          * No undo is recorded. The migration runs at startup before block sync,
+            so no reorg is concurrent; the only residue a later deep reorg could
+            leave is an orphan recency row for a just-deployed token whose GT row
+            is unwound — and every list query hydrates via ``get_token`` and
+            skips a ref whose token is gone, so orphans are inert (self-healing).
+        """
+        prefix = GlyphDBKeys.TOKEN
+        PAGE = 5000
+        seek = prefix
+        total = 0
+        pages = 0
+        while True:
+            page = []
+            for key, value in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+                page.append((key, value))
+                if len(page) >= PAGE:
+                    break
+            if not page:
+                break
+            with self.db.utxo_db.write_batch() as batch:
+                for key, value in page:
+                    ref = key[len(prefix):]
+                    if len(ref) != 36:
+                        continue
+                    try:
+                        token = GlyphTokenInfo.from_bytes(value)
+                    except Exception:
+                        continue
+                    # Same key computation as the live write path (no undo here;
+                    # the migration runs at startup before any reorg).
+                    for k, v in self._discovery_rows(ref, token):
+                        batch.put(k, v)
+                    total += 1
+            pages += 1
+            self.logger.info(
+                f'Glyph v4 migration: {total} tokens indexed ({pages} page(s))')
+            if len(page) < PAGE:
+                break
+            # Resume strictly after the last key (seek is inclusive; a trailing
+            # 0x00 byte is the smallest key greater than a fixed-length GT row).
+            seek = page[-1][0] + b'\x00'
+        self.logger.info(
+            f'Glyph v4 migration complete: {total} tokens backfilled into '
+            f'discovery indexes (GZ/GP/GQ)')
+        return total
 
     def _scrub_denylist_metadata(self) -> None:
         """Delete stored CBOR metadata blobs (GM keys) for all denylisted tokens.
@@ -1454,59 +1586,30 @@ class GlyphIndex:
                               timelocked_only: bool = False,
                               cursor: Optional[str] = None) -> Dict[str, Any]:
         """
-        Return a list of encrypted (and optionally timelocked) tokens.
+        Return encrypted (and optionally timelocked) tokens, newest-first.
 
-        Scans the token cache then falls back to DB scan.
-        Returns dicts safe for JSON serialisation (no raw bytes).
+        v4: backed by the BY_PROTO recency index — a prefix seek instead of the
+        former full GT-table scan + in-memory sort (old R16). ``timelocked_only``
+        seeks the TIMELOCK(9) facet and keeps the original "must also be
+        encrypted" semantics via a hydration predicate. Returns dicts safe for
+        JSON serialisation (no raw bytes).
 
-        Args:
-            limit: Max results
-            offset: Skip first N results
-            timelocked_only: If True, only return tokens with GLYPH_TIMELOCK
+        Consistency note: like every other list endpoint, this now reflects
+        flushed DB state (the BY_PROTO rows are written on flush); a token
+        deployed in the current, not-yet-flushed batch appears on the next flush.
+        The opaque cursor is an index key, not the pre-v4 integer offset.
         """
         if not self.enabled:
             return []
 
-        results = []
-        # Search cache first
-        for ref_bytes, token in self.token_cache.items():
-            if not token.is_encrypted:
-                continue
-            if timelocked_only and not token.is_timelocked:
-                continue
-            results.append(self._token_to_dict(token))
-
-        # Fall back to DB scan for tokens not in cache
-        prefix = GlyphDBKeys.TOKEN
-        try:
-            for key, value in self.db.utxo_db.iterator(prefix=prefix):
-                ref_bytes = key[len(prefix):]
-                if ref_bytes in self.token_cache:
-                    continue  # Already included from cache
-                try:
-                    token = GlyphTokenInfo.from_bytes(value)
-                    if not token.is_encrypted:
-                        continue
-                    if timelocked_only and not token.is_timelocked:
-                        continue
-                    results.append(self._token_to_dict(token))
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        results.sort(key=lambda t: t.get('deploy_height', 0), reverse=True)
-        # R16: list_encrypted_tokens does a full filter scan (no RocksDB prefix seek possible)
-        # so we use offset/limit on the post-filter sorted list; next_cursor is index-based.
-        start = 0
-        if cursor:
-            try:
-                start = int(base64.b64decode(cursor).decode())
-            except Exception:
-                start = 0
-        page = results[start:start + limit]
-        next_cursor = base64.b64encode(str(start + limit).encode()).decode() if len(results) > start + limit else None
-        return {'tokens': page, 'next_cursor': next_cursor}
+        if timelocked_only:
+            proto = GlyphProtocol.GLYPH_TIMELOCK
+            predicate = lambda t: t.is_encrypted  # noqa: E731 (parity with old filter)
+        else:
+            proto = GlyphProtocol.GLYPH_ENCRYPTED
+            predicate = None
+        prefix = GlyphDBKeys.BY_PROTO + struct.pack('<B', proto)
+        return self._paginate_hydrated(prefix, limit, cursor, predicate=predicate)
 
     def update_balance(self, height: int, scripthash: bytes, ref: bytes, delta: int):
         """Update a token balance."""
@@ -1661,6 +1764,42 @@ class GlyphIndex:
             + len(self._known_refs) * 100
         )
 
+    def _discovery_rows(self, ref: bytes, token: 'GlyphTokenInfo'):
+        """Yield (key, value) for the v4 discovery rows a token owns.
+
+        One BY_TYPE_RECENT + one GLOBAL_RECENT + one BY_PROTO per distinct
+        protocol. All keyed on ``token.deploy_height`` so they stay together and
+        can be recreated/deleted deterministically from a token record.
+        """
+        dh = token.deploy_height
+        tt = token.token_type
+        yield pack_type_recent_key(tt, dh, ref), b''
+        yield pack_global_recent_key(dh, ref), struct.pack('<B', tt & 0xFF)
+        for proto in set(token.protocols or ()):
+            yield pack_proto_key(proto, dh, ref), b''
+
+    def _write_discovery_rows(self, batch, ref: bytes, token: 'GlyphTokenInfo',
+                              height: int):
+        """Write a token's v4 discovery rows (undo-recorded, like BY_TYPE, so a
+        reorg's backup() removes the newly-created rows).
+
+        Facets that are not a primary token_type (encrypted=8, mutable=5,
+        timelock=9, …) get a first-class recency-ordered list this way, so those
+        queries no longer need a full GT scan.
+        """
+        for k, v in self._discovery_rows(ref, token):
+            self._record_undo(height, k)
+            batch.put(k, v)
+
+    def _delete_discovery_rows(self, batch, ref: bytes,
+                               token: 'GlyphTokenInfo', height: int):
+        """Delete a token's v4 discovery rows (undo-recorded so a reorg restores
+        them). Used to clear rows keyed on a superseded deploy_height/type/proto
+        set when the same ref is re-written."""
+        for k, _v in self._discovery_rows(ref, token):
+            self._record_undo(height, k)
+            batch.delete(k)
+
     def flush(self, batch):
         """Flush cached Glyph data to the database."""
         if not self.enabled:
@@ -1681,8 +1820,22 @@ class GlyphIndex:
             # at each drifts (the GSTAT total previously undercounted the GT row
             # set ~2x). A token re-written for a metadata update already exists
             # in the DB, so it is not recounted.
-            if self.db.utxo_db.get(key) is None:
+            existing_raw = self.db.utxo_db.get(key)
+            if existing_raw is None:
                 self._update_stats_delta(token, +1)
+            else:
+                # Re-write (e.g. a mutable metadata UPDATE re-reveals the same
+                # ref at a new height). The v4 discovery keys embed deploy_height
+                # / token_type / protocols, so if any of those changed the old
+                # rows would orphan and the token would appear twice in a recency
+                # list. Drop the stale rows first (undo-recorded, so a reorg
+                # restores them). No-op when nothing changed.
+                try:
+                    prev_token = GlyphTokenInfo.from_bytes(existing_raw)
+                except Exception:
+                    prev_token = None
+                if prev_token is not None:
+                    self._delete_discovery_rows(batch, ref, prev_token, height)
             self._record_undo(height, key)
             batch.put(key, token.to_bytes())
 
@@ -1690,7 +1843,10 @@ class GlyphIndex:
             type_key = GlyphDBKeys.BY_TYPE + struct.pack('<B', token.token_type) + ref
             self._record_undo(height, type_key)
             batch.put(type_key, b'')
-            
+
+            # v4 recency-ordered discovery indexes (by type, by protocol, global).
+            self._write_discovery_rows(batch, ref, token, height)
+
             # Index by name (if present)
             if token.name:
                 name_hash = sha256(token.name.lower().encode('utf-8'))[:16]
@@ -2236,25 +2392,65 @@ class GlyphIndex:
                 results.append(self._token_to_dict(token))
         return results
     
-    def get_tokens_by_type(self, token_type: int, limit: int = 100,
-                           cursor: Optional[str] = None) -> Dict[str, Any]:
-        """Get tokens by type with cursor-based pagination."""
+    def _paginate_hydrated(self, prefix: bytes, limit: int,
+                           cursor: Optional[str] = None,
+                           predicate=None) -> Dict[str, Any]:
+        """Seek a secondary index whose keys END in a 36-byte ref, hydrate each
+        token, and paginate with an opaque forward cursor (the raw next key).
+
+        Works for both the legacy ref-ordered indexes (``GY + type``, remainder
+        is exactly the ref) and the v4 recency indexes (``…+ inv_height + ref``),
+        because the ref is always the trailing 36 bytes. A row whose token is
+        gone (spent, or a rare reorg orphan) hydrates to ``None`` and is skipped,
+        which keeps the v4 backfill self-healing. ``predicate``, if given, is a
+        ``token -> bool`` filter applied after hydration (the cursor still points
+        at the next raw key, so pagination stays correct across filtered rows).
+        """
         results = []
-        prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', token_type)
         seek = self._decode_cursor(cursor) or prefix
         next_cursor = None
-
         for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
             if len(results) >= limit:
                 next_cursor = self._encode_cursor(key)
                 break
-            ref = key[len(prefix):]
-            token = self.get_token(ref)
-            if token:
+            token = self.get_token(key[-36:])
+            if token and (predicate is None or predicate(token)):
                 results.append(self._token_to_dict(token))
-
         return {'tokens': results, 'next_cursor': next_cursor}
-    
+
+    def get_tokens_by_type(self, token_type: int, limit: int = 100,
+                           cursor: Optional[str] = None,
+                           order: str = 'ref') -> Dict[str, Any]:
+        """Get tokens of a type with cursor-based pagination.
+
+        ``order='ref'`` (default) — legacy stable order by ref bytes (txid hash,
+        i.e. effectively random); preserved so existing ``/glyphs/by-type``
+        cursors keep working. ``order='recent'`` — newest-deployed first via the
+        v4 BY_TYPE_RECENT index. Cursors are order-specific (opaque raw keys) and
+        must not be carried across a change of ``order``.
+        """
+        if order == 'recent':
+            prefix = GlyphDBKeys.BY_TYPE_RECENT + struct.pack('<B', token_type & 0xFF)
+        else:
+            prefix = GlyphDBKeys.BY_TYPE + struct.pack('<B', token_type & 0xFF)
+        return self._paginate_hydrated(prefix, limit, cursor)
+
+    def get_recent_tokens(self, limit: int = 100,
+                          cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Newest-deployed tokens across every type (v4 GLOBAL_RECENT index)."""
+        return self._paginate_hydrated(GlyphDBKeys.GLOBAL_RECENT, limit, cursor)
+
+    def get_tokens_by_protocol(self, proto: int, limit: int = 100,
+                               cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Newest-first list of tokens carrying a given GlyphProtocol (v4).
+
+        Gives first-class, index-backed lists for protocol facets that are not a
+        primary token_type: encrypted(8), mutable(5), timelock(9), container(7),
+        authority(10), etc. — no full GT scan.
+        """
+        prefix = GlyphDBKeys.BY_PROTO + struct.pack('<B', proto & 0xFF)
+        return self._paginate_hydrated(prefix, limit, cursor)
+
     def get_metadata(self, metadata_hash: bytes) -> Optional[Dict]:
         """Get parsed metadata by hash."""
         # Check cache

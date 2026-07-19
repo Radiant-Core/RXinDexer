@@ -47,8 +47,24 @@ def make_mock_env():
     return env
 
 
+import contextlib
+
+
+class _FakeBatch:
+    def __init__(self, store):
+        self._store = store
+
+    def put(self, key, value):
+        self._store[key] = value
+
+    def delete(self, key):
+        self._store.pop(key, None)
+
+
 def make_mock_db():
-    """Minimal mock that mimics the db.utxo_db interface."""
+    """Mock that mimics db.utxo_db: sorted+seek iteration and write_batch, so
+    the flush() path and the v4 recency indexes (which need ordered scans) work.
+    """
     store = {}
 
     class MockRocksDB:
@@ -58,10 +74,18 @@ def make_mock_db():
         def put(self, key, value):
             store[key] = value
 
-        def iterator(self, prefix=b""):
-            return iter(
-                (k, v) for k, v in store.items() if k.startswith(prefix)
-            )
+        def iterator(self, prefix=b"", reverse=False, include_value=True, seek=None):
+            items = [(k, v) for k, v in store.items() if k.startswith(prefix)]
+            items.sort(key=lambda kv: kv[0], reverse=reverse)
+            if seek:
+                items = [(k, v) for k, v in items if k >= seek]
+            if include_value:
+                return iter(items)
+            return iter([k for k, _v in items])
+
+        @contextlib.contextmanager
+        def write_batch(self):
+            yield _FakeBatch(store)
 
         @property
         def _store(self):
@@ -71,6 +95,17 @@ def make_mock_db():
     db.db_height = 0
     db.utxo_db = MockRocksDB()
     return db
+
+
+def deploy_tokens(idx, db, *tokens):
+    """Register tokens through the flush path so their GT + secondary index
+    rows (incl. the v4 BY_TYPE_RECENT / BY_PROTO / GLOBAL_RECENT rows) are in
+    the DB, mirroring production. flush() clears token_cache afterwards.
+    """
+    for t in tokens:
+        idx.token_cache[t.ref] = t
+        idx.token_height[t.ref] = t.deploy_height or 0
+    idx.flush(_FakeBatch(db.utxo_db._store))
 
 
 def make_token(protocols, **kwargs) -> GlyphTokenInfo:
@@ -356,55 +391,55 @@ class TestKeyRevealPersistence:
 
 @pytest.mark.skipif(not HAS_CBOR, reason="cbor2 required")
 class TestListEncryptedTokens:
+    """v4: list_encrypted_tokens is backed by the BY_PROTO recency index (a
+    prefix seek), so tokens must be flushed into the DB (as in production) —
+    not merely staged in token_cache — before they appear.
+    """
+
     def _make_index(self):
         db = make_mock_db()
         env = make_mock_env()
-        return GlyphIndex(db, env)
+        return GlyphIndex(db, env), db
+
+    def _enc_token(self, name, ref_hex, height, timelocked=False):
+        protos = [GlyphProtocol.GLYPH_NFT, GlyphProtocol.GLYPH_ENCRYPTED]
+        if timelocked:
+            protos.append(GlyphProtocol.GLYPH_TIMELOCK)
+        t = make_token(protos, name=name)
+        t.ref = make_ref(ref_hex)
+        t.token_type = 2
+        t.is_encrypted = True
+        t.is_timelocked = timelocked
+        t.deploy_height = height
+        t.deploy_txid = bytes(32)
+        t.metadata_hash = bytes(32)
+        return t
 
     def test_empty_when_no_encrypted_tokens(self):
-        idx = self._make_index()
+        idx, db = self._make_index()
         plain = make_token([GlyphProtocol.GLYPH_NFT], name="Plain")
-        idx.token_cache[plain.ref] = plain
+        plain.token_type = 2
+        plain.deploy_txid = bytes(32)
+        plain.metadata_hash = bytes(32)
+        deploy_tokens(idx, db, plain)
         result = idx.list_encrypted_tokens()
         assert result['tokens'] == []
         assert result['next_cursor'] is None
 
     def test_returns_encrypted_tokens(self):
-        idx = self._make_index()
-        enc = make_token(
-            [GlyphProtocol.GLYPH_NFT, GlyphProtocol.GLYPH_ENCRYPTED], name="Enc"
-        )
-        enc.is_encrypted = True
-        enc.deploy_txid = bytes(32)
-        enc.metadata_hash = None
-        idx.token_cache[enc.ref] = enc
+        idx, db = self._make_index()
+        enc = self._enc_token("Enc", "ab" * 32, height=100)
+        deploy_tokens(idx, db, enc)
         result = idx.list_encrypted_tokens()
         results = result['tokens']
         assert len(results) == 1
         assert results[0].get("is_encrypted") is True
 
     def test_timelocked_only_filter(self):
-        idx = self._make_index()
-
-        enc = make_token(
-            [GlyphProtocol.GLYPH_NFT, GlyphProtocol.GLYPH_ENCRYPTED], name="EncOnly"
-        )
-        enc.is_encrypted = True
-        enc.deploy_txid = bytes(32)
-        enc.metadata_hash = None
-
-        tl = make_token(
-            [GlyphProtocol.GLYPH_NFT, GlyphProtocol.GLYPH_ENCRYPTED, GlyphProtocol.GLYPH_TIMELOCK],
-            name="TimeLocked"
-        )
-        tl.is_encrypted = True
-        tl.is_timelocked = True
-        tl.deploy_txid = bytes(32)
-        tl.metadata_hash = None
-        tl.ref = make_ref("bb" * 32)
-
-        idx.token_cache[enc.ref] = enc
-        idx.token_cache[tl.ref] = tl
+        idx, db = self._make_index()
+        enc = self._enc_token("EncOnly", "aa" * 32, height=100)
+        tl = self._enc_token("TimeLocked", "bb" * 32, height=101, timelocked=True)
+        deploy_tokens(idx, db, enc, tl)
 
         all_enc = idx.list_encrypted_tokens()
         assert len(all_enc['tokens']) == 2
@@ -414,26 +449,20 @@ class TestListEncryptedTokens:
         names = [t.get("name") for t in tl_only['tokens']]
         assert "TimeLocked" in names
 
-    def test_pagination(self):
-        idx = self._make_index()
-        for i in range(5):
-            t = make_token(
-                [GlyphProtocol.GLYPH_NFT, GlyphProtocol.GLYPH_ENCRYPTED], name=f"T{i}"
-            )
-            t.ref = make_ref(f"{i:02x}" * 32)
-            t.is_encrypted = True
-            t.deploy_height = i * 10
-            t.deploy_txid = bytes(32)
-            t.metadata_hash = None
-            idx.token_cache[t.ref] = t
+    def test_newest_first_and_pagination(self):
+        idx, db = self._make_index()
+        toks = [self._enc_token(f"T{i}", f"{i:02x}" * 32, height=i * 10)
+                for i in range(5)]
+        deploy_tokens(idx, db, *toks)
 
         page1 = idx.list_encrypted_tokens(limit=2)
         assert len(page1['tokens']) == 2
+        # newest deploy_height first (40, then 30)
+        assert [t["name"] for t in page1['tokens']] == ["T4", "T3"]
         next_cursor = page1['next_cursor']
         assert next_cursor is not None
         page2 = idx.list_encrypted_tokens(limit=2, cursor=next_cursor)
-        assert len(page2['tokens']) == 2
-        # Pages should not overlap
+        assert [t["name"] for t in page2['tokens']] == ["T2", "T1"]
         refs1 = {r["ref"] for r in page1['tokens']}
         refs2 = {r["ref"] for r in page2['tokens']}
         assert refs1.isdisjoint(refs2)
@@ -443,11 +472,6 @@ class TestListEncryptedTokens:
         env = make_mock_env()
         env.glyph_index = False
         idx = GlyphIndex(db, env)
-        t = make_token([GlyphProtocol.GLYPH_NFT, GlyphProtocol.GLYPH_ENCRYPTED])
-        t.is_encrypted = True
-        t.deploy_txid = bytes(32)
-        t.metadata_hash = None
-        idx.token_cache[t.ref] = t
         # When disabled the index is not enabled; list_encrypted_tokens returns []
         assert idx.list_encrypted_tokens() == []
 

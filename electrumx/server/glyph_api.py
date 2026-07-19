@@ -508,7 +508,7 @@ class GlyphAPIMixin:
         )
 
     async def glyph_get_tokens_by_type(self, token_type: int, limit: int = 100,
-                                        cursor: str = None):
+                                        cursor: str = None, order: str = 'ref'):
         """
         Get tokens by type.
 
@@ -516,6 +516,9 @@ class GlyphAPIMixin:
             token_type: GlyphTokenType ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, etc.)
             limit: Maximum results
             cursor: Opaque pagination cursor from previous response next_cursor
+            order: 'ref' (default, legacy ref-hash order) or 'recent'
+                   (newest-deployed first, via the v4 recency index). Cursors
+                   are order-specific and must not be reused across orders.
 
         Returns:
             Dict with tokens list and next_cursor
@@ -526,8 +529,33 @@ class GlyphAPIMixin:
             return {'error': 'Glyph indexing not enabled'}
 
         return self.glyph_index.get_tokens_by_type(
-            token_type, limit=limit, cursor=cursor
+            token_type, limit=limit, cursor=cursor, order=order
         )
+
+    async def glyph_get_recent(self, limit: int = 100, cursor: str = None,
+                               token_type: int = None):
+        """
+        Newest-deployed Glyph tokens (v4 discovery index).
+
+        Args:
+            limit: Maximum results
+            cursor: Opaque pagination cursor from previous response next_cursor
+            token_type: Optional GlyphTokenType filter. When given, lists newest
+                        tokens of that type; otherwise newest across all types.
+
+        Returns:
+            Dict with tokens list and next_cursor
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        if token_type is not None:
+            return self.glyph_index.get_tokens_by_type(
+                token_type, limit=limit, cursor=cursor, order='recent'
+            )
+        return self.glyph_index.get_recent_tokens(limit=limit, cursor=cursor)
 
     async def glyph_get_metadata(self, ref: str):
         """
@@ -1627,6 +1655,7 @@ GLYPH_METHODS = {
     'glyph.get_history': 'glyph_get_history',
     'glyph.search_tokens': 'glyph_search_tokens',
     'glyph.get_tokens_by_type': 'glyph_get_tokens_by_type',
+    'glyph.get_recent': 'glyph_get_recent',
     'glyph.get_metadata': 'glyph_get_metadata',
     # dMint contracts (for Glyph Miner)
     'dmint.get_contracts': 'dmint_get_contracts',

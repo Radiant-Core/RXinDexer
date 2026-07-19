@@ -330,7 +330,32 @@ class TestGlyphEndpoints:
         mock_glyph_index.get_tokens_by_type.return_value = {'tokens': [], 'next_cursor': None}
         resp = client.get('/glyphs/by-type/1')
         assert resp.status_code == 200
-        mock_glyph_index.get_tokens_by_type.assert_called_with(1, limit=100, cursor=None)
+        assert resp.json()['order'] == 'ref'
+        mock_glyph_index.get_tokens_by_type.assert_called_with(1, limit=100, cursor=None, order='ref')
+
+    def test_get_glyphs_by_type_recent_order(self, client, mock_glyph_index):
+        mock_glyph_index.get_tokens_by_type.return_value = {'tokens': [], 'next_cursor': None}
+        resp = client.get('/glyphs/by-type/2?order=recent')
+        assert resp.status_code == 200
+        assert resp.json()['order'] == 'recent'
+        mock_glyph_index.get_tokens_by_type.assert_called_with(2, limit=100, cursor=None, order='recent')
+
+    def test_get_glyphs_by_type_rejects_bad_order(self, client, mock_glyph_index):
+        resp = client.get('/glyphs/by-type/1?order=sideways')
+        assert resp.status_code == 422  # pattern-validated query param
+
+    def test_get_glyphs_recent_global(self, client, mock_glyph_index):
+        mock_glyph_index.get_recent_tokens.return_value = {'tokens': [], 'next_cursor': None}
+        resp = client.get('/glyphs/recent')
+        assert resp.status_code == 200
+        assert resp.json()['order'] == 'recent'
+        mock_glyph_index.get_recent_tokens.assert_called_with(limit=100, cursor=None)
+
+    def test_get_glyphs_recent_type_filtered(self, client, mock_glyph_index):
+        mock_glyph_index.get_tokens_by_type.return_value = {'tokens': [], 'next_cursor': None}
+        resp = client.get('/glyphs/recent?type_id=2')
+        assert resp.status_code == 200
+        mock_glyph_index.get_tokens_by_type.assert_called_with(2, limit=100, cursor=None, order='recent')
 
     def test_get_glyph_by_ref(self, client, mock_glyph_index):
         ref = _make_ref()

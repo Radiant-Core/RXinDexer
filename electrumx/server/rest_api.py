@@ -852,13 +852,33 @@ async def get_glyphs_by_type(
     type_id: int = Path(..., ge=0, le=7, description="Token type ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, 5=WAVE, 6=Container, 7=Authority)"),
     limit: int = Query(default=100, le=500),
     cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+    order: str = Query(default="ref", pattern="^(ref|recent)$", description="'ref' (legacy hash order) or 'recent' (newest-deployed first). Cursors are order-specific."),
 ):
     """Get tokens filtered by type."""
     _ensure_glyph_index()
 
     try:
-        result = _glyph_index.get_tokens_by_type(type_id, limit=limit, cursor=cursor)
-        return {"type_id": type_id, **result}
+        result = _glyph_index.get_tokens_by_type(type_id, limit=limit, cursor=cursor, order=order)
+        return {"type_id": type_id, "order": order, **result}
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/glyphs/recent", tags=["Glyphs"])
+async def get_glyphs_recent(
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+    type_id: Optional[int] = Query(default=None, ge=0, le=7, description="Optional token-type filter; omit for newest across all types"),
+):
+    """Newest-deployed Glyph tokens (v4 discovery index), across all types or one type."""
+    _ensure_glyph_index()
+
+    try:
+        if type_id is not None:
+            result = _glyph_index.get_tokens_by_type(type_id, limit=limit, cursor=cursor, order="recent")
+        else:
+            result = _glyph_index.get_recent_tokens(limit=limit, cursor=cursor)
+        return {"type_id": type_id, "order": "recent", **result}
     except Exception as e:
         raise _internal_error(e)
 

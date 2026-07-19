@@ -226,9 +226,25 @@ Get tokens by type.
 |------|------|-------------|
 | `token_type` | int | GlyphTokenType ID (1=FT, 2=NFT, etc.) |
 | `limit` | int | Maximum results (default 100) |
-| `offset` | int | Pagination offset (default 0) |
+| `cursor` | string | Opaque pagination cursor from previous `next_cursor` |
+| `order` | string | `ref` (default, legacy ref-hash order) or `recent` (newest-deployed first). Cursors are order-specific. |
 
-**Returns:** Array of tokens
+**Returns:** `{tokens, next_cursor}`
+
+---
+
+### glyph.get_recent
+
+Newest-deployed tokens (v4 discovery index), across all types or one type.
+
+**Parameters:**
+| Name | Type | Description |
+|------|------|-------------|
+| `limit` | int | Maximum results (default 100) |
+| `cursor` | string | Opaque pagination cursor from previous `next_cursor` |
+| `token_type` | int | Optional GlyphTokenType filter; omit for all types |
+
+**Returns:** `{tokens, next_cursor}`
 
 ---
 
@@ -393,6 +409,7 @@ Get contracts sorted by estimated profitability.
 | glyph.get_history | 2.0 |
 | glyph.search_tokens | 3.0 |
 | glyph.get_tokens_by_type | 2.0 |
+| glyph.get_recent | 2.0 |
 | glyph.get_metadata | 1.5 |
 | dmint.get_contracts | 1.0 |
 | dmint.get_contract | 1.0 |
@@ -675,7 +692,8 @@ RXinDexer also provides a FastAPI-based REST API for HTTP access. Enable it with
 | GET | `/glyphs` | List all tokens (paginated, filterable by `token_type`) |
 | GET | `/glyphs/search?q=` | Search tokens by name/ticker |
 | GET | `/glyphs/stats` | Token counts by type and version |
-| GET | `/glyphs/by-type/{type_id}` | Filter tokens by type ID |
+| GET | `/glyphs/by-type/{type_id}` | Filter tokens by type ID (`?order=ref` or `?order=recent`) |
+| GET | `/glyphs/recent` | Newest-deployed tokens (optional `type_id` filter) |
 | GET | `/glyphs/{ref}` | Get single token by 72-hex ref |
 
 ### Token Analytics Endpoints
