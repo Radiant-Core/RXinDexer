@@ -12,6 +12,8 @@ import pytest
 from unittest.mock import Mock, MagicMock
 import struct
 
+from tests.support import FakeEnv
+
 # Import the modules under test
 from electrumx.lib.glyph import (
     GLYPH_MAGIC,
@@ -412,11 +414,8 @@ class TestGlyphIndexIntegration:
 
     @pytest.fixture
     def mock_env(self):
-        """Create a mock environment."""
-        env = Mock()
-        env.glyph_index = True
-        env.reorg_limit = 10
-        return env
+        """A stand-in Env. Not a Mock — see FakeEnv in tests/conftest.py."""
+        return FakeEnv()
 
     def test_glyph_index_init(self, mock_db, mock_env):
         """Test GlyphIndex initialization."""
@@ -670,10 +669,7 @@ class TestDmintMintProcessing:
 
     @pytest.fixture
     def mock_env(self):
-        env = Mock()
-        env.glyph_index = True
-        env.reorg_limit = 10
-        return env
+        return FakeEnv()
 
     def test_process_mint_non_dmint_token_skipped(self, mock_db, mock_env):
         """Test that _process_mint skips non-dMint tokens."""
@@ -840,10 +836,7 @@ class TestImageExtraction:
         db.utxo_db.get = Mock(return_value=None)
         db.utxo_db.iterator = Mock(return_value=iter([]))
         db.db_height = 100
-        env = Mock()
-        env.glyph_index = True
-        env.reorg_limit = 10
-        return GlyphIndex(db, env)
+        return GlyphIndex(db, FakeEnv())
 
     def _make_reveal_envelope(self, cbor_payload: bytes) -> dict:
         """Build a minimal reveal envelope dict as produced by parse_glyph_envelope."""
@@ -1077,10 +1070,7 @@ class TestTokenToDictImages:
         db.utxo_db.get = Mock(return_value=None)
         db.utxo_db.iterator = Mock(return_value=iter([]))
         db.db_height = 100
-        env = Mock()
-        env.glyph_index = True
-        env.reorg_limit = 10
-        return GlyphIndex(db, env)
+        return GlyphIndex(db, FakeEnv())
 
     def _make_token_with_metadata(self, index, token_ref: bytes, metadata: dict):
         """Register a token and store its CBOR metadata in the index cache."""
@@ -1836,3 +1826,85 @@ class TestTokenDictJsonSafe:
         assert result['revealed_key'] == 'bb' * 32
         assert result['created_at'] is None
         assert result['reveal_height'] == 900
+
+
+# ---------------------------------------------------------------------------
+# Env stubbing contract + the dMint denylist path it used to break.
+#
+# GlyphIndex reads optional settings with getattr(env, name, default). A bare
+# Mock auto-creates every attribute as a truthy Mock, so the default never
+# applied and __init__ tried to iterate a Mock -- 24 tests across two files
+# died on "TypeError: 'Mock' object is not iterable" purely because their
+# fixtures never mentioned dmint_denylist. FakeEnv (tests/support.py) is a
+# plain object, so absent attributes really are absent.
+#
+# The denylist itself had no coverage, which is why the drift went unnoticed:
+# every test that touched it was failing in the constructor, so nothing ever
+# exercised what the setting does. These tests pin both.
+# ---------------------------------------------------------------------------
+
+class TestEnvStubContract:
+    def test_absent_attribute_falls_back_to_production_default(self):
+        """The property that makes FakeEnv safe: an unset setting is genuinely
+        unset, so getattr(env, name, default) yields the default."""
+        env = FakeEnv()
+        assert getattr(env, 'a_setting_that_does_not_exist', 'fallback') == 'fallback'
+        with pytest.raises(AttributeError):
+            env.a_setting_that_does_not_exist
+
+    def test_mock_env_would_not_fall_back(self):
+        """Contrast, pinning why a Mock must not be used here. If this ever
+        stops holding, the Mock-vs-FakeEnv distinction is moot."""
+        assert getattr(Mock(), 'anything', 'fallback') != 'fallback'
+
+    def test_defaults_mirror_a_real_env(self):
+        env = FakeEnv()
+        assert env.glyph_index is True
+        assert env.dmint_denylist == set()
+
+    def test_overrides_apply(self):
+        env = FakeEnv(glyph_index=False, reorg_limit=3)
+        assert env.glyph_index is False
+        assert env.reorg_limit == 3
+
+
+class TestDmintDenylist:
+    def _db(self):
+        db = Mock()
+        db.utxo_db = MagicMock()
+        db.utxo_db.get = Mock(return_value=None)
+        db.utxo_db.iterator = Mock(return_value=iter([]))
+        db.db_height = 100
+        return db
+
+    def test_empty_denylist_by_default(self):
+        from electrumx.server.glyph_index import GlyphIndex
+        index = GlyphIndex(self._db(), FakeEnv())
+        assert index._dmint_denylist == set()
+
+    def test_display_form_ref_is_parsed(self):
+        from electrumx.server.glyph_index import GlyphIndex, pack_ref
+        from electrumx.lib.hash import hex_str_to_hash
+        txid_hex = 'ab' * 32
+        index = GlyphIndex(self._db(), FakeEnv(dmint_denylist={f'{txid_hex}_0'}))
+        assert index._dmint_denylist == {pack_ref(hex_str_to_hash(txid_hex), 0)}
+
+    def test_raw_72_hex_form_is_parsed(self):
+        from electrumx.server.glyph_index import GlyphIndex
+        raw = 'cd' * 36  # 36 bytes = internal-order txid + LE vout
+        index = GlyphIndex(self._db(), FakeEnv(dmint_denylist={raw}))
+        assert index._dmint_denylist == {bytes.fromhex(raw)}
+
+    def test_invalid_ref_is_skipped_not_fatal(self):
+        """A bad entry must not take the indexer down at startup."""
+        from electrumx.server.glyph_index import GlyphIndex
+        good = 'ef' * 32 + '_1'
+        index = GlyphIndex(self._db(), FakeEnv(
+            dmint_denylist={good, 'not-a-ref', ''}))
+        assert len(index._dmint_denylist) == 1
+
+    def test_multiple_entries(self):
+        from electrumx.server.glyph_index import GlyphIndex
+        refs = {'aa' * 32 + '_0', 'bb' * 32 + '_2', 'cc' * 32 + '_1'}
+        index = GlyphIndex(self._db(), FakeEnv(dmint_denylist=refs))
+        assert len(index._dmint_denylist) == 3
