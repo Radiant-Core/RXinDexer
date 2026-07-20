@@ -28,7 +28,7 @@ attrs
 plyvel
 pylru
 aiohttp>=3.3,<4.0
-websockets>=10.0,<14.0
+websockets>=16.1.1,<17.0
 psutil
 python-rocksdb<=0.7.0
 cbor2>=5.4.0
