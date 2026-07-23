@@ -118,7 +118,7 @@ class DB(object):
         # hash or height), so this cache never needs invalidation except on
         # reorg, where the existing retry loop in all_utxos handles stale
         # reads.  50k entries covers ~50k most-recently-queried txs.
-        self._tx_hash_cache = pylru.lrucache(50000)
+        self._tx_hash_cache = pylru.lrucache(env.tx_hash_cache_size)
 
         # Confirmed balance cache: hashX -> confirmed balance (int).
         # Invalidated on block flush (flush_dbs/flush_backup) and on mempool
@@ -126,13 +126,13 @@ class DB(object):
         # all_utxos, so correctness is preserved even if invalidation is
         # delayed.  Capped at 100k entries (~7MB) to prevent unbounded growth
         # under high-throughput bursts (Photon Cannon).
-        self._balance_cache = pylru.lrucache(100000)
+        self._balance_cache = pylru.lrucache(env.balance_cache_size)
 
         # UTXO list cache: hashX -> sorted list of UTXO namedtuples.
         # Same invalidation semantics as the balance cache.  Avoids repeated
         # RocksDB prefix scans in all_utxos for listunspent calls.  Capped
         # at 10k entries (~50MB) — each entry is a list of UTXO tuples.
-        self._utxo_list_cache = pylru.lrucache(10000)
+        self._utxo_list_cache = pylru.lrucache(env.utxo_list_cache_size)
 
     async def _read_tx_counts(self):
         if self.tx_counts is not None:

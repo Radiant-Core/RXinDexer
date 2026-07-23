@@ -10,10 +10,17 @@
 
 
 import asyncio
+import ctypes
+import gc
 import time
 from asyncio import sleep
 
 from electrumx.server import metrics as _metrics
+
+try:
+    _malloc_trim = ctypes.CDLL('libc.so.6').malloc_trim
+except OSError:
+    _malloc_trim = None  # non-glibc platform (e.g. macOS dev)
 
 from aiorpcx import TaskGroup, CancelledError
 
@@ -472,6 +479,12 @@ class BlockProcessor:
         # Invalidate cached balances for any addresses touched by this flush.
         if self.touched:
             self.db.invalidate_balance_cache(self.touched)
+        # Return freed pages to the OS now that the per-flush dicts are
+        # cleared — the allocator otherwise retains them as fragmented RSS
+        # (observed ~0.5 GB/day growth at prod flush rates).
+        gc.collect()
+        if _malloc_trim is not None:
+            _malloc_trim(0)
         elapsed = time.perf_counter() - t0
         _metrics.flush_seconds.observe(elapsed)  # R19
         _metrics.flush_total.inc()                # R18

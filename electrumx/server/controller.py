@@ -128,7 +128,7 @@ class Controller(ServerBase):
             notifications.lookup_utxos = db.lookup_utxos
             MemPoolAPI.register(Notifications)
             mempool = MemPool(env.coin, notifications, env=env,
-                              refresh_secs=2.0,
+                              refresh_secs=env.mempool_refresh_secs,
                               glyph_index=bp.glyph_index, swap_index=bp.swap_index,
                               subscriptions=bp.subscriptions)
 

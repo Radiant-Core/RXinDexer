@@ -73,6 +73,13 @@ class Env(EnvBase):
         self.donation_address = self.default('DONATION_ADDRESS', '')
         self.drop_client = self.custom("DROP_CLIENT", None, re.compile)
         self.cache_MB = self.integer('CACHE_MB', 1200)
+        # DB-layer LRU cache sizes (see db.py) — tunable without a rebuild
+        self.tx_hash_cache_size = self.integer('TX_HASH_CACHE_SIZE', 50000)
+        self.balance_cache_size = self.integer('BALANCE_CACHE_SIZE', 100000)
+        self.utxo_list_cache_size = self.integer('UTXO_LIST_CACHE_SIZE', 10000)
+        # Mempool poll interval; the mempool retains a full MemPoolTx per tx,
+        # so a longer interval trades freshness for CPU and daemon RPC load
+        self.mempool_refresh_secs = self.custom('MEMPOOL_REFRESH_SECS', 2.0, float)
 
         # R26: use coin.REORG_LIMIT as default (Radiant coin sets 69 = node max reorg depth)
         # Warn if set to an unreasonably low value

@@ -38,6 +38,7 @@ ENV PACKAGES="\
   liblz4-dev \
   zlib1g-dev \
   libgflags-dev \
+  libjemalloc2 \
 "
 
 RUN apt update && apt install --no-install-recommends -y $PACKAGES  && \
@@ -87,6 +88,12 @@ ENV NET=mainnet
 ENV REQUEST_TIMEOUT=60
 ENV DB_DIRECTORY=/data/electrumdb
 ENV DB_ENGINE=rocksdb
+
+# jemalloc returns freed pages to the OS (pymalloc/glibc retain them as
+# fragmented RSS across flush cycles). Verify with:
+#   grep -m1 jemalloc /proc/1/maps   (ldd will NOT show an LD_PRELOAD)
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:10000
 ENV ELECTRUMX_ENV=prod
 
 # SSL configuration
