@@ -44,14 +44,19 @@ services:
     # follow deep reorgs without a resync — see REORG_LIMIT=100 on rxindexer below.
     # maxreorgdepth=100 documents the intended node/indexer bound (only enforced if
     # finalizeheaders is re-enabled). Revisit once mainnet block production settles.
+    # NOTE: `command:` below is a YAML folded scalar — every line is joined into
+    # one string, so a `#` comment inside it becomes a literal argument and
+    # radiantd fails to start. Keep commentary out here, above the key.
+    #
+    # rpcallowip is Docker's private RFC1918 range only, not 0.0.0.0/0. Port
+    # 7332 is already bound to 127.0.0.1 on the host, so this is defence in
+    # depth: if that mapping is ever widened by accident, an open RPC is not
+    # one typo away.
     command: >
       -server=1
       -printtoconsole
       -rpcuser=${RPC_USER:-radiant}
       -rpcpassword=${RPC_PASS:?RPC_PASS must be set}
-      # Docker's private RFC1918 range only, not 0.0.0.0/0. Port 7332 is bound
-      # to 127.0.0.1 on the host so this is defence-in-depth: if the mapping is
-      # ever widened by accident, an open RPC is not one typo away.
       -rpcallowip=172.16.0.0/12
       -rpcallowip=127.0.0.1
       -rpcbind=0.0.0.0
