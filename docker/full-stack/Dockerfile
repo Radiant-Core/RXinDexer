@@ -75,7 +75,8 @@ ENV DB_ENGINE=rocksdb
 
 # jemalloc returns freed pages to the OS (pymalloc/glibc retain them as
 # fragmented RSS across flush cycles). Verify with:
-#   grep -m1 jemalloc /proc/1/maps   (ldd will NOT show an LD_PRELOAD)
+#   grep -m1 jemalloc /proc/$(pgrep -f electrumx_server)/maps
+# (check the python process, not PID 1 = docker-init; ldd never shows an LD_PRELOAD)
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:10000
 
