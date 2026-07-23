@@ -103,6 +103,14 @@ services:
     # applies the same cap without a restart. The host dockerd cgroup is also
     # capped at CPUQuota=150% (systemd: docker.service).
     cpus: 2.0
+    # File-descriptor limit. ElectrumX derives its session cap from this:
+    # sane_max_sessions() = min(MAX_SESSIONS, nofile - 350), so Docker's
+    # default nofile=1024 silently capped a MAX_SESSIONS=10000 server at 674.
+    # Compose does not inherit the host's limit — it must be set per-service.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       radiantd:
         condition: service_healthy
