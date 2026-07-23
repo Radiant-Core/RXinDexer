@@ -49,7 +49,11 @@ services:
       -printtoconsole
       -rpcuser=${RPC_USER:-radiant}
       -rpcpassword=${RPC_PASS:?RPC_PASS must be set}
-      -rpcallowip=0.0.0.0/0
+      # Docker's private RFC1918 range only, not 0.0.0.0/0. Port 7332 is bound
+      # to 127.0.0.1 on the host so this is defence-in-depth: if the mapping is
+      # ever widened by accident, an open RPC is not one typo away.
+      -rpcallowip=172.16.0.0/12
+      -rpcallowip=127.0.0.1
       -rpcbind=0.0.0.0
       -rpcallowhost=radiantd
       -rpcallowhost=swap.radiantcore.org
@@ -136,7 +140,13 @@ services:
       - "50010:50010"   # TCP (Electrum protocol)
       - "50011:50011"   # WSS (Photonic wallet, WebSocket subscriptions)
       - "50012:50012"   # SSL (Electrum protocol)
-      - "8000:8000"     # REST API (HTTP)
+      # REST API — localhost only. Public access is via Caddy (radiantcore.org
+      # /api/*, photonic-wallet.com, glyph-miner.com), which terminates TLS and
+      # applies edge policy. Publishing this on 0.0.0.0 additionally exposed the
+      # same API over plaintext HTTP straight from the host IP, bypassing the
+      # edge entirely — /docs and /openapi.json included. Caddy reaches the
+      # container over the compose network, so it does not need a host binding.
+      - "127.0.0.1:8000:8000"  # REST API (HTTP, behind Caddy)
       - "127.0.0.1:8001:8001"  # Admin RPC (localhost only)
     environment:
       # Core configuration
