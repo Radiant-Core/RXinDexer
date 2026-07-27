@@ -1295,6 +1295,14 @@ class BlockProcessor:
             if count > 0:
                 async with self.state_lock:
                     await self.flush(True)
+            # Separate one-shot pass: DBs synced before the REF_NAME index
+            # existed have names but no ref -> name rows, so the backfill above
+            # (which only runs on an *empty* WAVE DB) never reaches them and
+            # reverse_lookup would keep returning name-less hits.
+            count = self.wave_index.backfill_ref_names(self.glyph_index)
+            if count > 0:
+                async with self.state_lock:
+                    await self.flush(True)
         if self.realm_index and self.glyph_index:
             count = self.realm_index.backfill_from_glyph_db(self.glyph_index)
             if count > 0:

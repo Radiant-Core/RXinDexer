@@ -55,7 +55,11 @@ import os
 import time
 from dataclasses import dataclass, field
 
-from electrumx.lib.glyph import MAX_JSONSAFE_NODES, MetadataTooComplex
+from electrumx.lib.glyph import (
+    MAX_JSONSAFE_NODES,
+    MetadataTooComplex,
+    wave_full_name_from_token as _wave_full_name,
+)
 from electrumx.lib.hash import hash_to_hex_str
 from electrumx.server import metrics as _metrics
 from electrumx.server.rate_limiter import (
@@ -1787,8 +1791,10 @@ async def wave_reverse_lookup(
     a 64-hex Electrum scripthash (``sha256(script)`` reversed, as wallets compute),
     or a base58 address — all normalised to the hashX the index is keyed by.
     Previously the route required a 64-hex value and passed it straight through,
-    so it never matched the 11-byte owner keys and always returned []. Each hit is
-    enriched (best-effort) with the plaintext WAVE name from the Glyph token index.
+    so it never matched the 11-byte owner keys and always returned []. Each hit
+    carries the plaintext ``name`` (bare label) and ``full_name``
+    (``label.domain``); both are omitted for a name the index cannot resolve, so
+    treat them as optional.
     """
     _ensure_wave()
     from electrumx.lib.hash import HASHX_LEN
@@ -1809,21 +1815,24 @@ async def wave_reverse_lookup(
     except Exception as e:
         raise _internal_error(e)
 
-    # The wave index stores a name_hash, not the plaintext label; the readable
-    # name lives in the Glyph token (type 5). Resolve it per hit, best-effort —
-    # a miss simply omits the name rather than failing the request.
+    # reverse_lookup names its own hits from the wave index's REF_NAME rows.
+    # This is only a fallback for a DB whose REF_NAME backfill has not run: it
+    # can resolve a hit whose ref happens to *be* the Glyph token ref, but not
+    # the usual reveal-outpoint form — which is why doing this here as the
+    # primary path returned every hit without a name.
     if _glyph_index:
         for hit in hits:
+            if hit.get("name"):
+                continue
             ref_str = hit.get("ref")
             if not ref_str:
                 continue
             try:
-                token = _glyph_index.get_token_by_ref_str(ref_str)
-                attrs = (token or {}).get("attrs") or {}
-                name = attrs.get("name")
-                if name:
-                    hit["name"] = name
-                    hit["full_name"] = f"{name}.{attrs.get('domain', 'rxd')}"
+                token = _glyph_index.get_token_by_ref_str(ref_str) or {}
+                full_name = _wave_full_name(token)
+                if full_name:
+                    hit["name"] = full_name.split(".", 1)[0]
+                    hit["full_name"] = full_name
             except Exception:
                 pass
 

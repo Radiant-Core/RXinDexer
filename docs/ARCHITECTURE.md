@@ -207,7 +207,9 @@ wave.get_subdomains(parent_name, limit?, offset?)
   -> [{char, ref}, ...]
 
 wave.reverse_lookup(scripthash, limit?)
-  -> [{ref}, ...] names owned by address
+  -> [{ref, owner, name, full_name, zone?}, ...] names owned by address
+     name = bare label, full_name = label.domain; both omitted if the
+     index cannot resolve the name, so treat them as optional
 
 wave.stats()
   -> {enabled, genesis_configured, tree_cache_size, ...}

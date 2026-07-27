@@ -28,6 +28,7 @@ from electrumx.lib.glyph import (
     parse_glyph_metadata,
     extract_token_info,
     to_jsonsafe,
+    wave_full_name_from_token as _wave_full_name,
 )
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
 from electrumx.server.glyph_subscriptions import SubscriptionLimitError
@@ -1549,7 +1550,10 @@ class GlyphAPIMixin:
             limit: Maximum results (default 100)
             
         Returns:
-            List of {ref} for owned names
+            List of {ref, owner, name, full_name, zone} for owned names.
+            ``name`` is the bare label and ``full_name`` is ``label.domain``;
+            both are omitted for a name the index cannot resolve, so callers
+            must treat them as optional.
         """
         self.bump_cost(3.0)
         
@@ -1564,20 +1568,25 @@ class GlyphAPIMixin:
         except Exception as e:
             return {'error': str(e)}
 
-        # Enrich with the plaintext name (the wave index only stores a name_hash;
-        # the readable label lives in the Glyph token). Best-effort.
+        # reverse_lookup names its own hits from the wave index's REF_NAME rows.
+        # This is only a fallback for a DB whose REF_NAME backfill has not run:
+        # it can resolve a hit whose ref happens to *be* the Glyph token ref
+        # (the form backfill_from_glyph_db writes). It cannot resolve the usual
+        # reveal-outpoint form — which is exactly why doing this here as the
+        # primary path returned every hit without a name.
         if getattr(self, 'glyph_index', None):
             for hit in hits:
-                ref_str = hit.get('ref') if isinstance(hit, dict) else None
+                if not isinstance(hit, dict) or hit.get('name'):
+                    continue
+                ref_str = hit.get('ref')
                 if not ref_str:
                     continue
                 try:
-                    token = self.glyph_index.get_token_by_ref_str(ref_str)
-                    attrs = (token or {}).get('attrs') or {}
-                    name = attrs.get('name')
-                    if name:
-                        hit['name'] = name
-                        hit['full_name'] = f"{name}.{attrs.get('domain', 'rxd')}"
+                    token = self.glyph_index.get_token_by_ref_str(ref_str) or {}
+                    full_name = _wave_full_name(token)
+                    if full_name:
+                        hit['name'] = full_name.split('.', 1)[0]
+                        hit['full_name'] = full_name
                 except Exception:
                     pass
         return hits

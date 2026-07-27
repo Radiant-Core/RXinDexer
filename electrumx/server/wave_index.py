@@ -53,6 +53,16 @@ class WaveDBKeys:
     UNDO = b'WVU'      # WVU + height(be) -> repr([(key, prev_value_or_None), ...])
     DUPLICATE = b'WD' # WD + name_hash + height + tx_idx -> ref (duplicate registrations)
     SINGLETON = b'WSG'  # WSG + singleton_ref(36) -> name_hash (canonical name owning it)
+    # WM + ref(36) -> full name, utf-8 ("gatorcoin.rxd"). NAME is one-way
+    # (name_hash), so without this there is no way back from a ref to the
+    # readable label and reverse_lookup could only ever return bare refs.
+    #
+    # Prefix choice: no prefix may be a prefix of another. The WR reverse-owner
+    # scan is `WR + hashX + ref`, so e.g. `WRN` would be swept up by any owner
+    # whose hashX starts with 0x4E ('N'); `WNx` would likewise pollute the `WN`
+    # scan in list_names. `WM` is unused and shares no head with WT/WN/WZ/WO/
+    # WR/WH/WD/WVU/WSG.
+    REF_NAME = b'WM'
 
 
 class WaveZoneRecords:
@@ -321,12 +331,16 @@ class WaveIndex:
         # target update (which co-spends the singleton but carries no protocol
         # list) be tied back to the canonical name it belongs to.
         self.singleton_cache: Dict[bytes, bytes] = {}  # singleton_ref(36) -> name_hash
+        # ref(36) -> full name utf-8. Written at registration, where the
+        # plaintext label is in hand; read back by reverse_lookup.
+        self.refname_cache: Dict[bytes, bytes] = {}
 
         self.tree_height: Dict[bytes, int] = {}
         self.name_height: Dict[bytes, int] = {}
         self.zone_height: Dict[bytes, int] = {}
         self.owner_height: Dict[bytes, int] = {}
         self.singleton_height: Dict[bytes, int] = {}
+        self.refname_height: Dict[bytes, int] = {}
 
         # Per-height undo info for reorg safety
         self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
@@ -424,7 +438,7 @@ class WaveIndex:
         
         # Build ref for claim token (output 0)
         claim_ref = tx_hash + struct.pack('<I', 0)
-        
+
         # Determine parent ref
         parent_ref = None
         if parent_name:
@@ -443,7 +457,17 @@ class WaveIndex:
         
         # Index the name in the prefix tree
         self._index_name_in_tree(name, parent_ref, claim_ref, height, tx_hash=tx_hash)
-        
+
+        # Record ref -> readable name. This is the ONLY back-edge from a ref to
+        # its label: NAME is keyed by the one-way name_hash, so reverse_lookup
+        # (which starts from refs) has no other way to name its hits. Recorded
+        # for duplicates too, so a duplicate hit is still nameable. Written only
+        # once the registration is known to be accepted — a rejected one (no
+        # resolvable parent) must not leave a name row behind for its outpoint.
+        # `parent_name` has already been folded to None for the 'rxd' root.
+        self.refname_cache[claim_ref] = f'{name}.{parent_name or "rxd"}'.encode('utf-8')
+        self.refname_height[claim_ref] = height
+
         # Store name -> ref mapping
         name_hash = name_to_hash(name)
         
@@ -832,11 +856,13 @@ class WaveIndex:
             + len(self.zone_cache) * 600
             + len(self.owner_cache) * 190
             + len(self.singleton_cache) * 190
+            + len(self.refname_cache) * 190
             + len(self.tree_height) * 140
             + len(self.name_height) * 140
             + len(self.zone_height) * 140
             + len(self.owner_height) * 140
             + len(self.singleton_height) * 140
+            + len(self.refname_height) * 140
             + undo_entries * 120
             + len(self._pending_heights) * 140
             + len(self.hot_names) * 400
@@ -904,6 +930,16 @@ class WaveIndex:
                 self._record_undo(height, key)
             batch.put(key, name_hash)
 
+        # Flush ref -> readable name (backs reverse_lookup's `name`/`full_name`).
+        # Backfilled rows carry no height and so record no undo: they restate
+        # historical registrations that no reorg in the window can unwind.
+        for ref, full_name in self.refname_cache.items():
+            height = self.refname_height.get(ref)
+            key = WaveDBKeys.REF_NAME + ref
+            if height is not None:
+                self._record_undo(height, key)
+            batch.put(key, full_name)
+
         # Persist undo information last so it includes keys written above.
         for height, entries in sorted(self._undo_cache.items()):
             batch.put(self._undo_key(height), encode_undo(entries))  # R22
@@ -917,11 +953,13 @@ class WaveIndex:
         self.zone_cache.clear()
         self.owner_cache.clear()
         self.singleton_cache.clear()
+        self.refname_cache.clear()
         self.tree_height.clear()
         self.name_height.clear()
         self.zone_height.clear()
         self.owner_height.clear()
         self.singleton_height.clear()
+        self.refname_height.clear()
         self._pending_heights.clear()
         
         if count > 0:
@@ -1001,6 +1039,9 @@ class WaveIndex:
             self.name_cache[name_hash] = claim_ref
             self.name_height[name_hash] = height
 
+            # ...and the back-edge ref -> name, so reverse_lookup can name it.
+            self.refname_cache[claim_ref] = (raw_name or name).encode('utf-8')
+
             # Store zone records from token metadata if available
             metadata_hash = token.metadata_hash
             zone = WaveZoneRecords()
@@ -1029,10 +1070,73 @@ class WaveIndex:
 
         return count
 
+    def backfill_ref_names(self, glyph_index) -> int:
+        """Backfill the REF_NAME (ref -> readable name) index for existing DBs.
+
+        REF_NAME was added after mainnet had already indexed thousands of names,
+        so a DB synced by an older build has none of these rows and
+        ``reverse_lookup`` would keep returning name-less hits until a full
+        reindex. This rebuilds them in place from the Glyph token DB — no daemon
+        rescan — and is a no-op once any REF_NAME row exists.
+
+        Two ref forms are written per token, because the two ways a name can
+        enter this index disagree on which outpoint is the ref:
+
+          * ``deploy_txid:0`` — what ``process_tx`` records (``claim_ref``, the
+            *reveal* transaction's claim output). This is what a normally-synced
+            mainnet DB holds, and the form ``reverse_lookup`` returns.
+          * the Glyph token's own ref — what ``backfill_from_glyph_db`` records
+            (the commit/singleton outpoint).
+
+        Both map to the same name, so writing both makes the index correct
+        regardless of which path populated the DB. (That the two paths key the
+        same name differently is a pre-existing inconsistency, noted here rather
+        than changed: altering a name's canonical ref would break every client
+        holding one.)
+        """
+        if not self.enabled:
+            return 0
+
+        if self._count_db_prefix(WaveDBKeys.REF_NAME, limit=1) > 0 or self.refname_cache:
+            return 0
+
+        try:
+            from electrumx.server.glyph_index import GlyphDBKeys, GlyphTokenInfo
+        except ImportError:
+            self.logger.warning('Cannot import GlyphIndex — REF_NAME backfill aborted')
+            return 0
+
+        self.logger.info('Backfilling WAVE REF_NAME index from Glyph token DB...')
+        count = 0
+        for key, value in self.db.utxo_db.iterator(prefix=GlyphDBKeys.TOKEN):
+            try:
+                token = GlyphTokenInfo.from_bytes(value)
+            except Exception:
+                continue
+            if GlyphProtocol.GLYPH_WAVE not in token.protocols:
+                continue
+            if not token.name:
+                continue
+
+            token_ref = key[len(GlyphDBKeys.TOKEN):]
+            if len(token_ref) < 36:
+                continue
+            encoded = token.name.encode('utf-8')
+
+            # No heights recorded: these restate historical registrations, so
+            # they need no reorg undo (see flush()).
+            self.refname_cache[token_ref[:36]] = encoded
+            if token.deploy_txid:
+                self.refname_cache[token.deploy_txid + struct.pack('<I', 0)] = encoded
+            count += 1
+
+        self.logger.info(f'WAVE REF_NAME backfill: named {count} tokens')
+        return count
+
     # ========================================================================
     # Query Methods (API)
     # ========================================================================
-    
+
     def resolve(self, name: str, include_duplicates: bool = False) -> Optional[Dict[str, Any]]:
         """
         Resolve a WAVE name to its zone records and owner.
@@ -1296,6 +1400,16 @@ class WaveIndex:
                 continue
 
             entry = {'ref': self._format_ref(ref)}
+            # Name the hit here rather than leaving it to callers. Enrichment
+            # used to be attempted in the RPC/REST layers via
+            # glyph_index.get_token_by_ref_str(ref), which can never work: a
+            # WAVE ref is the *reveal* outpoint (reveal_txid:0) while a Glyph
+            # token is keyed by its own commit/singleton ref, so that lookup
+            # always missed and every hit came back name-less.
+            full_name = self._get_ref_name(ref)
+            if full_name:
+                entry['name'] = full_name.split('.', 1)[0]
+                entry['full_name'] = full_name
             zone = self._get_zone_records(ref)
             if zone:
                 entry['zone'] = zone.to_dict()
@@ -1336,6 +1450,22 @@ class WaveIndex:
                 pass
         return None
     
+    def _get_ref_name(self, ref: bytes) -> Optional[str]:
+        """Resolve a ref to its full readable name (e.g. ``gatorcoin.rxd``).
+
+        Returns ``None`` for refs registered before the REF_NAME index existed
+        and not yet backfilled — callers must treat the name as optional.
+        """
+        raw = self.refname_cache.get(ref)
+        if raw is None:
+            raw = self.db.utxo_db.get(WaveDBKeys.REF_NAME + ref)
+        if not raw:
+            return None
+        try:
+            return raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+
     def _get_owner(self, ref: bytes) -> Optional[bytes]:
         """Get owner scripthash for a ref."""
         if ref in self.owner_cache:

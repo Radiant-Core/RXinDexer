@@ -532,6 +532,32 @@ def parse_ref(ref_str: str) -> Tuple[str, int]:
     return txid_hex, int(vout_str)
 
 
+def wave_full_name_from_token(token: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract a WAVE name's full ``label.domain`` from a Glyph token dict.
+
+    A WAVE token carries the name twice: already-qualified in the top-level
+    ``name`` (``"gatorcoin.rxd"``) and split across ``attrs.name`` /
+    ``attrs.domain``. Prefer the top-level field and fall back to ``attrs``,
+    since ``attrs`` is arbitrary user-supplied metadata and need not be present.
+    Returns ``None`` when neither yields a name.
+    """
+    if not token:
+        return None
+    name = token.get('name')
+    if isinstance(name, str) and name:
+        return name
+    attrs = token.get('attrs') or {}
+    if not isinstance(attrs, dict):
+        return None
+    label = attrs.get('name')
+    if not isinstance(label, str) or not label:
+        return None
+    domain = attrs.get('domain')
+    if not isinstance(domain, str) or not domain:
+        domain = 'rxd'
+    return f'{label}.{domain}'
+
+
 class MetadataTooComplex(ValueError):
     """A decoded Glyph structure is too large/shared/cyclic to serialise.
 
