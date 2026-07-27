@@ -66,6 +66,11 @@ electrumx-standalone-deploy.zip
 .env
 test.env
 *.env.local
+# Timestamped backups ops scripts leave behind (.env.bak-1785131670). The plain
+# `.env` rule above does not match these, so without this they show up as
+# untracked and are one `git add .` away from committing DAEMON_URL credentials.
+.env.bak*
+.env.*.bak
 
 # Production override (contains credentials / host-specific cert paths — never
 # commit). The committed base is safe-by-default; the override is OPTIONAL and
