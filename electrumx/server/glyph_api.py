@@ -1481,9 +1481,12 @@ class GlyphAPIMixin:
         
         Args:
             name: WAVE name to resolve (e.g., "alice", "mail.alice")
-            
+
         Returns:
-            {name, ref, zone, owner, available} or None if not registered
+            {name, ref, zone, owner, available, expires?, status?,
+            grace_until?} or None if not registered — or LAPSED: a name past
+            its expiry + grace period no longer resolves. status is
+            'active' | 'grace'.
         """
         self.bump_cost(1.0)
         
@@ -1498,9 +1501,11 @@ class GlyphAPIMixin:
         
         Args:
             name: WAVE name to check
-            
+
         Returns:
-            {available: bool, name, ref?, error?}
+            {available: bool, name, ref?, error?, expires?, status?,
+            expired?, previous_ref?} — a LAPSED name reports available: True
+            with expired: True and the lapsed registration's previous_ref.
         """
         self.bump_cost(0.5)
         

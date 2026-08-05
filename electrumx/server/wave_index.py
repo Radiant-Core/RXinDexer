@@ -17,6 +17,7 @@ Database Schema:
 
 import base64
 import struct
+import time
 from typing import Optional, Dict, Any, List, Tuple, Set
 from collections import defaultdict
 
@@ -41,6 +42,49 @@ WAVE_MIN_NAME_LENGTH = 1
 WAVE_MAX_NAME_LENGTH = 63
 WAVE_MAX_SUBDOMAIN_DEPTH = 127
 
+# ---------------------------------------------------------------------------
+# Name lifecycle (term-based registration — see WAVE-Protocol ANNOUNCEMENT.md)
+#
+# Names are registered for a fixed term and renewed on-chain: any tx that
+# spends the name's claim singleton (covenant-proven owner action) and pays
+# >= the name's registration price to the protocol treasury extends the term
+# to max(current expiry, block time) + WAVE_REGISTRATION_TERM. After expiry
+# the owner has WAVE_GRACE_PERIOD in which the name still resolves and can
+# still be renewed; past that the name lapses — resolution stops, the name
+# reports available, and the next registration supersedes the old canonical
+# mapping. Burning the singleton (no re-created output) releases the name
+# immediately: a destroyed singleton can never resolve again.
+#
+# Expiry timestamps are derived from BLOCK TIMES (registration / renewal
+# block), never from self-asserted metadata, so wallets cannot mint
+# themselves longer terms. Query-time checks use the server wall clock.
+# ---------------------------------------------------------------------------
+WAVE_REGISTRATION_TERM = 2 * 365 * 24 * 60 * 60   # 2 years, in seconds
+WAVE_GRACE_PERIOD = 30 * 24 * 60 * 60             # 30 days
+# Default treasury: the address Photonic pays registration fees to.
+WAVE_TREASURY_ADDRESS_DEFAULT = '1GrwkQNJfjbEJjH25heszNZLpbZou8nfXG'
+# Safety floor for the transition to enforced expiry: no name can lapse
+# before this timestamp (2027-01-01T00:00:00Z), so every owner of a
+# pre-enforcement name has months of runway to renew after deployment.
+# Operators must share this value or their canonical mappings will diverge.
+WAVE_EXPIRY_FLOOR_DEFAULT = 1798761600
+
+
+def wave_name_price(bare_name: str) -> int:
+    """Registration/renewal price in photons, tiered by bare-name length.
+
+    Mirrors Photonic's ``calculateNameCost`` (packages/lib/src/wave.ts) —
+    keep the two in sync.
+    """
+    length = len(bare_name)
+    if length <= 3:
+        return 10_000_000_000   # 100 RXD
+    if length == 4:
+        return 5_000_000_000    # 50 RXD
+    if length == 5:
+        return 1_000_000_000    # 10 RXD
+    return 500_000_000          # 5 RXD
+
 
 # Database key prefixes
 class WaveDBKeys:
@@ -63,6 +107,18 @@ class WaveDBKeys:
     # scan in list_names. `WM` is unused and shares no head with WT/WN/WZ/WO/
     # WR/WH/WD/WVU/WSG.
     REF_NAME = b'WM'
+    # WX + name_hash -> expiry timestamp (8B LE uint64, unix seconds).
+    # Written at registration (block time + term), rewritten by renewals and
+    # by a superseding registration; deleted when a name is freed by burn.
+    # Absent for legacy pre-lifecycle rows until backfill_lifecycle runs —
+    # a missing record means the name cannot lapse.
+    EXPIRY = b'WX'
+    # WCS + name_hash -> singleton_ref(36) currently authorised to control
+    # the name (target updates / renewals / burn-release). SINGLETON (WSG)
+    # is one-way and rows survive supersession, so without this a lapsed
+    # name's OLD singleton could still steer the NEW canonical registration.
+    # Absent (legacy) -> the WSG mapping alone authorises, as before.
+    CURRENT_SINGLETON = b'WCS'
 
 
 class WaveZoneRecords:
@@ -334,6 +390,12 @@ class WaveIndex:
         # ref(36) -> full name utf-8. Written at registration, where the
         # plaintext label is in hand; read back by reverse_lookup.
         self.refname_cache: Dict[bytes, bytes] = {}
+        # name_hash -> packed expiry (WX) / controlling singleton ref (WCS).
+        self.expiry_cache: Dict[bytes, bytes] = {}
+        self.cursingle_cache: Dict[bytes, bytes] = {}
+        # Full DB key -> height. Keys deleted this flush window (burn-released
+        # names). Readers must treat a key present here as absent from the DB.
+        self.delete_cache: Dict[bytes, int] = {}
 
         self.tree_height: Dict[bytes, int] = {}
         self.name_height: Dict[bytes, int] = {}
@@ -341,6 +403,8 @@ class WaveIndex:
         self.owner_height: Dict[bytes, int] = {}
         self.singleton_height: Dict[bytes, int] = {}
         self.refname_height: Dict[bytes, int] = {}
+        self.expiry_height: Dict[bytes, int] = {}
+        self.cursingle_height: Dict[bytes, int] = {}
 
         # Per-height undo info for reorg safety
         self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
@@ -356,25 +420,244 @@ class WaveIndex:
         # Hot name cache (frequently accessed names in memory)
         self.hot_names: Dict[str, WaveNameInfo] = {}
         self.hot_name_limit = getattr(env, 'wave_hot_names', 10000)
-        
+
+        # ---- Name lifecycle (expiry / renewal / release) configuration ----
+        # isinstance guards: tests build env from Mock(), whose missing attrs
+        # are truthy Mock objects, not usable values — fall back to defaults.
+        enforce = getattr(env, 'wave_expiry_enforce', True)
+        self.expiry_enforce = enforce if isinstance(enforce, bool) else True
+        floor_ts = getattr(env, 'wave_expiry_floor_ts', None)
+        self.expiry_floor_ts = (floor_ts if isinstance(floor_ts, int)
+                                else WAVE_EXPIRY_FLOOR_DEFAULT)
+        treasury = getattr(env, 'wave_treasury_address', None)
+        if not isinstance(treasury, str):
+            treasury = WAVE_TREASURY_ADDRESS_DEFAULT
+        self.treasury_script = self._build_treasury_script(treasury)
+
         if self.enabled:
             self.logger.info('WAVE name indexing enabled')
             if self.genesis_ref:
                 self.logger.info(f'WAVE genesis ref: {genesis_ref_str}')
             else:
                 self.logger.warning('WAVE_GENESIS_REF not configured')
-    
+            self.logger.info(
+                f'WAVE lifecycle: enforce={self.expiry_enforce} '
+                f'floor_ts={self.expiry_floor_ts} '
+                f'treasury={"ok" if self.treasury_script else "UNAVAILABLE"}'
+            )
+
+    # ------------------------------------------------------------------
+    # Name lifecycle helpers (expiry / renewal / release)
+    # ------------------------------------------------------------------
+
+    def _build_treasury_script(self, address: str) -> Optional[bytes]:
+        """P2PKH script bytes for the treasury address, or None (renewals
+        then simply never match — logged, not fatal)."""
+        try:
+            from electrumx.lib.hash import Base58
+            from electrumx.lib.script import ScriptPubKey
+            raw = Base58.decode_check(address)
+            if len(raw) != 21:
+                raise ValueError(f'unexpected payload length {len(raw)}')
+            return ScriptPubKey.P2PKH_script(raw[1:])
+        except Exception as e:
+            self.logger.warning(
+                f'WAVE treasury address unusable ({address!r}): {e} — '
+                f'renewal detection disabled'
+            )
+            return None
+
+    def _db_get_live(self, key: bytes) -> Optional[bytes]:
+        """DB read that honours pending deletions (burn-released names)."""
+        if key in self.delete_cache:
+            return None
+        return self.db.utxo_db.get(key)
+
+    def _get_expiry(self, name_hash: bytes) -> Optional[int]:
+        """Stored expiry timestamp for a canonical name, or None (legacy
+        row not yet backfilled — such a name cannot lapse)."""
+        raw = self.expiry_cache.get(name_hash)
+        if raw is None:
+            raw = self._db_get_live(WaveDBKeys.EXPIRY + name_hash)
+        if raw is None or len(raw) != 8:
+            return None
+        return struct.unpack('<Q', raw)[0]
+
+    def _effective_expiry(self, name_hash: bytes) -> Optional[int]:
+        """Expiry with the transition floor applied: no name lapses before
+        WAVE_EXPIRY_FLOOR (owners get runway to renew post-deployment)."""
+        expiry = self._get_expiry(name_hash)
+        if expiry is None:
+            return None
+        return max(expiry, self.expiry_floor_ts)
+
+    def _is_lapsed(self, name_hash: bytes, at_ts: int) -> bool:
+        """True when the name's grace period has fully passed at ``at_ts``.
+
+        Index-time callers pass the BLOCK time (deterministic across nodes);
+        query-time callers pass the wall clock.
+        """
+        if not self.expiry_enforce or not at_ts:
+            return False
+        effective = self._effective_expiry(name_hash)
+        return (effective is not None
+                and at_ts >= effective + WAVE_GRACE_PERIOD)
+
+    def _get_current_singleton(self, name_hash: bytes) -> Optional[bytes]:
+        cur = self.cursingle_cache.get(name_hash)
+        if cur is None:
+            cur = self._db_get_live(WaveDBKeys.CURRENT_SINGLETON + name_hash)
+        return cur
+
+    def _singleton_controls_name(self, singleton_ref: bytes,
+                                 name_hash: bytes) -> bool:
+        """Whether this singleton currently controls the canonical name.
+
+        A superseding registration re-points WCS at its own singleton, so a
+        lapsed name's old singleton loses control. Legacy names (no WCS row
+        yet) fall back to the WSG mapping alone, exactly as before.
+        """
+        current = self._get_current_singleton(name_hash)
+        if current is None:
+            return True
+        return current == singleton_ref
+
+    def _set_expiry(self, name_hash: bytes, expiry: int, height: int,
+                    eager_undo: bool = False):
+        key = WaveDBKeys.EXPIRY + name_hash
+        if eager_undo:
+            # Snapshot cache-first (two renewals in one flush window must
+            # each capture the value immediately before them — same pattern
+            # as zone-target undo).
+            if key not in self._undo_seen[height]:
+                self._undo_seen[height].add(key)
+                prev = self.expiry_cache.get(name_hash)
+                if prev is None:
+                    prev = self.db.utxo_db.get(key)
+                self._undo_cache[height].append((key, prev))
+        self.expiry_cache[name_hash] = struct.pack('<Q', expiry)
+        self.expiry_height[name_hash] = height
+        self.delete_cache.pop(key, None)
+
+    def _free_name(self, name_hash: bytes, singleton_ref: bytes, height: int,
+                   reason: str):
+        """Release a name NOW: its singleton was destroyed, so it can never
+        resolve again. Deletes the canonical mapping (and lifecycle rows) so
+        the name reports available and the next registration is canonical.
+        All deletions are undo-recorded for reorg safety."""
+        claim_ref = self._resolve_name_to_ref_raw(name_hash)
+        keys = [
+            WaveDBKeys.NAME + name_hash,
+            WaveDBKeys.EXPIRY + name_hash,
+            WaveDBKeys.CURRENT_SINGLETON + name_hash,
+            WaveDBKeys.SINGLETON + singleton_ref,
+        ]
+        for key in keys:
+            self._record_undo(height, key)
+            self.delete_cache[key] = height
+        # Drop any unflushed writes for these rows.
+        self.name_cache.pop(name_hash, None)
+        self.name_height.pop(name_hash, None)
+        self.expiry_cache.pop(name_hash, None)
+        self.expiry_height.pop(name_hash, None)
+        self.cursingle_cache.pop(name_hash, None)
+        self.cursingle_height.pop(name_hash, None)
+        self.singleton_cache.pop(singleton_ref, None)
+        self.singleton_height.pop(singleton_ref, None)
+        if claim_ref:
+            self._invalidate_hot_name_by_ref(claim_ref)
+        self._pending_heights[name_hash.hex()] = height
+        self.logger.info(
+            f'WAVE name released ({reason}): '
+            f'name_hash={name_hash.hex()[:12]}.. at height {height}'
+        )
+
+    def _resolve_name_to_ref_raw(self, name_hash: bytes) -> Optional[bytes]:
+        """Canonical ref by name_hash (cache -> live DB)."""
+        if name_hash in self.name_cache:
+            return self.name_cache[name_hash]
+        return self._db_get_live(WaveDBKeys.NAME + name_hash)
+
+    def _maybe_process_renewal(self, tx_hash: bytes, tx, height: int,
+                               block_time: int, spent_singleton_refs: set):
+        """Extend a name's term when its singleton spend pays the treasury.
+
+        Rule: a tx that spends the name's controlling singleton and pays
+        >= wave_name_price(name) to the treasury P2PKH extends the expiry to
+        max(current expiry, block time) + WAVE_REGISTRATION_TERM. Payment is
+        a shared budget consumed name-by-name in sorted-ref order, so one tx
+        cannot renew N names with one fee (and iteration is deterministic
+        for reorg replay).
+        """
+        if (not self.enabled or not spent_singleton_refs
+                or not self.treasury_script or not block_time):
+            return
+        paid = 0
+        for out in tx.outputs:
+            if getattr(out, 'pk_script', None) == self.treasury_script:
+                try:
+                    paid += int(getattr(out, 'value', 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+        if paid <= 0:
+            return
+
+        for singleton_ref in sorted(spent_singleton_refs):
+            name_hash = self._resolve_singleton_to_name(singleton_ref)
+            if not name_hash:
+                continue
+            if not self._singleton_controls_name(singleton_ref, name_hash):
+                continue
+            claim_ref = self._resolve_name_to_ref_raw(name_hash)
+            if not claim_ref:
+                continue
+            full_name = self._get_ref_name(claim_ref)
+            if full_name:
+                price = wave_name_price(full_name.split('.', 1)[0])
+            else:
+                # Label unknown (REF_NAME not backfilled) — charge the
+                # cheapest tier rather than making renewal impossible.
+                price = wave_name_price('xxxxxx')
+                self.logger.warning(
+                    f'WAVE renewal price fallback (no label) for '
+                    f'name_hash={name_hash.hex()[:12]}..'
+                )
+            if paid < price:
+                self.logger.info(
+                    f'WAVE renewal underpaid for name_hash='
+                    f'{name_hash.hex()[:12]}..: {paid} < {price} '
+                    f'(tx {hash_to_hex_str(tx_hash)})'
+                )
+                continue
+            paid -= price
+            current = self._get_expiry(name_hash)
+            new_expiry = max(current or 0, block_time) + WAVE_REGISTRATION_TERM
+            self._set_expiry(name_hash, new_expiry, height, eager_undo=True)
+            self._pending_heights[name_hash.hex()] = height
+            self._invalidate_hot_name_by_ref(claim_ref)
+            self.logger.info(
+                f'WAVE name renewed: name_hash={name_hash.hex()[:12]}.. '
+                f'-> expires {new_expiry} at height {height} '
+                f'(tx {hash_to_hex_str(tx_hash)})'
+            )
+
     def process_tx(self, tx_hash: bytes, tx, height: int, tx_idx: int,
                    glyph_envelope: Dict[str, Any] = None,
                    output_refs_by_vout: Dict[int, List[Tuple[bytes, int]]] = None,
-                   spent_singleton_refs: set = None):
+                   spent_singleton_refs: set = None,
+                   block_time: int = 0):
         """
         Process a transaction for WAVE name registration/update.
-        
+
         A WAVE registration has:
         - Protocol [2, 5, 11] = NFT + Mutable + WAVE
         - 38 outputs (1 claim + 37 branches)
         - Metadata with app.namespace = 'rxd.wave'
+
+        ``block_time`` is the containing block's header timestamp. It drives
+        the name-lifecycle decisions (expiry stamping, renewal extension,
+        lapsed-name supersession); when 0 (unknown), lifecycle actions are
+        skipped and the tx is processed with the legacy semantics.
         """
         if not self.enabled:
             return
@@ -383,9 +666,16 @@ class WaveIndex:
         # changed hands (transfer / sale / mutable target update). Re-point its
         # owner from the re-created singleton output. Runs BEFORE the
         # glyph-envelope gate so plain transfers — which carry no envelope — are
-        # tracked too.
+        # tracked too. Also detects singleton BURNS (spent, not re-created) and
+        # releases the name immediately.
         self._maybe_update_owner(
             tx_hash, tx, height, output_refs_by_vout, spent_singleton_refs
+        )
+
+        # Renewal: singleton spend + treasury payment extends the term. Runs
+        # before the envelope gate too — a plain transfer can carry a renewal.
+        self._maybe_process_renewal(
+            tx_hash, tx, height, block_time, spent_singleton_refs
         )
 
         if not glyph_envelope:
@@ -470,11 +760,15 @@ class WaveIndex:
 
         # Store name -> ref mapping
         name_hash = name_to_hash(name)
-        
-        # Check if this name is already registered (first registration wins)
+
+        # Check if this name is already registered (first registration wins —
+        # unless the existing registration has LAPSED at this block's time, in
+        # which case this registration supersedes it as the new canonical).
         existing_ref = self._resolve_name_to_ref(name)
-        is_duplicate = existing_ref is not None
-        
+        lapsed = (existing_ref is not None
+                  and self._is_lapsed(name_hash, block_time))
+        is_duplicate = existing_ref is not None and not lapsed
+
         if is_duplicate:
             # Store as duplicate - do NOT overwrite canonical mapping
             # Duplicate key: WD + name_hash + height(4B) + tx_idx(4B) -> claim_ref
@@ -486,9 +780,31 @@ class WaveIndex:
                 f'Original: {existing_ref.hex()[:16]}..., Duplicate: {claim_ref.hex()[:16]}...'
             )
         else:
-            # First registration - store as canonical
+            # First registration - store as canonical. A supersession (lapsed
+            # prior registration) takes the same path: the flush-time undo
+            # snapshots the previous on-disk WN/WX/WCS values, so a reorg
+            # restores the old canonical mapping.
+            if lapsed:
+                self._invalidate_hot_name_by_ref(existing_ref)
+                self.hot_names.pop(normalize_name(name), None)
+                self.logger.info(
+                    f'WAVE lapsed name "{name}" superseded: '
+                    f'{existing_ref.hex()[:16]}.. -> {claim_ref.hex()[:16]}.. '
+                    f'at height {height}'
+                )
             self.name_cache[name_hash] = claim_ref
             self.name_height[name_hash] = height
+            # WN may have been burn-released earlier in this flush window;
+            # this registration re-creates it.
+            self.delete_cache.pop(WaveDBKeys.NAME + name_hash, None)
+
+            # Stamp the registration term from the BLOCK time (never from
+            # self-asserted metadata). block_time == 0 (legacy caller/tests)
+            # leaves no expiry row — the name then cannot lapse.
+            if block_time:
+                self._set_expiry(
+                    name_hash, block_time + WAVE_REGISTRATION_TERM, height
+                )
 
             # Record the NFT singleton this registration creates so a later
             # mutable target update (which co-spends the singleton) can be mapped
@@ -509,7 +825,7 @@ class WaveIndex:
                     # to one canonical name; silently re-pointing it would let a
                     # second registration steal control of the first's updates.
                     if (ref_bytes in self.singleton_cache
-                            or self.db.utxo_db.get(
+                            or self._db_get_live(
                                 WaveDBKeys.SINGLETON + ref_bytes) is not None):
                         self.logger.warning(
                             f'WAVE singleton {ref_bytes.hex()[:16]}.. already '
@@ -518,6 +834,13 @@ class WaveIndex:
                         continue
                     self.singleton_cache[ref_bytes] = name_hash
                     self.singleton_height[ref_bytes] = height
+                    # This singleton now CONTROLS the name (target updates,
+                    # renewals, release). A supersession re-points this, so a
+                    # lapsed name's old singleton loses control.
+                    self.cursingle_cache[name_hash] = ref_bytes
+                    self.cursingle_height[name_hash] = height
+                    self.delete_cache.pop(
+                        WaveDBKeys.CURRENT_SINGLETON + name_hash, None)
         
         # Store zone records (for both canonical and duplicates)
         zone = WaveZoneRecords.from_metadata(metadata)
@@ -609,21 +932,13 @@ class WaveIndex:
     
     def _resolve_name_to_ref(self, name: str) -> Optional[bytes]:
         """Resolve a name to its claim ref."""
-        name_hash = name_to_hash(name)
-        
-        # Check cache
-        if name_hash in self.name_cache:
-            return self.name_cache[name_hash]
-        
-        # Check database
-        key = WaveDBKeys.NAME + name_hash
-        return self.db.utxo_db.get(key)
+        return self._resolve_name_to_ref_raw(name_to_hash(name))
 
     def _resolve_singleton_to_name(self, singleton_ref: bytes) -> Optional[bytes]:
         """Resolve an NFT singleton ref to the canonical name_hash that owns it."""
         if singleton_ref in self.singleton_cache:
             return self.singleton_cache[singleton_ref]
-        return self.db.utxo_db.get(WaveDBKeys.SINGLETON + singleton_ref)
+        return self._db_get_live(WaveDBKeys.SINGLETON + singleton_ref)
 
     def _invalidate_hot_name_by_ref(self, ref: bytes):
         """Drop any hot-cache entries pointing at this claim ref so the next
@@ -668,8 +983,11 @@ class WaveIndex:
             name_hash = self._resolve_singleton_to_name(singleton_ref)
             if not name_hash:
                 continue
-            claim_ref = (self.name_cache.get(name_hash)
-                         or self.db.utxo_db.get(WaveDBKeys.NAME + name_hash))
+            # A superseded registration's old singleton must not steer the
+            # new canonical name.
+            if not self._singleton_controls_name(singleton_ref, name_hash):
+                continue
+            claim_ref = self._resolve_name_to_ref_raw(name_hash)
             if not claim_ref:
                 continue
 
@@ -736,22 +1054,29 @@ class WaveIndex:
         (that would need reorg-fragile batch deletes); reverse_lookup filters
         them out by comparing each hit against the current OWNER record.
         """
-        if not self.enabled or not spent_singleton_refs or not output_refs_by_vout:
+        if not self.enabled or not spent_singleton_refs:
             return
+        # None means the caller did not compute output refs at all (legacy
+        # callers/tests) — "singleton absent from outputs" then proves
+        # nothing, so burn-release must not fire. The block processor always
+        # passes a dict (possibly empty), so real burns still release.
+        refs_known = output_refs_by_vout is not None
+        output_refs_by_vout = output_refs_by_vout or {}
 
-        for singleton_ref in spent_singleton_refs:
+        for singleton_ref in sorted(spent_singleton_refs):
             name_hash = self._resolve_singleton_to_name(singleton_ref)
             if not name_hash:
                 continue
-            claim_ref = (self.name_cache.get(name_hash)
-                         or self.db.utxo_db.get(WaveDBKeys.NAME + name_hash))
+            claim_ref = self._resolve_name_to_ref_raw(name_hash)
             if not claim_ref:
                 continue
 
             # Find the re-created singleton output (same ref) → new owner address.
+            recreated = False
             new_owner = None
             for vout, refs in output_refs_by_vout.items():
                 if any(rb == singleton_ref and rt == 1 for (rb, rt) in refs):
+                    recreated = True
                     try:
                         new_owner = self._owner_hashX_from_script(
                             tx.outputs[vout].pk_script
@@ -760,8 +1085,22 @@ class WaveIndex:
                         new_owner = None
                     break
 
-            # No tracked re-creation (burned/melted) — leave owner as-is rather
-            # than guess; resolution would also stop, so it won't mislead.
+            if not recreated:
+                # Singleton DESTROYED (burn / melt / reclaim). The node's
+                # singleton rule means it can never reappear, so the name can
+                # never resolve again — release it immediately so it returns
+                # to the available pool. Only the CONTROLLING singleton frees
+                # the name (an orphaned mapping from a superseded registration
+                # must not release the new canonical), and only when the
+                # caller genuinely computed output refs (refs_known).
+                if (refs_known and self.expiry_enforce
+                        and self._singleton_controls_name(
+                            singleton_ref, name_hash)):
+                    self._free_name(name_hash, singleton_ref, height, 'burn')
+                continue
+
+            # Re-created but the holding script defied owner extraction —
+            # leave the owner as-is rather than guess.
             if new_owner is None:
                 continue
             if self._get_owner(claim_ref) == new_owner:
@@ -857,6 +1196,9 @@ class WaveIndex:
             + len(self.owner_cache) * 190
             + len(self.singleton_cache) * 190
             + len(self.refname_cache) * 190
+            + len(self.expiry_cache) * 190
+            + len(self.cursingle_cache) * 190
+            + len(self.delete_cache) * 140
             + len(self.tree_height) * 140
             + len(self.name_height) * 140
             + len(self.zone_height) * 140
@@ -940,6 +1282,29 @@ class WaveIndex:
                 self._record_undo(height, key)
             batch.put(key, full_name)
 
+        # Flush expiry rows (registration stamp / renewals / backfill).
+        for name_hash, packed in self.expiry_cache.items():
+            height = self.expiry_height.get(name_hash)
+            key = WaveDBKeys.EXPIRY + name_hash
+            if height is not None:
+                self._record_undo(height, key)
+            batch.put(key, packed)
+
+        # Flush controlling-singleton rows.
+        for name_hash, singleton_ref in self.cursingle_cache.items():
+            height = self.cursingle_height.get(name_hash)
+            key = WaveDBKeys.CURRENT_SINGLETON + name_hash
+            if height is not None:
+                self._record_undo(height, key)
+            batch.put(key, singleton_ref)
+
+        # Apply deletions (burn-released names) AFTER the put loops — the
+        # release already dropped its rows from the write caches, and the
+        # eager undo recorded at release time restores them on reorg.
+        for key, height in self.delete_cache.items():
+            self._record_undo(height, key)
+            batch.delete(key)
+
         # Persist undo information last so it includes keys written above.
         for height, entries in sorted(self._undo_cache.items()):
             batch.put(self._undo_key(height), encode_undo(entries))  # R22
@@ -954,12 +1319,17 @@ class WaveIndex:
         self.owner_cache.clear()
         self.singleton_cache.clear()
         self.refname_cache.clear()
+        self.expiry_cache.clear()
+        self.cursingle_cache.clear()
+        self.delete_cache.clear()
         self.tree_height.clear()
         self.name_height.clear()
         self.zone_height.clear()
         self.owner_height.clear()
         self.singleton_height.clear()
         self.refname_height.clear()
+        self.expiry_height.clear()
+        self.cursingle_height.clear()
         self._pending_heights.clear()
         
         if count > 0:
@@ -1133,36 +1503,148 @@ class WaveIndex:
         self.logger.info(f'WAVE REF_NAME backfill: named {count} tokens')
         return count
 
+    def backfill_lifecycle(self, glyph_index) -> int:
+        """One-time backfill of the lifecycle rows (WX expiry, WCS control)
+        for names indexed before term enforcement existed.
+
+        - WCS: inverted from the existing SINGLETON (WSG) rows — at
+          registration each claim singleton was mapped to its name, so the
+          inverse identifies the controlling singleton per name.
+        - WX: registration block time (from the glyph token's deploy height →
+          stored header timestamp) + WAVE_REGISTRATION_TERM. Names whose
+          height or header can't be recovered get the transition floor, so
+          they still enter the lifecycle with months of renewal runway.
+
+        No-op once any WX row exists. Rows carry no height and record no
+        undo (they restate historical registrations, like backfill_ref_names).
+        Returns the number of names stamped.
+        """
+        if not self.enabled:
+            return 0
+        if (self._count_db_prefix(WaveDBKeys.EXPIRY, limit=1) > 0
+                or self.expiry_cache):
+            return 0
+
+        # ---- WCS from WSG (skip names that already have one) ----
+        for key, name_hash in self.db.utxo_db.iterator(
+                prefix=WaveDBKeys.SINGLETON):
+            singleton_ref = key[len(WaveDBKeys.SINGLETON):]
+            if len(singleton_ref) != 36 or len(name_hash) != 16:
+                continue
+            if (name_hash in self.cursingle_cache
+                    or self.db.utxo_db.get(
+                        WaveDBKeys.CURRENT_SINGLETON + name_hash) is not None):
+                continue
+            self.cursingle_cache[name_hash] = singleton_ref
+
+        # ---- deploy_txid -> height map from the glyph token DB ----
+        height_by_txid: Dict[bytes, int] = {}
+        try:
+            from electrumx.server.glyph_index import GlyphDBKeys, GlyphTokenInfo
+            for key, value in self.db.utxo_db.iterator(
+                    prefix=GlyphDBKeys.TOKEN):
+                try:
+                    token = GlyphTokenInfo.from_bytes(value)
+                except Exception:
+                    continue
+                if GlyphProtocol.GLYPH_WAVE not in token.protocols:
+                    continue
+                if not token.deploy_height:
+                    continue
+                if token.deploy_txid:
+                    height_by_txid[token.deploy_txid] = token.deploy_height
+                token_ref = key[len(GlyphDBKeys.TOKEN):]
+                if len(token_ref) >= 32:
+                    height_by_txid.setdefault(
+                        token_ref[:32], token.deploy_height)
+        except ImportError:
+            self.logger.warning(
+                'WAVE lifecycle backfill: GlyphIndex unavailable — '
+                'falling back to the floor for all names')
+
+        def _block_time(height: int) -> Optional[int]:
+            headers_file = getattr(self.db, 'headers_file', None)
+            if headers_file is None or height <= 0:
+                return None
+            try:
+                raw = headers_file.read(height * 80, 80)
+                if len(raw) != 80:
+                    return None
+                return struct.unpack_from('<I', raw, 68)[0]
+            except Exception:
+                return None
+
+        count = 0
+        floored = 0
+        for key, ref_bytes in self.db.utxo_db.iterator(
+                prefix=WaveDBKeys.NAME):
+            name_hash = key[len(WaveDBKeys.NAME):]
+            if len(name_hash) != 16 or len(ref_bytes) < 36:
+                continue
+            height = height_by_txid.get(ref_bytes[:32])
+            ts = _block_time(height) if height else None
+            if ts:
+                expiry = ts + WAVE_REGISTRATION_TERM
+            else:
+                # Unknown registration time — floor keeps the name safe
+                # until the transition window ends, then normal grace rules.
+                expiry = self.expiry_floor_ts
+                floored += 1
+            self.expiry_cache[name_hash] = struct.pack('<Q', expiry)
+            count += 1
+
+        if count:
+            self.logger.info(
+                f'WAVE lifecycle backfill: stamped {count} names '
+                f'({floored} floored), {len(self.cursingle_cache)} control rows'
+            )
+        return count
+
     # ========================================================================
     # Query Methods (API)
     # ========================================================================
 
-    def resolve(self, name: str, include_duplicates: bool = False) -> Optional[Dict[str, Any]]:
+    def resolve(self, name: str, include_duplicates: bool = False,
+                now: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Resolve a WAVE name to its zone records and owner.
-        
-        Always returns the CANONICAL (first) registration.
-        Duplicate registrations are tracked but not returned unless requested.
-        
+
+        Always returns the CANONICAL registration. Duplicate registrations
+        are tracked but not returned unless requested.
+
+        Lifecycle: a name past its expiry + grace period is LAPSED and no
+        longer resolves (returns None, as if unregistered). Within the grace
+        window it still resolves, with ``status: 'grace'``. Active/grace
+        results carry ``expires`` (unix seconds, floor-adjusted).
+
         Args:
             name: The WAVE name to resolve
             include_duplicates: If True, include list of duplicate registrations
-        
-        Returns None if name is not registered.
+            now: Override the wall clock (tests)
+
+        Returns None if name is not registered (or has lapsed).
         """
         valid, error = validate_wave_name(name)
         if not valid:
             return {'error': error}
-        
-        # Check hot cache
+
+        now = int(time.time()) if now is None else now
+        name_hash = name_to_hash(name)
         normalized = normalize_name(name)
+        if self._is_lapsed(name_hash, now):
+            # Stale hot entry must not resurrect a lapsed name.
+            self.hot_names.pop(normalized, None)
+            return None
+
+        # Check hot cache
         if normalized in self.hot_names:
             info = self.hot_names[normalized]
             result = self._name_info_to_dict(info)
+            self._append_lifecycle(result, name_hash, now)
             if include_duplicates:
                 result['duplicates'] = self._get_duplicate_registrations(name)
             return result
-        
+
         # Look up canonical ref (first registration)
         ref = self._resolve_name_to_ref(name)
         if not ref:
@@ -1200,11 +1682,26 @@ class WaveIndex:
             'canonical': True,  # This is always the canonical (first) registration
             'has_duplicates': has_duplicates,
         }
-        
+        self._append_lifecycle(result, name_hash, now)
+
         if include_duplicates:
             result['duplicates'] = self._get_duplicate_registrations(name)
-        
+
         return result
+
+    def _append_lifecycle(self, result: Dict[str, Any], name_hash: bytes,
+                          now: int):
+        """Attach expires/status to a resolve() result. Legacy names with no
+        expiry row get no lifecycle fields (they cannot lapse)."""
+        effective = self._effective_expiry(name_hash)
+        if effective is None:
+            return
+        result['expires'] = effective
+        if self.expiry_enforce and now >= effective:
+            result['status'] = 'grace'
+            result['grace_until'] = effective + WAVE_GRACE_PERIOD
+        else:
+            result['status'] = 'active'
     
     def _has_duplicates(self, name: str) -> bool:
         """Check if a name has any duplicate registrations."""
@@ -1273,20 +1770,38 @@ class WaveIndex:
             return {'name': name, 'registered': False}
         return result
     
-    def check_available(self, name: str) -> Dict[str, Any]:
-        """Check if a WAVE name is available for registration."""
+    def check_available(self, name: str,
+                        now: Optional[int] = None) -> Dict[str, Any]:
+        """Check if a WAVE name is available for registration.
+
+        A LAPSED name (expiry + grace passed without renewal) is available:
+        the next registration supersedes the old canonical mapping. The
+        response then carries ``expired: True`` and the lapsed registration's
+        ref for transparency.
+        """
         valid, error = validate_wave_name(name)
         if not valid:
             return {'available': False, 'error': error}
-        
+
+        now = int(time.time()) if now is None else now
         ref = self._resolve_name_to_ref(name)
-        
+
         if ref:
-            return {
+            name_hash = name_to_hash(name)
+            if self._is_lapsed(name_hash, now):
+                return {
+                    'available': True,
+                    'name': normalize_name(name),
+                    'expired': True,
+                    'previous_ref': self._format_ref(ref),
+                }
+            result = {
                 'available': False,
                 'ref': self._format_ref(ref),
                 'name': normalize_name(name),
             }
+            self._append_lifecycle(result, name_hash, now)
+            return result
         else:
             return {
                 'available': True,
@@ -1366,7 +1881,8 @@ class WaveIndex:
 
         return results
     
-    def reverse_lookup(self, scripthash: bytes, limit: int = 100) -> List[Dict[str, Any]]:
+    def reverse_lookup(self, scripthash: bytes, limit: int = 100,
+                       now: Optional[int] = None) -> List[Dict[str, Any]]:
         """Find WAVE names owned by an address.
 
         Owners are indexed by the 11-byte ElectrumX hashX (sha256(scriptPubKey)
@@ -1377,6 +1893,7 @@ class WaveIndex:
         nothing. Index: WR + hashX + ref -> ''.
         """
         from electrumx.lib.hash import HASHX_LEN
+        now = int(time.time()) if now is None else now
         if len(scripthash) == 32:
             owner_key = scripthash[::-1][:HASHX_LEN]
         else:
@@ -1410,6 +1927,25 @@ class WaveIndex:
             if full_name:
                 entry['name'] = full_name.split('.', 1)[0]
                 entry['full_name'] = full_name
+                # Lifecycle status so owners can see names needing renewal.
+                # Lapsed names stay listed (flagged 'expired') — the owner
+                # still holds the token even though resolution has stopped.
+                # WX is keyed by name_hash (shared with any superseding
+                # registration), so only attach it when THIS ref is still
+                # the canonical holder; otherwise flag the supersession.
+                nh = name_to_hash(entry['name'])
+                if self._resolve_name_to_ref_raw(nh) == ref:
+                    effective = self._effective_expiry(nh)
+                    if effective is not None:
+                        entry['expires'] = effective
+                        if not self.expiry_enforce or now < effective:
+                            entry['status'] = 'active'
+                        elif now < effective + WAVE_GRACE_PERIOD:
+                            entry['status'] = 'grace'
+                        else:
+                            entry['status'] = 'expired'
+                else:
+                    entry['status'] = 'superseded'
             zone = self._get_zone_records(ref)
             if zone:
                 entry['zone'] = zone.to_dict()
@@ -1559,6 +2095,13 @@ class WaveIndex:
             'cache_names': len(self.name_cache),
             'cache_zones': len(self.zone_cache),
             'hot_names': len(self.hot_names),
+            'lifecycle': {
+                'expiry_enforce': self.expiry_enforce,
+                'registration_term': WAVE_REGISTRATION_TERM,
+                'grace_period': WAVE_GRACE_PERIOD,
+                'expiry_floor_ts': self.expiry_floor_ts,
+                'renewals_enabled': self.treasury_script is not None,
+            },
         }
 
 

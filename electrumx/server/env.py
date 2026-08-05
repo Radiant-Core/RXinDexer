@@ -114,6 +114,15 @@ class Env(EnvBase):
         # WAVE naming system configuration
         self.wave_genesis_ref = self.default('WAVE_GENESIS_REF', None)
         self.wave_hot_names = self.integer('WAVE_HOT_NAMES', 10000)
+        # WAVE name lifecycle (term-based registration; see wave_index.py).
+        # WAVE_EXPIRY_ENFORCE=0 is the emergency rollback switch: renewals
+        # still index, but nothing lapses and burns don't release names.
+        # WAVE_EXPIRY_FLOOR_TS: no name can lapse before this timestamp —
+        # operators MUST share this value or canonical mappings diverge.
+        self.wave_expiry_enforce = self.boolean('WAVE_EXPIRY_ENFORCE', True)
+        self.wave_expiry_floor_ts = self.integer('WAVE_EXPIRY_FLOOR_TS', 1798761600)
+        self.wave_treasury_address = self.default(
+            'WAVE_TREASURY_ADDRESS', '1GrwkQNJfjbEJjH25heszNZLpbZou8nfXG')
         
         # dMint contracts configuration
         self.dmint_contracts_file = self.default('DMINT_CONTRACTS_FILE', 'data/contracts.json')

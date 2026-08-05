@@ -12,6 +12,7 @@
 import asyncio
 import ctypes
 import gc
+import struct
 import time
 from asyncio import sleep
 
@@ -591,6 +592,14 @@ class BlockProcessor:
         min_height = self.db.min_undo_height(self.daemon.cached_height())
         height = self.height + 1
 
+        # Header timestamp for this block, consumed by the WAVE name-lifecycle
+        # logic inside advance_txs (expiry stamping / renewals / supersession).
+        # 80-byte header, little-endian uint32 time at offset 68.
+        try:
+            self._current_block_time = struct.unpack_from('<I', block.header, 68)[0]
+        except Exception:
+            self._current_block_time = 0
+
         is_unspendable = is_unspendable_legacy
         undo_info, ref_loc_undo_info = self.advance_txs(block.transactions, is_unspendable)
         if height >= min_height:
@@ -873,7 +882,7 @@ class BlockProcessor:
                                 f'Passing WAVE envelope to wave_index: '
                                 f'tx={hash_to_hex_str(tx_hash)} protocols={protocols}'
                             )
-                        self.wave_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, output_refs_by_vout, spent_singleton_refs)
+                        self.wave_index.process_tx(tx_hash, tx, self.height + 1, tx_num - self.tx_count, glyph_envelope, output_refs_by_vout, spent_singleton_refs, block_time=getattr(self, '_current_block_time', 0))
                     except MemoryError:
                         raise
                     except Exception:
@@ -1300,6 +1309,13 @@ class BlockProcessor:
             # (which only runs on an *empty* WAVE DB) never reaches them and
             # reverse_lookup would keep returning name-less hits.
             count = self.wave_index.backfill_ref_names(self.glyph_index)
+            if count > 0:
+                async with self.state_lock:
+                    await self.flush(True)
+            # One-shot lifecycle backfill: stamps expiry (WX) and controlling-
+            # singleton (WCS) rows for names indexed before term enforcement
+            # existed. No-op once any WX row is present.
+            count = self.wave_index.backfill_lifecycle(self.glyph_index)
             if count > 0:
                 async with self.state_lock:
                     await self.flush(True)
