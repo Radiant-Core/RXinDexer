@@ -11,7 +11,7 @@ aiohttp>=3.3,<4.0
 # i.e. CI exercised a different websockets implementation than the server
 # actually uses, on the exact axis where they diverge. Bump both together,
 # deliberately, not one as a side effect.
-websockets>=10.0,<14.0
+websockets>=16.1.1,<17.0
 psutil
 cbor2>=5.4.0
 
