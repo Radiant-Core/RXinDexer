@@ -55,6 +55,8 @@ class GlyphDBKeys:
     UNDO = b'GXU'              # GXU + height(be) -> binary undo entries
     KEY_REVEALS = b'GKR'       # GKR + ref -> CBOR key reveal record (Phase 6 / REP-3009)
     CONTRACT_TO_TOKEN = b'GC'  # GC + contract_ref(36) -> token_ref(36) (R6 reverse index)
+    CONTAINER_MEMBERS = b'GCM' # GCM + container_ref(36) + member_ref(36) -> empty
+    BY_META_TYPE = b'GMT'      # GMT + type_hash(16) + ref(36) -> empty (metadata 'type' field index)
     STATS = b'GSTAT'           # GSTAT -> CBOR {total, ft, nft, dat, dmint, v1, v2} (R11)
     SCHEMA_VERSION = b'GVER'   # GVER -> uint8 schema version (R21)
     # --- v4 discovery indexes (recency-ordered; see _migrate_3_to_4) ---
@@ -74,7 +76,16 @@ class GlyphDBKeys:
 # v4: recency-ordered discovery indexes (BY_TYPE_RECENT / BY_PROTO / GLOBAL_RECENT).
 #     Backfillable in place from existing GT rows (deploy_height + protocols are
 #     already stored) — no radiantd rescan; see _migrate_3_to_4.
-CURRENT_SCHEMA_VERSION = 4
+# v5: container membership index (GCM keys). Backfillable in place from stored
+#     metadata (`in` field); see _migrate_4_to_5.
+# v6: metadata type index (GMT keys). Backfillable in place from stored metadata
+#     (`type` field); see _migrate_5_to_6.
+#
+# v5/v6 were developed as v4/v5 against a v3 base, before the recency indexes took
+# v4 upstream; they are renumbered here so the chain stays linear. Both derive
+# purely from the CBOR metadata already stored in GM rows, so neither needs the
+# full reindex their original notes assumed.
+CURRENT_SCHEMA_VERSION = 6
 
 
 # History event types
@@ -534,6 +545,14 @@ class GlyphIndex:
         self.contract_to_token_cache: Dict[bytes, bytes] = {}  # contract_ref -> token_ref
         self.contract_to_token_height: Dict[bytes, int] = {}   # contract_ref -> height
 
+        # Pending container membership index entries for flush
+        self.container_member_cache: Dict[bytes, Set[bytes]] = defaultdict(set)  # container_ref -> {member_ref}
+        self.container_member_height: Dict[bytes, int] = {}   # container_ref -> height
+
+        # Pending metadata type index entries for flush (GMT)
+        self.meta_type_cache: Dict[str, Set[bytes]] = defaultdict(set)  # meta_type_lower -> {ref}
+        self.meta_type_height: Dict[str, int] = {}            # meta_type_lower -> height
+
         # In-memory stats delta accumulator (R11)
         # Tracks net change in counts since last flush
         self._stats_delta: Dict[str, int] = dict(self._STATS_ZERO)
@@ -615,7 +634,9 @@ class GlyphIndex:
             return
 
         # v < CURRENT — walk the in-place migration chain.
-        migrations = {3: self._migrate_3_to_4}
+        migrations = {3: self._migrate_3_to_4,
+                      4: self._migrate_4_to_5,
+                      5: self._migrate_5_to_6}
         while v < CURRENT_SCHEMA_VERSION:
             migrator = migrations.get(v)
             if migrator is None:
@@ -687,6 +708,116 @@ class GlyphIndex:
             f'Glyph v4 migration complete: {total} tokens backfilled into '
             f'discovery indexes (GZ/GP/GQ)')
         return total
+
+    def _read_token_page(self, seek: bytes, page: int):
+        """Read one page of GT rows from ``seek``. Returns ``(items, next_seek)``.
+
+        ``items`` is ``[(ref, token)]`` with unparseable rows dropped; ``next_seek`` is None once
+        the walk is complete. The iterator is fully drained before returning, so a caller's
+        ``write_batch`` never overlaps an open RocksDB iterator — the same constraint
+        ``_migrate_3_to_4`` observes by collecting a page before opening its batch.
+        """
+        prefix = GlyphDBKeys.TOKEN
+        raw = []
+        for key, value in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            raw.append((key, value))
+            if len(raw) >= page:
+                break
+        items = []
+        for key, value in raw:
+            ref = key[len(prefix):]
+            if len(ref) != 36:
+                continue
+            try:
+                items.append((ref, GlyphTokenInfo.from_bytes(value)))
+            except Exception:
+                continue
+        # seek is inclusive, so resume strictly after the last key read.
+        next_seek = (raw[-1][0] + b'\x00') if len(raw) >= page else None
+        return items, next_seek
+
+    def _migrate_metadata_derived(self, label: str, derive) -> int:
+        """Shared driver for the v4->v5 and v5->v6 backfills.
+
+        Both walk existing GT rows, re-read each token's stored CBOR metadata from its GM row, and
+        write keys that are a pure function of that metadata — so neither needs a radiantd rescan
+        or any block reprocessing. ``derive(ref, metadata)`` returns the keys to write.
+
+        Notes (mirroring _migrate_3_to_4):
+          * Idempotent — the keys are derived, so re-writing them is a no-op and a run interrupted
+            before the version stamp is safe to repeat.
+          * Page-committed via ``seek``, never holding an iterator open across a commit.
+          * No undo recorded: migrations run at startup before block sync, so no reorg is
+            concurrent, and every list query hydrates via ``get_token`` and skips refs whose token
+            is gone — leaving any orphan inert.
+          * Tokens whose metadata is absent (never stored, or scrubbed by the dMint denylist) or
+            undecodable are skipped: there is nothing to derive a key from.
+        """
+        PAGE = 5000
+        seek = GlyphDBKeys.TOKEN
+        total = 0
+        indexed = 0
+        pages = 0
+        while True:
+            items, seek = self._read_token_page(seek, PAGE)
+            if items:
+                with self.db.utxo_db.write_batch() as batch:
+                    for ref, token in items:
+                        total += 1
+                        if not token.metadata_hash:
+                            continue
+                        metadata = self.get_metadata(token.metadata_hash)
+                        if not isinstance(metadata, dict):
+                            continue
+                        for key in derive(ref, metadata):
+                            batch.put(key, b'')
+                            indexed += 1
+                pages += 1
+                self.logger.info(
+                    f'Glyph {label} migration: {total} tokens scanned, '
+                    f'{indexed} rows written ({pages} page(s))')
+            if seek is None:
+                break
+        self.logger.info(
+            f'Glyph {label} migration complete: {indexed} rows written from {total} tokens')
+        return indexed
+
+    def _migrate_4_to_5(self) -> int:
+        """v4 -> v5: backfill the container membership index (GCM) in place.
+
+        Mirrors the live write path exactly: membership is declared by the MEMBER token, whose
+        metadata carries a 36-byte container ref at ``metadata['in'][0]`` (CBORTag-wrapped in some
+        encoders). Member tokens are plain NFTs and carry no distinguishing protocol flag, so the
+        ``in`` field is the sole signal.
+        """
+        def derive(ref, metadata):
+            in_field = metadata.get('in')
+            if not isinstance(in_field, (list, tuple)) or not in_field:
+                return
+            in_0 = in_field[0]
+            if hasattr(in_0, 'value'):      # unwrap CBORTag
+                in_0 = in_0.value
+            if isinstance(in_0, (bytes, bytearray)) and len(in_0) == 36:
+                yield GlyphDBKeys.CONTAINER_MEMBERS + bytes(in_0) + ref
+
+        return self._migrate_metadata_derived('v5 (GCM)', derive)
+
+    def _migrate_5_to_6(self) -> int:
+        """v5 -> v6: backfill the metadata type index (GMT) in place.
+
+        Mirrors the live write path exactly, including the ``strip().lower()`` normalisation — the
+        stored key is ``sha256(normalised_type)[:16]``, so any divergence here would produce keys
+        that live writes could never match.
+        """
+        def derive(ref, metadata):
+            raw_meta_type = metadata.get('type')
+            if raw_meta_type and isinstance(raw_meta_type, str):
+                meta_type_lower = raw_meta_type.strip().lower()
+                if meta_type_lower:
+                    type_hash = sha256(meta_type_lower.encode('utf-8'))[:16]
+                    yield GlyphDBKeys.BY_META_TYPE + type_hash + ref
+
+        return self._migrate_metadata_derived('v6 (GMT)', derive)
 
     def _scrub_denylist_metadata(self) -> None:
         """Delete stored CBOR metadata blobs (GM keys) for all denylisted tokens.
@@ -1574,6 +1705,34 @@ class GlyphIndex:
                     token.timelock_cek_hash = tl.get('cek_hash')  # 'sha256:hex'
                     token.timelock_hint = tl.get('hint')
 
+        # Extract container membership: presence of an 'in' field is sufficient —
+        # member tokens are plain NFTs and do not carry a specific container
+        # protocol flag.  The container ref is a 36-byte value at metadata['in'][0].
+        in_field = metadata.get('in')
+        if isinstance(in_field, (list, tuple)) and len(in_field) > 0:
+            in_0 = in_field[0]
+            # Unwrap CBORTag if needed
+            if hasattr(in_0, 'value'):
+                in_0 = in_0.value
+            if isinstance(in_0, (bytes, bytearray)) and len(in_0) == 36:
+                container_ref_bytes = bytes(in_0)
+                token.container_ref = container_ref_bytes.hex()
+                self.container_member_cache[container_ref_bytes].add(ref)
+                if container_ref_bytes not in self.container_member_height:
+                    self.container_member_height[container_ref_bytes] = height
+
+        # Index by metadata 'type' field (GMT) — covers application-level token
+        # categories like "user", "profile", etc. that are not expressed as
+        # protocol flags.  Both v1 (type string only) and v2 (p array + type
+        # string) tokens may carry this field.
+        raw_meta_type = metadata.get('type')
+        if raw_meta_type and isinstance(raw_meta_type, str):
+            meta_type_lower = raw_meta_type.strip().lower()
+            if meta_type_lower:
+                self.meta_type_cache[meta_type_lower].add(ref)
+                if meta_type_lower not in self.meta_type_height:
+                    self.meta_type_height[meta_type_lower] = height
+
         # Store in cache (GSTAT counting happens once at the GT write point in
         # flush(), covering all registration paths uniformly).
         self.token_cache[ref] = token
@@ -2066,6 +2225,23 @@ class GlyphIndex:
             self._record_undo(height, key)
             batch.put(key, token_ref)
 
+        # Flush container membership index (GCM + container_ref + member_ref -> empty)
+        for container_ref_bytes, member_refs in self.container_member_cache.items():
+            c_height = self.container_member_height.get(container_ref_bytes, self.db.db_height) or 0
+            for member_ref in member_refs:
+                key = GlyphDBKeys.CONTAINER_MEMBERS + container_ref_bytes + member_ref
+                self._record_undo(c_height, key)
+                batch.put(key, b'')
+
+        # Flush metadata type index (GMT + type_hash(16) + ref(36) -> empty)
+        for meta_type_str, refs in self.meta_type_cache.items():
+            type_hash = sha256(meta_type_str.encode('utf-8'))[:16]
+            mt_height = self.meta_type_height.get(meta_type_str, self.db.db_height) or 0
+            for ref in refs:
+                key = GlyphDBKeys.BY_META_TYPE + type_hash + ref
+                self._record_undo(mt_height, key)
+                batch.put(key, b'')
+
         # R11: Flush incremental stats counter
         self._flush_stats_counter(batch)
 
@@ -2088,6 +2264,10 @@ class GlyphIndex:
         self.key_reveal_height.clear()         # R2
         self.contract_to_token_cache.clear()   # R6
         self.contract_to_token_height.clear()  # R6
+        self.container_member_cache.clear()
+        self.container_member_height.clear()
+        self.meta_type_cache.clear()
+        self.meta_type_height.clear()
         self._stats_delta = dict(self._STATS_ZERO)  # R11
         self._known_refs.clear()               # R14: clear on every flush
     
@@ -2686,6 +2866,105 @@ class GlyphIndex:
         """
         prefix = GlyphDBKeys.BY_PROTO + struct.pack('<B', proto & 0xFF)
         return self._paginate_hydrated(prefix, limit, cursor)
+
+    def get_container_members(self, container_ref: bytes, limit: int = 100,
+                              cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Get all member tokens belonging to a container, with cursor-based pagination."""
+        results = []
+        prefix = GlyphDBKeys.CONTAINER_MEMBERS + container_ref
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            member_ref = key[len(prefix):]
+            if len(member_ref) != 36:
+                continue
+            token = self.get_token(member_ref)
+            if token:
+                results.append(self._token_to_dict(token))
+
+        txid, vout = unpack_ref(container_ref)
+        return {
+            'container_ref': hash_to_hex_str(txid) + '_' + str(vout),
+            'tokens': results,
+            'next_cursor': next_cursor,
+        }
+
+    def has_container_members(self, container_ref: bytes) -> bool:
+        """Return True if any GCM entries exist for this container ref."""
+        prefix = GlyphDBKeys.CONTAINER_MEMBERS + container_ref
+        for _ in self.db.utxo_db.iterator(prefix=prefix):
+            return True
+        return False
+
+    def has_meta_type(self, meta_type: str, ref: bytes) -> bool:
+        """Return True if ref is indexed under the given metadata type."""
+        type_hash = sha256(meta_type.strip().lower().encode('utf-8'))[:16]
+        key = GlyphDBKeys.BY_META_TYPE + type_hash + ref
+        return self.db.utxo_db.get(key) is not None
+
+    def get_all_containers(self, limit: int = 100,
+                           cursor: Optional[str] = None) -> Dict[str, Any]:
+        """List containers that actually hold members, by scanning the GCM index.
+
+        This is deliberately narrower than ``get_tokens_by_type(CONTAINER)``.  A token carrying
+        GLYPH_CONTAINER (7) — or recovered by ``meta_indicates_container`` — is classified
+        CONTAINER and is discoverable through BY_TYPE whether or not anything is inside it.  This
+        scan instead walks GCM keys (GCM + container_ref + member_ref) and returns the unique
+        container_refs, so it yields only non-empty containers, in membership-index order.
+
+        Use BY_TYPE to enumerate every container; use this to enumerate the populated ones.
+        """
+        prefix = GlyphDBKeys.CONTAINER_MEMBERS
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+        results = []
+        last_container_ref = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(key) < len(prefix) + 36:
+                continue
+            container_ref = key[len(prefix):len(prefix) + 36]
+            if container_ref == last_container_ref:
+                continue  # additional member of same container — skip
+            # New container encountered
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            last_container_ref = container_ref
+            token = self.get_token(container_ref)
+            if token:
+                results.append(self._token_to_dict(token))
+
+        return {'tokens': results, 'next_cursor': next_cursor}
+
+    def get_tokens_by_meta_type(self, meta_type: str, limit: int = 100,
+                                cursor: Optional[str] = None) -> Dict[str, Any]:
+        """List tokens whose metadata carries a specific 'type' string (e.g. 'user').
+
+        Scans the GMT index (GMT + sha256(type_lower)[:16] + ref).
+        """
+        type_hash = sha256(meta_type.strip().lower().encode('utf-8'))[:16]
+        prefix = GlyphDBKeys.BY_META_TYPE + type_hash
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+        results = []
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            ref = key[len(prefix):]
+            if len(ref) != 36:
+                continue
+            token = self.get_token(ref)
+            if token:
+                results.append(self._token_to_dict(token))
+
+        return {'tokens': results, 'next_cursor': next_cursor}
 
     def get_metadata(self, metadata_hash: bytes) -> Optional[Dict]:
         """Get parsed metadata by hash."""

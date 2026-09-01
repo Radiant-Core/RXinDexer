@@ -864,7 +864,7 @@ def get_glyph_stats():
 
 @app.get("/glyphs/by-type/{type_id}", tags=["Glyphs"])
 async def get_glyphs_by_type(
-    type_id: int = Path(..., ge=0, le=7, description="Token type ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, 5=WAVE, 6=Container, 7=Authority)"),
+    type_id: int = Path(..., ge=0, le=7, description="Token type ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, 5=WAVE, 7=Authority). Note: use GET /containers for container tokens and GET /users for user-profile tokens."),
     limit: int = Query(default=100, le=500),
     cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
     order: str = Query(default="ref", pattern="^(ref|recent)$", description="'ref' (legacy hash order) or 'recent' (newest-deployed first). Cursors are order-specific."),
@@ -920,6 +920,73 @@ async def list_encrypted_tokens(
             limit=limit, cursor=cursor, timelocked_only=timelocked_only
         )
         return {**result, "timelocked_only": timelocked_only}
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/containers", tags=["Containers"])
+async def list_containers(
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+):
+    """List all container tokens."""
+    _ensure_glyph_index()
+
+    try:
+        return _glyph_index.get_tokens_by_meta_type('container', limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/containers/{ref}/members", tags=["Containers"])
+async def get_container_members(
+    ref: str = _REF_PATH,
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+):
+    """Get all member tokens belonging to a container."""
+    _ensure_glyph_index()
+
+    try:
+        ref_bytes = _resolve_ref(ref)
+        return _glyph_index.get_container_members(ref_bytes, limit=limit, cursor=cursor)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/containers/{ref}", tags=["Containers"])
+async def get_container(ref: str = _REF_PATH):
+    """Get a container token by reference."""
+    _ensure_glyph_index()
+
+    try:
+        ref_bytes = _resolve_ref(ref)
+        token = _glyph_index.get_token(ref_bytes)
+        if not token:
+            raise HTTPException(status_code=404, detail="Token not found")
+        if not _glyph_index.has_meta_type('container', ref_bytes):
+            raise HTTPException(status_code=404, detail="Token is not a container")
+        return _glyph_index._token_to_dict(token)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/users", tags=["Users"])
+async def list_users(
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+):
+    """List all user-profile tokens (metadata type == 'user')."""
+    _ensure_glyph_index()
+
+    try:
+        return _glyph_index.get_tokens_by_meta_type('user', limit=limit, cursor=cursor)
     except Exception as e:
         raise _internal_error(e)
 

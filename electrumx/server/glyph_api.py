@@ -590,6 +590,73 @@ class GlyphAPIMixin:
             )
         return self.glyph_index.get_recent_tokens(limit=limit, cursor=cursor)
 
+    async def glyph_get_container_members(self, container_ref: str, limit: int = 100,
+                                           cursor: str = None):
+        """
+        Get all member tokens belonging to a container.
+
+        Args:
+            container_ref: Container token ref in format "txid_vout" or 72-hex
+            limit: Maximum results (capped at 500)
+            cursor: Opaque pagination cursor from previous response next_cursor
+
+        Returns:
+            Dict with container_ref, tokens list, and next_cursor
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        try:
+            from electrumx.server.glyph_index import parse_ref_any
+            ref_bytes = parse_ref_any(container_ref)
+            return self.glyph_index.get_container_members(
+                ref_bytes, limit=min(limit, 500), cursor=cursor
+            )
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def glyph_list_containers(self, limit: int = 100, cursor: str = None):
+        """
+        List all container tokens.
+
+        Args:
+            limit: Maximum results (capped at 500)
+            cursor: Opaque pagination cursor from previous response next_cursor
+
+        Returns:
+            Dict with tokens list and next_cursor
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        return self.glyph_index.get_tokens_by_meta_type(
+            'container', limit=min(limit, 500), cursor=cursor
+        )
+
+    async def glyph_list_users(self, limit: int = 100, cursor: str = None):
+        """
+        List all user-profile tokens (metadata type == 'user').
+
+        Args:
+            limit: Maximum results (capped at 500)
+            cursor: Opaque pagination cursor from previous response next_cursor
+
+        Returns:
+            Dict with tokens list and next_cursor
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        return self.glyph_index.get_tokens_by_meta_type(
+            'user', limit=min(limit, 500), cursor=cursor
+        )
+
     async def glyph_get_metadata(self, ref: str):
         """
         Get full CBOR metadata for a token.
@@ -1749,6 +1816,11 @@ GLYPH_METHODS = {
     'glyph.get_tokens_by_type': 'glyph_get_tokens_by_type',
     'glyph.get_recent': 'glyph_get_recent',
     'glyph.get_metadata': 'glyph_get_metadata',
+    # Container support
+    'glyph.get_container_members': 'glyph_get_container_members',
+    'glyph.list_containers': 'glyph_list_containers',
+    # User profiles
+    'glyph.list_users': 'glyph_list_users',
     # dMint contracts (for Glyph Miner)
     'dmint.get_contracts': 'dmint_get_contracts',
     'dmint.get_contract': 'dmint_get_contract',
