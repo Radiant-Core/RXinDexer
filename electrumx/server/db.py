@@ -225,7 +225,7 @@ class DB(object):
         self.history.assert_flushed()
 
     def flush_dbs(self, flush_data, flush_utxos, estimate_txs_remaining,
-                  glyph_index=None, wave_index=None, realm_index=None, swap_index=None, predict_index=None, royalty_index=None, analytics_index=None, dmint_contracts=None):
+                  glyph_index=None, wave_index=None, realm_index=None, swap_index=None, predict_index=None, royalty_index=None, hashmark_index=None, analytics_index=None, dmint_contracts=None):
         '''Flush out cached state.  History is always flushed; UTXOs are
         flushed if flush_utxos. Glyph/WAVE/Swap indexes are flushed if provided.
         dMint contracts manager syncs from Glyph index if provided.'''
@@ -263,6 +263,8 @@ class DB(object):
                 predict_index.flush(batch)
             if royalty_index:
                 royalty_index.flush(batch)
+            if hashmark_index:
+                hashmark_index.flush(batch)
             if analytics_index:
                 analytics_index.flush(batch)
             self.flush_state(batch)
@@ -412,7 +414,7 @@ class DB(object):
         self.last_flush_tx_count = self.fs_tx_count
         self.write_utxo_state(batch)
 
-    def flush_backup(self, flush_data, touched, *, glyph_index=None, wave_index=None, realm_index=None, swap_index=None, predict_index=None, royalty_index=None, analytics_index=None, dmint_contracts=None):
+    def flush_backup(self, flush_data, touched, *, glyph_index=None, wave_index=None, realm_index=None, swap_index=None, predict_index=None, royalty_index=None, hashmark_index=None, analytics_index=None, dmint_contracts=None):
         '''Like flush_dbs() but when backing up.  All UTXOs are flushed.
         dMint contracts re-sync from Glyph index after reorg.'''
         assert not flush_data.headers
@@ -442,6 +444,8 @@ class DB(object):
                 predict_index.backup(batch, reorg_height)
             if royalty_index is not None:
                 royalty_index.backup(batch, reorg_height)
+            if hashmark_index is not None:
+                hashmark_index.backup(batch, reorg_height)
             if analytics_index is not None:
                 analytics_index.backup(batch, reorg_height)
             self.flush_utxo_db(batch, flush_data)

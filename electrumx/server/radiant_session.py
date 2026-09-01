@@ -66,6 +66,13 @@ class RadiantElectrumX(GlyphAPIMixin, ElectrumX):
         return None
 
     @property
+    def hashmark_index(self):
+        """Access the HashMark digest index from block processor."""
+        if hasattr(self, 'session_mgr') and hasattr(self.session_mgr, 'bp'):
+            return getattr(self.session_mgr.bp, 'hashmark_index', None)
+        return None
+
+    @property
     def realm_index(self):
         """Access the realm (realm_v1) directory index from block processor."""
         if hasattr(self, 'session_mgr') and hasattr(self.session_mgr, 'bp'):

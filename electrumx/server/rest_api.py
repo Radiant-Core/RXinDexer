@@ -62,6 +62,12 @@ from electrumx.lib.glyph import (
 )
 from electrumx.lib.hash import hash_to_hex_str
 from electrumx.server import metrics as _metrics
+from electrumx.server.hashmark_index import (
+    DEFAULT_LIMIT as HASHMARK_DEFAULT_LIMIT,
+    MAX_LIMIT as HASHMARK_MAX_LIMIT,
+    parse_digest_arg as parse_hashmark_digest,
+    resolve_algorithm as resolve_hashmark_algorithm,
+)
 from electrumx.server.rate_limiter import (
     DEFAULT_TRUSTED_PROXIES as _DEFAULT_TRUSTED_PROXIES,
     IPRateLimiter as _IPRateLimiter,
@@ -433,6 +439,9 @@ async def _security_middleware(request: Request, call_next):
         '/wave', '/wave/',
         '/swap', '/swap/', '/swaps', '/swaps/',
         '/royalties', '/royalties/',
+        '/hashmark', '/hashmark/',
+        '/containers', '/containers/', '/container', '/container/',
+        '/users', '/users/',
         '/mempool', '/mempool/',
         '/addresses', '/addresses/',
         '/docs', '/openapi',
@@ -471,6 +480,7 @@ _glyph_index = None
 _wave_index = None
 _swap_index = None
 _royalty_index = None
+_hashmark_index = None
 _analytics_index = None
 _dmint_contracts = None
 _mempool = None
@@ -480,16 +490,17 @@ _start_time = time.time()
 
 
 def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
-                royalty_index=None, analytics_index=None, dmint_contracts=None,
-                mempool=None):
+                royalty_index=None, hashmark_index=None, analytics_index=None,
+                dmint_contracts=None, mempool=None):
     """Set the indexer references from the main server."""
-    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _analytics_index, _dmint_contracts, _mempool
+    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _hashmark_index, _analytics_index, _dmint_contracts, _mempool
     _glyph_index = glyph_index
     _db = db
     _daemon = daemon
     _wave_index = wave_index
     _swap_index = swap_index
     _royalty_index = royalty_index
+    _hashmark_index = hashmark_index
     _analytics_index = analytics_index
     _dmint_contracts = dmint_contracts
     _mempool = mempool
@@ -2116,6 +2127,60 @@ async def get_royalty_stats():
         }
     except Exception as e:
         raise _internal_error(e)
+
+
+# =============================================================================
+# HASHMARK (Digest Lookup)
+# =============================================================================
+
+def _ensure_hashmark():
+    if not _hashmark_index:
+        raise HTTPException(status_code=503, detail="HashMark index not available")
+
+
+# Declared before /hashmark/{digest} so "stats" is routed here rather than parsed as a digest.
+@app.get("/hashmark/stats", tags=["HashMark"])
+async def get_hashmark_stats():
+    """HashMark index status, including historic-backfill progress.
+
+    `backfill_complete` tells a client whether an empty lookup means "never marked" or
+    "not scanned back that far yet"."""
+    _ensure_hashmark()
+    try:
+        return _hashmark_index.stats()
+    except Exception as e:
+        raise _internal_error(e, "hashmark_stats")
+
+
+@app.get("/hashmark/{digest}", tags=["HashMark"])
+async def hashmark_lookup(
+    digest: str = Path(..., min_length=16, max_length=128,
+                       description="Full lowercase hex digest (sha256 -> 64 chars)"),
+    algorithm: str = Query(default="sha256", description="Algorithm name ('sha256') or id ('1')"),
+    limit: int = Query(default=HASHMARK_DEFAULT_LIMIT, ge=1, le=HASHMARK_MAX_LIMIT),
+):
+    """Confirmed HashMark records for one digest, oldest first.
+
+    Returns `[]` when the digest was never marked — a normal answer, not a 404.  A hit is a search
+    hint: the caller is expected to re-fetch the transaction and re-decode the output itself.
+    """
+    _ensure_hashmark()
+
+    alg_id = resolve_hashmark_algorithm(algorithm)
+    if alg_id is None:
+        raise HTTPException(status_code=400, detail=f"Unknown algorithm: {algorithm}")
+    digest_bytes = parse_hashmark_digest(digest, alg_id)
+    if digest_bytes is None:
+        # Strict full-length match only: prefix search would let a caller enumerate the index.
+        raise HTTPException(
+            status_code=400,
+            detail="digest must be the full lowercase hex digest for this algorithm",
+        )
+
+    try:
+        return _hashmark_index.lookup(digest_bytes, alg_id, limit)
+    except Exception as e:
+        raise _internal_error(e, "hashmark_lookup")
 
 
 # =============================================================================
