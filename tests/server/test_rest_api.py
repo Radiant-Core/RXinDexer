@@ -117,7 +117,10 @@ def mock_dmint_contracts():
 def mock_db():
     db = Mock()
     db.db_height = 100000
-    db.db_engine = 'rocksdb'
+    # On the real DB this lives on env (see db.py, `self.env.db_engine`); the
+    # mock previously set it directly, which is why /health/db reporting
+    # 'unknown' went unnoticed.
+    db.env.db_engine = 'rocksdb'
     return db
 
 
@@ -928,6 +931,60 @@ class TestProxyTrustedPeerGate:
         # The bucket was created under the attacker's real peer, NOT the victim.
         assert '198.51.100.99' in rest_api._rate_buckets
         assert '203.0.113.7' not in rest_api._rate_buckets
+
+    def test_exempt_allowlist_defaults_to_empty(self, monkeypatch):
+        """No REST_RATE_LIMIT_EXEMPT => everyone is limited, as before."""
+        from electrumx.server import rest_api
+        monkeypatch.setattr(rest_api, '_RATE_LIMIT_EXEMPT', [])
+        monkeypatch.setattr(rest_api, '_rate_buckets', {})
+        monkeypatch.setenv('REST_RATE_LIMIT_PER_MIN', '600')
+
+        rest_api._rate_limit(self._make_request({}, client_host='10.1.2.3'))
+        assert '10.1.2.3' in rest_api._rate_buckets
+
+    def test_exempt_internal_ip_creates_no_bucket(self, monkeypatch):
+        """An allowlisted caller returns early: not throttled, and no bucket
+        retained (so internal polling cannot grow _rate_buckets)."""
+        from electrumx.server import rest_api
+        monkeypatch.setattr(rest_api, '_RATE_LIMIT_EXEMPT',
+                            rest_api._parse_rate_exempt('private'))
+        monkeypatch.setattr(rest_api, '_rate_buckets', {})
+        monkeypatch.setenv('REST_RATE_LIMIT_PER_MIN', '600')
+
+        for host in ('10.1.2.3', '192.168.0.5', '127.0.0.1', '172.20.0.9'):
+            rest_api._rate_limit(self._make_request({}, client_host=host))
+        assert rest_api._rate_buckets == {}
+
+        # A public caller is still limited and still gets a bucket.
+        rest_api._rate_limit(self._make_request({}, client_host='203.0.113.7'))
+        assert '203.0.113.7' in rest_api._rate_buckets
+
+    def test_exempt_matches_resolved_client_not_proxy_peer(self, monkeypatch):
+        """Behind a trusted proxy the socket peer is the proxy (private), so
+        exemption must key on the RESOLVED client — otherwise every caller
+        through the proxy would be exempt."""
+        from electrumx.server import rest_api
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY', True)
+        monkeypatch.setattr(rest_api, '_TRUST_PROXY_HOPS', 1)
+        monkeypatch.setattr(
+            rest_api, '_TRUSTED_PROXIES',
+            _IPRateLimiter._parse_networks('172.18.0.0/16'),
+        )
+        monkeypatch.setattr(rest_api, '_RATE_LIMIT_EXEMPT',
+                            rest_api._parse_rate_exempt('private'))
+        monkeypatch.setattr(rest_api, '_rate_buckets', {})
+        monkeypatch.setenv('REST_RATE_LIMIT_PER_MIN', '600')
+
+        # Public client arriving via the private-IP proxy: still limited.
+        rest_api._rate_limit(self._make_request(
+            {'x-forwarded-for': '203.0.113.7'}, client_host='172.18.0.2'))
+        assert '203.0.113.7' in rest_api._rate_buckets
+
+    def test_exempt_ignores_unparseable_tokens(self, monkeypatch):
+        from electrumx.server import rest_api
+        nets = rest_api._parse_rate_exempt('garbage,,10.0.0.0/8')
+        assert rest_api._peer_in_networks('10.1.2.3', nets)
+        assert not rest_api._peer_in_networks('203.0.113.7', nets)
 
 
 # ===========================================================================

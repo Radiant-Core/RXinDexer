@@ -332,6 +332,42 @@ _TRUSTED_PROXIES = _IPRateLimiter._parse_networks(
     os.getenv('TRUSTED_PROXIES', '').strip() or _DEFAULT_TRUSTED_PROXIES
 )
 
+# Rate-limit exemption allowlist. Comma-separated CIDRs/IPs, or the shorthand
+# token `private` for loopback + RFC1918 + link-local + IPv6 ULA/loopback —
+# i.e. "don't throttle callers on my own network".
+#
+# Default empty => every caller is limited, preserving current behaviour.
+#
+# Matched against the RESOLVED client IP (see _get_client_ip), not the raw
+# socket peer, so that behind a reverse proxy the real client is what counts —
+# exempting on the socket peer would exempt EVERY caller, since the peer is then
+# always the proxy. The corollary is that with TRUST_PROXY=1 this inherits the
+# forwarded chain's trust model: the proxy MUST overwrite (not append to) an
+# inbound X-Forwarded-For, or a remote caller could claim an internal IP and
+# exempt itself. With TRUST_PROXY=0 the resolved IP is the socket peer and
+# cannot be spoofed.
+_PRIVATE_NETWORK_SPEC = ('127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,'
+                         '169.254.0.0/16,::1/128,fc00::/7,fe80::/10')
+
+
+def _parse_rate_exempt(spec: str):
+    """Parse REST_RATE_LIMIT_EXEMPT, expanding the `private` shorthand."""
+    if not spec:
+        return []
+    tokens = []
+    for tok in spec.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.lower() == 'private':
+            tokens.append(_PRIVATE_NETWORK_SPEC)
+        else:
+            tokens.append(tok)
+    return _IPRateLimiter._parse_networks(','.join(tokens))
+
+
+_RATE_LIMIT_EXEMPT = _parse_rate_exempt(os.getenv('REST_RATE_LIMIT_EXEMPT', '').strip())
+
 
 def _get_client_ip(request: Request) -> str:
     """R8 + XFF-spoof hardening: resolve the real client IP, honouring
@@ -367,6 +403,12 @@ def _rate_limit(request: Request):
         return
 
     client_host = _get_client_ip(request)  # R8
+
+    # Exempt allowlisted callers before any bucket is created, so internal
+    # traffic neither throttles nor occupies memory in _rate_buckets.
+    if _RATE_LIMIT_EXEMPT and _peer_in_networks(client_host, _RATE_LIMIT_EXEMPT):
+        return
+
     now = time.time()
 
     # Purge stale buckets: every 1000 requests OR every 60 seconds (R17)
@@ -573,7 +615,7 @@ async def health_db():
         return {
             "status": "connected",
             "height": height,
-            "db_engine": getattr(_db, 'db_engine', 'unknown'),
+            "db_engine": getattr(getattr(_db, 'env', None), 'db_engine', 'unknown'),
         }
     except Exception as e:
         _logger.error("health/db DB error: %s", e, exc_info=True)
@@ -590,7 +632,7 @@ async def get_status():
 
     if _db:
         status["sync_height"] = _db.db_height
-        status["db_engine"] = getattr(_db, 'db_engine', 'unknown')
+        status["db_engine"] = getattr(getattr(_db, 'env', None), 'db_engine', 'unknown')
 
     if _glyph_index:
         status["glyph_indexing"] = True
