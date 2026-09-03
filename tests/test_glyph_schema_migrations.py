@@ -221,12 +221,22 @@ def test_page_walk_resumes_strictly_after_the_last_key():
 
 
 def test_migration_chain_is_registered_for_every_step():
-    # A gap here is what produced "version 4 < 6 has no in-place migration" on deploy.
+    """Every version from 3 up to CURRENT must have an in-place migrator.
+
+    A gap here is what produced "version 4 < 6 has no in-place migration" on deploy. Derived from
+    CURRENT_SCHEMA_VERSION rather than hard-coded, so bumping the schema without adding a migrator
+    fails this test instead of silently shipping a hard-fail to production.
+    """
+    from electrumx.server.glyph_index import CURRENT_SCHEMA_VERSION
+
     src = open(os.path.join(os.path.dirname(__file__), '..', 'electrumx', 'server',
                             'glyph_index.py'), encoding='utf-8').read()
-    for step in ('3: self._migrate_3_to_4', '4: self._migrate_4_to_5', '5: self._migrate_5_to_6'):
-        assert step in src, f'missing migration step: {step}'
-    assert 'CURRENT_SCHEMA_VERSION = 6' in src
+    for v in range(3, CURRENT_SCHEMA_VERSION):
+        step = f'{v}: self._migrate_{v}_to_{v + 1}'
+        assert step in src, (
+            f'schema v{v} -> v{v + 1} has no registered in-place migrator; '
+            f'a node at v{v} would refuse to start')
+        assert f'def _migrate_{v}_to_{v + 1}' in src, f'missing _migrate_{v}_to_{v + 1} definition'
 
 
 if __name__ == '__main__':

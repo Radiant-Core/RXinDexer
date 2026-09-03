@@ -482,6 +482,8 @@ async def _security_middleware(request: Request, call_next):
         '/swap', '/swap/', '/swaps', '/swaps/',
         '/royalties', '/royalties/',
         '/hashmark', '/hashmark/',
+        '/creators', '/creators/',
+        '/media', '/media/',
         '/containers', '/containers/', '/container', '/container/',
         '/users', '/users/',
         '/mempool', '/mempool/',
@@ -879,18 +881,125 @@ async def search_glyphs(
     q: str = Query(..., min_length=1, max_length=100, description="Search query (name or ticker)"),
     protocols: Optional[str] = Query(default=None, max_length=256, description="Comma-separated protocol IDs to filter"),
     limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0, description="Wildcard mode only: skip this many matches"),
+    wildcard: bool = Query(default=False, description="Force wildcard mode: treat q as *q* (substring)"),
 ):
-    """Search tokens by name or ticker."""
+    """Search tokens by name or ticker.
+
+    Exact by default. A `q` containing `*`, `?` or `[abc]` switches to wildcard mode, which matches
+    against **both** name and ticker, case-insensitively; `wildcard=true` forces that mode for
+    plain text (treating `q` as `*q*`). Pass `offset` to page wildcard results.
+
+    Exact search is an indexed lookup. Wildcard search is a bounded full scan — BY_NAME stores
+    `sha256(name)` and so cannot be seeked by prefix — and its response includes `scanned` and
+    `truncated` so you can tell a complete answer from a capped one.
+    """
     _ensure_glyph_index()
 
     try:
         protocol_list = None
         if protocols:
             protocol_list = [int(p.strip()) for p in protocols.split(',') if p.strip()]
+
+        if wildcard or any(ch in q for ch in '*?['):
+            result = _glyph_index.search_tokens_wildcard(
+                q, protocols=protocol_list, limit=limit, offset=offset,
+            )
+            return {"query": q, "mode": "wildcard", **result}
+
         result = _glyph_index.search_tokens(q, protocols=protocol_list, limit=limit)
-        return {"query": q, "results": result, "count": len(result)}
+        return {"query": q, "mode": "exact", "results": result, "count": len(result)}
     except Exception as e:
         raise _internal_error(e)
+
+
+_MEDIA_HASH_PATH = Path(..., min_length=64, max_length=64,
+                        description="Lowercase hex sha256 of the media bytes")
+
+
+@app.get("/media/{sha256}/glyphs", tags=["Ownership"])
+async def get_glyphs_by_media(
+    sha256: str = _MEDIA_HASH_PATH,
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Tokens whose media is byte-identical to this sha256.
+
+    Covers embedded media (sha256 of the raw bytes) and remote media (the committed `h`) in one
+    keyspace, so the same artwork is found however each token carries it. Rows are not
+    height-ordered — duplicate sets are small and each row carries `deploy_height`, so sort
+    client-side to badge the first mint.
+
+    A token detail response carries `media_sha256` and `media_duplicates`; use
+    `media_duplicates > 1` as the trigger to call this, rather than probing it per page view.
+    """
+    _ensure_glyph_index()
+
+    try:
+        media_hash = bytes.fromhex(sha256)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="media hash must be 64 lowercase hex chars")
+    if sha256 != sha256.lower() or len(media_hash) != 32:
+        raise HTTPException(status_code=400, detail="media hash must be 64 lowercase hex chars")
+
+    try:
+        return _glyph_index.get_tokens_by_media_hash(media_hash, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e, "get_glyphs_by_media")
+
+
+@app.get("/media/payload/{sha256}/glyphs", tags=["Ownership"])
+async def get_glyphs_by_payload(
+    sha256: str = _MEDIA_HASH_PATH,
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Tokens whose ENTIRE CBOR payload is byte-identical — a whole-record clone, not just
+    matching media.
+
+    No route-ordering hazard against /media/{sha256}/glyphs despite the shared prefix: that route
+    has one path segment where this has two, so they can never match the same URL.
+    """
+    _ensure_glyph_index()
+
+    try:
+        payload_hash = bytes.fromhex(sha256)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="payload hash must be 64 lowercase hex chars")
+    if len(payload_hash) != 32:
+        raise HTTPException(status_code=400, detail="payload hash must be 64 lowercase hex chars")
+
+    try:
+        return _glyph_index.get_tokens_by_payload_hash(payload_hash, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e, "get_glyphs_by_payload")
+
+
+@app.get("/creators/{ref}/works", tags=["Ownership"])
+async def get_creator_works(
+    ref: str = Path(..., min_length=1, max_length=128,
+                    description="Creator token ref: 72-hex or txid_vout"),
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Tokens attributed to a creator, from each token's metadata `by` field.
+
+    Attribution is **self-asserted**: `by` is written by whoever minted the token, and nothing
+    binds it to the referenced token's owner. Entries are claims of authorship, not proof — the
+    response repeats this as `attribution: "self-asserted"`.
+    """
+    _ensure_glyph_index()
+
+    try:
+        from electrumx.server.glyph_index import parse_ref_any
+        ref_bytes = parse_ref_any(ref)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid creator ref format")
+
+    try:
+        return _glyph_index.get_creator_works(ref_bytes, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e, "get_creator_works")
 
 
 @app.get("/glyphs/stats", tags=["Glyphs"])
@@ -1010,7 +1119,9 @@ async def get_container(ref: str = _REF_PATH):
             raise HTTPException(status_code=404, detail="Token not found")
         if not _glyph_index.has_meta_type('container', ref_bytes):
             raise HTTPException(status_code=404, detail="Token is not a container")
-        return _glyph_index._token_to_dict(token)
+        # Single-token detail: include the media-reuse extras (media_sha256 /
+        # media_duplicates), which cost a GMH prefix scan and so stay off for list pages.
+        return _glyph_index._token_to_dict(token, include_media_dupes=True)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except HTTPException:
@@ -1044,7 +1155,9 @@ async def get_glyph(ref: str = _REF_PATH):
         if not token:
             raise HTTPException(status_code=404, detail="Token not found")
 
-        return _glyph_index._token_to_dict(token)
+        # Single-token detail: include the media-reuse extras (media_sha256 /
+        # media_duplicates), which cost a GMH prefix scan and so stay off for list pages.
+        return _glyph_index._token_to_dict(token, include_media_dupes=True)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except HTTPException:

@@ -510,22 +510,40 @@ class GlyphAPIMixin:
 
     async def glyph_search_tokens(self, query: str, protocols: list = None,
                                    limit: int = 50,
-                                   cursor=_CURSOR_UNSET):
+                                   cursor=_CURSOR_UNSET,
+                                   wildcard: bool = False,
+                                   offset: int = 0):
         """
         Search tokens by name or ticker.
 
         Args:
-            query: Search query string
+            query: Search query. Exact by default. Contains ``*``/``?``/``[abc]`` -> wildcard
+                   search over BOTH name and ticker. Case-insensitive either way.
             protocols: Optional list of protocol IDs to filter
             limit: Maximum results
             cursor: Opaque pagination cursor (see docs/pagination-cursors.md).
                     When supplied, response shape is
-                    ``{entries, next_cursor, has_more}``.
+                    ``{entries, next_cursor, has_more}``. Not used by wildcard search,
+                    which pages with ``offset`` because its results are sorted
+                    alphabetically rather than by seek key.
+            wildcard: Force wildcard mode for plain text, treating ``query`` as
+                      ``*query*`` (substring). Ignored when query already has a metacharacter.
+            offset: Wildcard mode only: skip this many matches.
+
+        Exact search is an indexed hash lookup; wildcard search is a bounded full scan, because
+        BY_NAME stores sha256(name) and cannot be seeked by prefix. Wildcard responses carry
+        ``scanned``/``truncated`` so a caller can tell a complete answer from a capped one.
         """
         self.bump_cost(3.0)
 
         if not hasattr(self, 'glyph_index') or not self.glyph_index:
             return {'error': 'Glyph indexing not enabled'}
+
+        if wildcard or any(ch in (query or '') for ch in '*?['):
+            self.bump_cost(12.0)        # full scan, not a seek
+            return self.glyph_index.search_tokens_wildcard(
+                query, protocols=protocols, limit=limit, offset=offset,
+            )
 
         if cursor is _CURSOR_UNSET:
             return self.glyph_index.search_tokens(
@@ -656,6 +674,37 @@ class GlyphAPIMixin:
         return self.glyph_index.get_tokens_by_meta_type(
             'user', limit=min(limit, 500), cursor=cursor
         )
+
+    async def glyph_get_creator_works(self, creator_ref: str, limit: int = 100,
+                                      cursor: str = None):
+        """
+        Get all tokens attributed to a creator (metadata ``by`` field).
+
+        Args:
+            creator_ref: Creator token ref, "txid_vout" or 72-hex
+            limit: Maximum results (capped at 500)
+            cursor: Opaque pagination cursor from previous response next_cursor
+
+        Returns:
+            Dict with creator_ref, tokens list, and next_cursor.
+
+        Attribution is SELF-ASSERTED by whoever minted each token; nothing binds ``by`` to the
+        referenced token's owner. Entries are claims of authorship, not proof of it — the response
+        carries ``attribution: "self-asserted"`` as a standing reminder.
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        try:
+            from electrumx.server.glyph_index import parse_ref_any
+            ref_bytes = parse_ref_any(creator_ref)
+            return self.glyph_index.get_creator_works(
+                ref_bytes, limit=min(limit, 500), cursor=cursor
+            )
+        except Exception as e:
+            return {'error': str(e)}
 
     async def glyph_get_metadata(self, ref: str):
         """
@@ -1819,6 +1868,7 @@ GLYPH_METHODS = {
     # Container support
     'glyph.get_container_members': 'glyph_get_container_members',
     'glyph.list_containers': 'glyph_list_containers',
+    'glyph.get_creator_works': 'glyph_get_creator_works',
     # User profiles
     'glyph.list_users': 'glyph_list_users',
     # dMint contracts (for Glyph Miner)
