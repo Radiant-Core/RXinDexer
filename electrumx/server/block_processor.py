@@ -83,6 +83,14 @@ except ImportError:
     HAS_ROYALTY_INDEX = False
     RoyaltyIndex = None
 
+# Import DeclarationIndex for Canon declaration documents (scriptSig scanner)
+try:
+    from electrumx.server.declaration_index import DeclarationIndex
+    HAS_DECLARATION_INDEX = True
+except ImportError:
+    HAS_DECLARATION_INDEX = False
+    DeclarationIndex = None
+
 # Import HashMarkIndex for HashMark digest lookups
 try:
     from electrumx.server.hashmark_index import HashMarkIndex
@@ -332,6 +340,10 @@ class BlockProcessor:
         if HAS_HASHMARK_INDEX and getattr(env, 'hashmark_index', False):
             self.hashmark_index = HashMarkIndex(db, env)
             self.logger.info('HashMark digest indexing initialized')
+        self.declaration_index = None
+        if HAS_DECLARATION_INDEX and getattr(env, 'declaration_index', False):
+            self.declaration_index = DeclarationIndex(db, env)
+            self.logger.info('Canon declaration indexing initialized')
         self.analytics_index = None
         if HAS_ANALYTICS_INDEX and getattr(env, 'analytics_index', True):
             self.analytics_index = AnalyticsIndex(db, env)
@@ -404,6 +416,7 @@ class BlockProcessor:
                 predict_index=self.predict_index,
                 royalty_index=self.royalty_index,
                 hashmark_index=self.hashmark_index,
+                declaration_index=self.declaration_index,
                 analytics_index=self.analytics_index,
                 dmint_contracts=self.dmint_contracts,
             )
@@ -492,6 +505,7 @@ class BlockProcessor:
                          predict_index=self.predict_index,
                          royalty_index=self.royalty_index,
                          hashmark_index=self.hashmark_index,
+                         declaration_index=self.declaration_index,
                          analytics_index=self.analytics_index,
                          dmint_contracts=self.dmint_contracts)
         # Invalidate cached balances for any addresses touched by this flush.
@@ -547,6 +561,8 @@ class BlockProcessor:
             index_cache_size += self.royalty_index.memory_estimate()
         if self.hashmark_index is not None:
             index_cache_size += self.hashmark_index.memory_estimate()
+        if self.declaration_index is not None:
+            index_cache_size += self.declaration_index.memory_estimate()
         if self.analytics_index is not None:
             index_cache_size += self.analytics_index.memory_estimate()
         utxo_MB = (db_deletes_size + utxo_cache_size) // one_MB
@@ -874,6 +890,20 @@ class BlockProcessor:
             # HashMark digest records.  Deliberately outside the glyph_index guard below: a
             # HashMark is a plain data output with no Glyph envelope, so it must still be indexed
             # on a node running with GLYPH_INDEX=0.
+            # Canon declarations live in INPUT scripts, so this scanner is fed the same tx but
+            # reads txin.script rather than the outputs.
+            if self.declaration_index:
+                try:
+                    self.declaration_index.process_tx(
+                        tx_hash, tx, self.height + 1, tx_num - self.tx_count)
+                except MemoryError:
+                    raise
+                except Exception:
+                    self.logger.exception(
+                        'declaration_index.process_tx failed for tx %s at height %d; skipping',
+                        hash_to_hex_str(tx_hash), self.height + 1
+                    )
+
             if self.hashmark_index:
                 try:
                     self.hashmark_index.process_tx(tx_hash, tx, self.height + 1, self._block_hash)
@@ -1390,6 +1420,9 @@ class BlockProcessor:
                     await group.spawn(self.analytics_index.backfill(self.height, caught_up_event))
                 if self.hashmark_index and self.height >= 0:
                     await group.spawn(self.hashmark_index.backfill(
+                        self.height, self.daemon, caught_up_event))
+                if self.declaration_index and self.height >= 0:
+                    await group.spawn(self.declaration_index.backfill(
                         self.height, self.daemon, caught_up_event))
 
                 async for task in group:
