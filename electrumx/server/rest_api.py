@@ -62,6 +62,12 @@ from electrumx.lib.glyph import (
 )
 from electrumx.lib.hash import hash_to_hex_str
 from electrumx.server import metrics as _metrics
+from electrumx.server.hashmark_index import (
+    DEFAULT_LIMIT as HASHMARK_DEFAULT_LIMIT,
+    MAX_LIMIT as HASHMARK_MAX_LIMIT,
+    parse_digest_arg as parse_hashmark_digest,
+    resolve_algorithm as resolve_hashmark_algorithm,
+)
 from electrumx.server.rate_limiter import (
     DEFAULT_TRUSTED_PROXIES as _DEFAULT_TRUSTED_PROXIES,
     IPRateLimiter as _IPRateLimiter,
@@ -326,6 +332,42 @@ _TRUSTED_PROXIES = _IPRateLimiter._parse_networks(
     os.getenv('TRUSTED_PROXIES', '').strip() or _DEFAULT_TRUSTED_PROXIES
 )
 
+# Rate-limit exemption allowlist. Comma-separated CIDRs/IPs, or the shorthand
+# token `private` for loopback + RFC1918 + link-local + IPv6 ULA/loopback —
+# i.e. "don't throttle callers on my own network".
+#
+# Default empty => every caller is limited, preserving current behaviour.
+#
+# Matched against the RESOLVED client IP (see _get_client_ip), not the raw
+# socket peer, so that behind a reverse proxy the real client is what counts —
+# exempting on the socket peer would exempt EVERY caller, since the peer is then
+# always the proxy. The corollary is that with TRUST_PROXY=1 this inherits the
+# forwarded chain's trust model: the proxy MUST overwrite (not append to) an
+# inbound X-Forwarded-For, or a remote caller could claim an internal IP and
+# exempt itself. With TRUST_PROXY=0 the resolved IP is the socket peer and
+# cannot be spoofed.
+_PRIVATE_NETWORK_SPEC = ('127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,'
+                         '169.254.0.0/16,::1/128,fc00::/7,fe80::/10')
+
+
+def _parse_rate_exempt(spec: str):
+    """Parse REST_RATE_LIMIT_EXEMPT, expanding the `private` shorthand."""
+    if not spec:
+        return []
+    tokens = []
+    for tok in spec.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.lower() == 'private':
+            tokens.append(_PRIVATE_NETWORK_SPEC)
+        else:
+            tokens.append(tok)
+    return _IPRateLimiter._parse_networks(','.join(tokens))
+
+
+_RATE_LIMIT_EXEMPT = _parse_rate_exempt(os.getenv('REST_RATE_LIMIT_EXEMPT', '').strip())
+
 
 def _get_client_ip(request: Request) -> str:
     """R8 + XFF-spoof hardening: resolve the real client IP, honouring
@@ -361,6 +403,12 @@ def _rate_limit(request: Request):
         return
 
     client_host = _get_client_ip(request)  # R8
+
+    # Exempt allowlisted callers before any bucket is created, so internal
+    # traffic neither throttles nor occupies memory in _rate_buckets.
+    if _RATE_LIMIT_EXEMPT and _peer_in_networks(client_host, _RATE_LIMIT_EXEMPT):
+        return
+
     now = time.time()
 
     # Purge stale buckets: every 1000 requests OR every 60 seconds (R17)
@@ -433,6 +481,11 @@ async def _security_middleware(request: Request, call_next):
         '/wave', '/wave/',
         '/swap', '/swap/', '/swaps', '/swaps/',
         '/royalties', '/royalties/',
+        '/hashmark', '/hashmark/',
+        '/creators', '/creators/',
+        '/media', '/media/',
+        '/containers', '/containers/', '/container', '/container/',
+        '/users', '/users/',
         '/mempool', '/mempool/',
         '/addresses', '/addresses/',
         '/docs', '/openapi',
@@ -471,6 +524,7 @@ _glyph_index = None
 _wave_index = None
 _swap_index = None
 _royalty_index = None
+_hashmark_index = None
 _analytics_index = None
 _dmint_contracts = None
 _mempool = None
@@ -480,16 +534,17 @@ _start_time = time.time()
 
 
 def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
-                royalty_index=None, analytics_index=None, dmint_contracts=None,
-                mempool=None):
+                royalty_index=None, hashmark_index=None, analytics_index=None,
+                dmint_contracts=None, mempool=None):
     """Set the indexer references from the main server."""
-    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _analytics_index, _dmint_contracts, _mempool
+    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _hashmark_index, _analytics_index, _dmint_contracts, _mempool
     _glyph_index = glyph_index
     _db = db
     _daemon = daemon
     _wave_index = wave_index
     _swap_index = swap_index
     _royalty_index = royalty_index
+    _hashmark_index = hashmark_index
     _analytics_index = analytics_index
     _dmint_contracts = dmint_contracts
     _mempool = mempool
@@ -562,7 +617,7 @@ async def health_db():
         return {
             "status": "connected",
             "height": height,
-            "db_engine": getattr(_db, 'db_engine', 'unknown'),
+            "db_engine": getattr(getattr(_db, 'env', None), 'db_engine', 'unknown'),
         }
     except Exception as e:
         _logger.error("health/db DB error: %s", e, exc_info=True)
@@ -579,7 +634,7 @@ async def get_status():
 
     if _db:
         status["sync_height"] = _db.db_height
-        status["db_engine"] = getattr(_db, 'db_engine', 'unknown')
+        status["db_engine"] = getattr(getattr(_db, 'env', None), 'db_engine', 'unknown')
 
     if _glyph_index:
         status["glyph_indexing"] = True
@@ -826,18 +881,125 @@ async def search_glyphs(
     q: str = Query(..., min_length=1, max_length=100, description="Search query (name or ticker)"),
     protocols: Optional[str] = Query(default=None, max_length=256, description="Comma-separated protocol IDs to filter"),
     limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0, description="Wildcard mode only: skip this many matches"),
+    wildcard: bool = Query(default=False, description="Force wildcard mode: treat q as *q* (substring)"),
 ):
-    """Search tokens by name or ticker."""
+    """Search tokens by name or ticker.
+
+    Exact by default. A `q` containing `*`, `?` or `[abc]` switches to wildcard mode, which matches
+    against **both** name and ticker, case-insensitively; `wildcard=true` forces that mode for
+    plain text (treating `q` as `*q*`). Pass `offset` to page wildcard results.
+
+    Exact search is an indexed lookup. Wildcard search is a bounded full scan — BY_NAME stores
+    `sha256(name)` and so cannot be seeked by prefix — and its response includes `scanned` and
+    `truncated` so you can tell a complete answer from a capped one.
+    """
     _ensure_glyph_index()
 
     try:
         protocol_list = None
         if protocols:
             protocol_list = [int(p.strip()) for p in protocols.split(',') if p.strip()]
+
+        if wildcard or any(ch in q for ch in '*?['):
+            result = _glyph_index.search_tokens_wildcard(
+                q, protocols=protocol_list, limit=limit, offset=offset,
+            )
+            return {"query": q, "mode": "wildcard", **result}
+
         result = _glyph_index.search_tokens(q, protocols=protocol_list, limit=limit)
-        return {"query": q, "results": result, "count": len(result)}
+        return {"query": q, "mode": "exact", "results": result, "count": len(result)}
     except Exception as e:
         raise _internal_error(e)
+
+
+_MEDIA_HASH_PATH = Path(..., min_length=64, max_length=64,
+                        description="Lowercase hex sha256 of the media bytes")
+
+
+@app.get("/media/{sha256}/glyphs", tags=["Ownership"])
+async def get_glyphs_by_media(
+    sha256: str = _MEDIA_HASH_PATH,
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Tokens whose media is byte-identical to this sha256.
+
+    Covers embedded media (sha256 of the raw bytes) and remote media (the committed `h`) in one
+    keyspace, so the same artwork is found however each token carries it. Rows are not
+    height-ordered — duplicate sets are small and each row carries `deploy_height`, so sort
+    client-side to badge the first mint.
+
+    A token detail response carries `media_sha256` and `media_duplicates`; use
+    `media_duplicates > 1` as the trigger to call this, rather than probing it per page view.
+    """
+    _ensure_glyph_index()
+
+    try:
+        media_hash = bytes.fromhex(sha256)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="media hash must be 64 lowercase hex chars")
+    if sha256 != sha256.lower() or len(media_hash) != 32:
+        raise HTTPException(status_code=400, detail="media hash must be 64 lowercase hex chars")
+
+    try:
+        return _glyph_index.get_tokens_by_media_hash(media_hash, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e, "get_glyphs_by_media")
+
+
+@app.get("/media/payload/{sha256}/glyphs", tags=["Ownership"])
+async def get_glyphs_by_payload(
+    sha256: str = _MEDIA_HASH_PATH,
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Tokens whose ENTIRE CBOR payload is byte-identical — a whole-record clone, not just
+    matching media.
+
+    No route-ordering hazard against /media/{sha256}/glyphs despite the shared prefix: that route
+    has one path segment where this has two, so they can never match the same URL.
+    """
+    _ensure_glyph_index()
+
+    try:
+        payload_hash = bytes.fromhex(sha256)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="payload hash must be 64 lowercase hex chars")
+    if len(payload_hash) != 32:
+        raise HTTPException(status_code=400, detail="payload hash must be 64 lowercase hex chars")
+
+    try:
+        return _glyph_index.get_tokens_by_payload_hash(payload_hash, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e, "get_glyphs_by_payload")
+
+
+@app.get("/creators/{ref}/works", tags=["Ownership"])
+async def get_creator_works(
+    ref: str = Path(..., min_length=1, max_length=128,
+                    description="Creator token ref: 72-hex or txid_vout"),
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Tokens attributed to a creator, from each token's metadata `by` field.
+
+    Attribution is **self-asserted**: `by` is written by whoever minted the token, and nothing
+    binds it to the referenced token's owner. Entries are claims of authorship, not proof — the
+    response repeats this as `attribution: "self-asserted"`.
+    """
+    _ensure_glyph_index()
+
+    try:
+        from electrumx.server.glyph_index import parse_ref_any
+        ref_bytes = parse_ref_any(ref)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid creator ref format")
+
+    try:
+        return _glyph_index.get_creator_works(ref_bytes, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e, "get_creator_works")
 
 
 @app.get("/glyphs/stats", tags=["Glyphs"])
@@ -853,7 +1015,7 @@ def get_glyph_stats():
 
 @app.get("/glyphs/by-type/{type_id}", tags=["Glyphs"])
 async def get_glyphs_by_type(
-    type_id: int = Path(..., ge=0, le=7, description="Token type ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, 5=WAVE, 6=Container, 7=Authority)"),
+    type_id: int = Path(..., ge=0, le=7, description="Token type ID (1=FT, 2=NFT, 3=DAT, 4=DMINT, 5=WAVE, 7=Authority). Note: use GET /containers for container tokens and GET /users for user-profile tokens."),
     limit: int = Query(default=100, le=500),
     cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
     order: str = Query(default="ref", pattern="^(ref|recent)$", description="'ref' (legacy hash order) or 'recent' (newest-deployed first). Cursors are order-specific."),
@@ -913,6 +1075,75 @@ async def list_encrypted_tokens(
         raise _internal_error(e)
 
 
+@app.get("/containers", tags=["Containers"])
+async def list_containers(
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+):
+    """List all container tokens."""
+    _ensure_glyph_index()
+
+    try:
+        return _glyph_index.get_tokens_by_meta_type('container', limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/containers/{ref}/members", tags=["Containers"])
+async def get_container_members(
+    ref: str = _REF_PATH,
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+):
+    """Get all member tokens belonging to a container."""
+    _ensure_glyph_index()
+
+    try:
+        ref_bytes = _resolve_ref(ref)
+        return _glyph_index.get_container_members(ref_bytes, limit=limit, cursor=cursor)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/containers/{ref}", tags=["Containers"])
+async def get_container(ref: str = _REF_PATH):
+    """Get a container token by reference."""
+    _ensure_glyph_index()
+
+    try:
+        ref_bytes = _resolve_ref(ref)
+        token = _glyph_index.get_token(ref_bytes)
+        if not token:
+            raise HTTPException(status_code=404, detail="Token not found")
+        if not _glyph_index.has_meta_type('container', ref_bytes):
+            raise HTTPException(status_code=404, detail="Token is not a container")
+        # Single-token detail: include the media-reuse extras (media_sha256 /
+        # media_duplicates), which cost a GMH prefix scan and so stay off for list pages.
+        return _glyph_index._token_to_dict(token, include_media_dupes=True)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _internal_error(e)
+
+
+@app.get("/users", tags=["Users"])
+async def list_users(
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
+):
+    """List all user-profile tokens (metadata type == 'user')."""
+    _ensure_glyph_index()
+
+    try:
+        return _glyph_index.get_tokens_by_meta_type('user', limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e)
+
+
 @app.get("/glyphs/{ref}", tags=["Glyphs"])
 async def get_glyph(ref: str = _REF_PATH):
     """Get Glyph token by reference (72 hex chars = 36 bytes)."""
@@ -924,7 +1155,9 @@ async def get_glyph(ref: str = _REF_PATH):
         if not token:
             raise HTTPException(status_code=404, detail="Token not found")
 
-        return _glyph_index._token_to_dict(token)
+        # Single-token detail: include the media-reuse extras (media_sha256 /
+        # media_duplicates), which cost a GMH prefix scan and so stay off for list pages.
+        return _glyph_index._token_to_dict(token, include_media_dupes=True)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except HTTPException:
@@ -2116,6 +2349,60 @@ async def get_royalty_stats():
         }
     except Exception as e:
         raise _internal_error(e)
+
+
+# =============================================================================
+# HASHMARK (Digest Lookup)
+# =============================================================================
+
+def _ensure_hashmark():
+    if not _hashmark_index:
+        raise HTTPException(status_code=503, detail="HashMark index not available")
+
+
+# Declared before /hashmark/{digest} so "stats" is routed here rather than parsed as a digest.
+@app.get("/hashmark/stats", tags=["HashMark"])
+async def get_hashmark_stats():
+    """HashMark index status, including historic-backfill progress.
+
+    `backfill_complete` tells a client whether an empty lookup means "never marked" or
+    "not scanned back that far yet"."""
+    _ensure_hashmark()
+    try:
+        return _hashmark_index.stats()
+    except Exception as e:
+        raise _internal_error(e, "hashmark_stats")
+
+
+@app.get("/hashmark/{digest}", tags=["HashMark"])
+async def hashmark_lookup(
+    digest: str = Path(..., min_length=16, max_length=128,
+                       description="Full lowercase hex digest (sha256 -> 64 chars)"),
+    algorithm: str = Query(default="sha256", description="Algorithm name ('sha256') or id ('1')"),
+    limit: int = Query(default=HASHMARK_DEFAULT_LIMIT, ge=1, le=HASHMARK_MAX_LIMIT),
+):
+    """Confirmed HashMark records for one digest, oldest first.
+
+    Returns `[]` when the digest was never marked — a normal answer, not a 404.  A hit is a search
+    hint: the caller is expected to re-fetch the transaction and re-decode the output itself.
+    """
+    _ensure_hashmark()
+
+    alg_id = resolve_hashmark_algorithm(algorithm)
+    if alg_id is None:
+        raise HTTPException(status_code=400, detail=f"Unknown algorithm: {algorithm}")
+    digest_bytes = parse_hashmark_digest(digest, alg_id)
+    if digest_bytes is None:
+        # Strict full-length match only: prefix search would let a caller enumerate the index.
+        raise HTTPException(
+            status_code=400,
+            detail="digest must be the full lowercase hex digest for this algorithm",
+        )
+
+    try:
+        return _hashmark_index.lookup(digest_bytes, alg_id, limit)
+    except Exception as e:
+        raise _internal_error(e, "hashmark_lookup")
 
 
 # =============================================================================

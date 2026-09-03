@@ -103,6 +103,10 @@ class Env(EnvBase):
         # requires a reindex/backfill so historic listings populate (see
         # docs / RoyaltyIndex). Turn on with ROYALTY_INDEX=1 after deploy.
         self.royalty_index = False if minimal else self.boolean('ROYALTY_INDEX', False)
+        # HashMark digest index (hashmark.lookup).  Enabling it on an already-synced node kicks
+        # off a background historic backfill (see HashMarkIndex.backfill), which re-reads every
+        # block from the daemon once.  Set HASHMARK_INDEX=0 to skip it.
+        self.hashmark_index = False if minimal else self.boolean('HASHMARK_INDEX', True)
         self.analytics_index = False if minimal else self.boolean('ANALYTICS_INDEX', True)
         self.glyph_subscriptions = False if minimal else self.boolean('GLYPH_SUBSCRIPTIONS', True)
         self.mempool_glyph_index = False if minimal else self.boolean('MEMPOOL_GLYPH_INDEX', True)

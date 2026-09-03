@@ -32,6 +32,13 @@ from electrumx.lib.glyph import (
 )
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
 from electrumx.server.glyph_subscriptions import SubscriptionLimitError
+from electrumx.server.hashmark_index import (
+    DEFAULT_LIMIT as HASHMARK_DEFAULT_LIMIT,
+    MAX_LIMIT as HASHMARK_MAX_LIMIT,
+    parse_digest_arg as parse_hashmark_digest,
+    resolve_algorithm as resolve_hashmark_algorithm,
+)
+from electrumx.server.session import BAD_REQUEST, RPCError, non_negative_integer
 
 
 # Sentinel distinguishing "client did not pass cursor" (legacy list shape)
@@ -503,22 +510,40 @@ class GlyphAPIMixin:
 
     async def glyph_search_tokens(self, query: str, protocols: list = None,
                                    limit: int = 50,
-                                   cursor=_CURSOR_UNSET):
+                                   cursor=_CURSOR_UNSET,
+                                   wildcard: bool = False,
+                                   offset: int = 0):
         """
         Search tokens by name or ticker.
 
         Args:
-            query: Search query string
+            query: Search query. Exact by default. Contains ``*``/``?``/``[abc]`` -> wildcard
+                   search over BOTH name and ticker. Case-insensitive either way.
             protocols: Optional list of protocol IDs to filter
             limit: Maximum results
             cursor: Opaque pagination cursor (see docs/pagination-cursors.md).
                     When supplied, response shape is
-                    ``{entries, next_cursor, has_more}``.
+                    ``{entries, next_cursor, has_more}``. Not used by wildcard search,
+                    which pages with ``offset`` because its results are sorted
+                    alphabetically rather than by seek key.
+            wildcard: Force wildcard mode for plain text, treating ``query`` as
+                      ``*query*`` (substring). Ignored when query already has a metacharacter.
+            offset: Wildcard mode only: skip this many matches.
+
+        Exact search is an indexed hash lookup; wildcard search is a bounded full scan, because
+        BY_NAME stores sha256(name) and cannot be seeked by prefix. Wildcard responses carry
+        ``scanned``/``truncated`` so a caller can tell a complete answer from a capped one.
         """
         self.bump_cost(3.0)
 
         if not hasattr(self, 'glyph_index') or not self.glyph_index:
             return {'error': 'Glyph indexing not enabled'}
+
+        if wildcard or any(ch in (query or '') for ch in '*?['):
+            self.bump_cost(12.0)        # full scan, not a seek
+            return self.glyph_index.search_tokens_wildcard(
+                query, protocols=protocols, limit=limit, offset=offset,
+            )
 
         if cursor is _CURSOR_UNSET:
             return self.glyph_index.search_tokens(
@@ -582,6 +607,104 @@ class GlyphAPIMixin:
                 token_type, limit=limit, cursor=cursor, order='recent'
             )
         return self.glyph_index.get_recent_tokens(limit=limit, cursor=cursor)
+
+    async def glyph_get_container_members(self, container_ref: str, limit: int = 100,
+                                           cursor: str = None):
+        """
+        Get all member tokens belonging to a container.
+
+        Args:
+            container_ref: Container token ref in format "txid_vout" or 72-hex
+            limit: Maximum results (capped at 500)
+            cursor: Opaque pagination cursor from previous response next_cursor
+
+        Returns:
+            Dict with container_ref, tokens list, and next_cursor
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        try:
+            from electrumx.server.glyph_index import parse_ref_any
+            ref_bytes = parse_ref_any(container_ref)
+            return self.glyph_index.get_container_members(
+                ref_bytes, limit=min(limit, 500), cursor=cursor
+            )
+        except Exception as e:
+            return {'error': str(e)}
+
+    async def glyph_list_containers(self, limit: int = 100, cursor: str = None):
+        """
+        List all container tokens.
+
+        Args:
+            limit: Maximum results (capped at 500)
+            cursor: Opaque pagination cursor from previous response next_cursor
+
+        Returns:
+            Dict with tokens list and next_cursor
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        return self.glyph_index.get_tokens_by_meta_type(
+            'container', limit=min(limit, 500), cursor=cursor
+        )
+
+    async def glyph_list_users(self, limit: int = 100, cursor: str = None):
+        """
+        List all user-profile tokens (metadata type == 'user').
+
+        Args:
+            limit: Maximum results (capped at 500)
+            cursor: Opaque pagination cursor from previous response next_cursor
+
+        Returns:
+            Dict with tokens list and next_cursor
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        return self.glyph_index.get_tokens_by_meta_type(
+            'user', limit=min(limit, 500), cursor=cursor
+        )
+
+    async def glyph_get_creator_works(self, creator_ref: str, limit: int = 100,
+                                      cursor: str = None):
+        """
+        Get all tokens attributed to a creator (metadata ``by`` field).
+
+        Args:
+            creator_ref: Creator token ref, "txid_vout" or 72-hex
+            limit: Maximum results (capped at 500)
+            cursor: Opaque pagination cursor from previous response next_cursor
+
+        Returns:
+            Dict with creator_ref, tokens list, and next_cursor.
+
+        Attribution is SELF-ASSERTED by whoever minted each token; nothing binds ``by`` to the
+        referenced token's owner. Entries are claims of authorship, not proof of it — the response
+        carries ``attribution: "self-asserted"`` as a standing reminder.
+        """
+        self.bump_cost(2.0)
+
+        if not hasattr(self, 'glyph_index') or not self.glyph_index:
+            return {'error': 'Glyph indexing not enabled'}
+
+        try:
+            from electrumx.server.glyph_index import parse_ref_any
+            ref_bytes = parse_ref_any(creator_ref)
+            return self.glyph_index.get_creator_works(
+                ref_bytes, limit=min(limit, 500), cursor=cursor
+            )
+        except Exception as e:
+            return {'error': str(e)}
 
     async def glyph_get_metadata(self, ref: str):
         """
@@ -1239,6 +1362,52 @@ class GlyphAPIMixin:
         except Exception as e:
             return {'error': str(e)}
 
+    async def hashmark_lookup(self, digest: str, algorithm_id: Any = 1,
+                              limit: int = HASHMARK_DEFAULT_LIMIT):
+        """Find the confirmed HashMark records for one digest, oldest first.
+
+        Args:
+            digest: full lowercase hex digest, exactly the algorithm's length (sha256 -> 64 chars)
+            algorithm_id: algorithm id (1) or name ('sha256')
+            limit: maximum records to return (default 20, capped at 100)
+
+        Returns:
+            A list of records, oldest first — empty when the digest was never marked, which is a
+            normal answer rather than an error.  Each record carries txid/output_index/height/
+            block_hash/version/algorithm/digest, plus `label` when the mark had one.
+
+        A hit is a search hint, not proof: the caller is expected to re-fetch the transaction and
+        re-decode the output itself.
+        """
+        self.bump_cost(1.0)
+        if not self.hashmark_index:
+            raise RPCError(BAD_REQUEST, 'HashMark indexing not enabled on this server')
+
+        alg_id = resolve_hashmark_algorithm(algorithm_id)
+        if alg_id is None:
+            raise RPCError(BAD_REQUEST, f'{algorithm_id} is not a known HashMark algorithm')
+        digest_bytes = parse_hashmark_digest(digest, alg_id)
+        if digest_bytes is None:
+            # Deliberately strict: no prefix or partial matching, which would let a caller
+            # enumerate the index one nibble at a time.
+            raise RPCError(BAD_REQUEST,
+                           'digest must be the full lowercase hex digest for this algorithm')
+
+        limit = max(1, min(non_negative_integer(limit) or 1, HASHMARK_MAX_LIMIT))
+        self.bump_cost(0.05 * limit)
+        return self.hashmark_index.lookup(digest_bytes, alg_id, limit)
+
+    async def hashmark_stats(self):
+        """HashMark index status, including historic-backfill progress.
+
+        `backfill_complete` is what lets a client tell "this digest was never marked" from
+        "the index has not scanned that far back yet".
+        """
+        self.bump_cost(0.5)
+        if not self.hashmark_index:
+            raise RPCError(BAD_REQUEST, 'HashMark indexing not enabled on this server')
+        return self.hashmark_index.stats()
+
     async def swap_get_user_unconfirmed(self, scripthash: str):
         """
         Get unconfirmed swap orders for a user.
@@ -1696,6 +1865,12 @@ GLYPH_METHODS = {
     'glyph.get_tokens_by_type': 'glyph_get_tokens_by_type',
     'glyph.get_recent': 'glyph_get_recent',
     'glyph.get_metadata': 'glyph_get_metadata',
+    # Container support
+    'glyph.get_container_members': 'glyph_get_container_members',
+    'glyph.list_containers': 'glyph_list_containers',
+    'glyph.get_creator_works': 'glyph_get_creator_works',
+    # User profiles
+    'glyph.list_users': 'glyph_list_users',
     # dMint contracts (for Glyph Miner)
     'dmint.get_contracts': 'dmint_get_contracts',
     'dmint.get_contract': 'dmint_get_contract',
@@ -1713,6 +1888,9 @@ GLYPH_METHODS = {
     'market.list': 'market_list',
     # Royalty-listing discovery (RRYL beacons)
     'royalty.get_listings': 'royalty_get_listings',
+    # HashMark digest lookup
+    'hashmark.lookup': 'hashmark_lookup',
+    'hashmark.stats': 'hashmark_stats',
     # Mempool Glyph/Swap
     'glyph.get_unconfirmed_balance': 'glyph_get_unconfirmed_balance',
     'glyph.get_unconfirmed_txs': 'glyph_get_unconfirmed_txs',

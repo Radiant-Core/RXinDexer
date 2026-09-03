@@ -506,6 +506,8 @@ def get_token_type_id(protocols: List[int],
     if GlyphProtocol.GLYPH_NFT in protocols:
         if GlyphProtocol.GLYPH_WAVE in protocols:
             return GlyphTokenType.WAVE
+        # CONTAINER is checked before AUTHORITY so a container+authority token
+        # ([2,7,10]) classifies the same way here as in get_token_type.
         if GlyphProtocol.GLYPH_CONTAINER in protocols:
             return GlyphTokenType.CONTAINER
         if GlyphProtocol.GLYPH_AUTHORITY in protocols:

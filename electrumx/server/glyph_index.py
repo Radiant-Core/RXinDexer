@@ -6,6 +6,7 @@ Handles token registration, balance tracking, and history.
 """
 
 import base64
+import os
 import struct
 from typing import Optional, Dict, Any, List, Tuple, Set
 from collections import defaultdict
@@ -55,6 +56,28 @@ class GlyphDBKeys:
     UNDO = b'GXU'              # GXU + height(be) -> binary undo entries
     KEY_REVEALS = b'GKR'       # GKR + ref -> CBOR key reveal record (Phase 6 / REP-3009)
     CONTRACT_TO_TOKEN = b'GC'  # GC + contract_ref(36) -> token_ref(36) (R6 reverse index)
+    CONTAINER_MEMBERS = b'GCM' # GCM + container_ref(36) + member_ref(36) -> empty
+    BY_META_TYPE = b'GMT'      # GMT + type_hash(16) + ref(36) -> empty (metadata 'type' field index)
+    # GA + creator_ref(36) + work_ref(36) -> empty. Answers "all glyphs by creator X" from the
+    # metadata `by` field.  Deliberately NOT 'GBY': that would sit under the BALANCE prefix 'GB',
+    # whose scans seek on GB + hashX(11) — a creator row would then be a candidate match for a
+    # hashX beginning 0x59 ('Y'). Same "no prefix may be a prefix of another" rule the recency
+    # indexes cite (and that GC/GCM and GM/GMT already bend).
+    BY_CREATOR = b'GA'
+    # GMH + sha256(media)(32) + token_ref(36) -> empty. Finds every token carrying the same media
+    # bytes, whether embedded (sha256 of main.b) or remote (the committed `h`), so the two forms of
+    # one artwork collide in a single keyspace.
+    #
+    # GMH does sit under METADATA's 'GM', but safely: every GM access is an exact `.get()` on
+    # GM + metadata_hash(32) and nothing ever prefix-scans 'GM' (same situation as the pre-existing
+    # GM/GMT pair).
+    MEDIA_HASH = b'GMH'
+    # GDH + metadata_hash(32) + ref(36) -> empty. Whole-payload clones: identical CBOR, not merely
+    # identical media. NOT 'GPH' as originally proposed — that sits under BY_PROTO's 'GP', which IS
+    # prefix-scanned as GP + proto(1), so a 'GPH' row would be a candidate match for protocol
+    # 0x48 (72). No protocol id is that high today, which is exactly what makes it a latent trap
+    # rather than a visible bug.
+    PAYLOAD_HASH = b'GDH'
     STATS = b'GSTAT'           # GSTAT -> CBOR {total, ft, nft, dat, dmint, v1, v2} (R11)
     SCHEMA_VERSION = b'GVER'   # GVER -> uint8 schema version (R21)
     # --- v4 discovery indexes (recency-ordered; see _migrate_3_to_4) ---
@@ -74,7 +97,25 @@ class GlyphDBKeys:
 # v4: recency-ordered discovery indexes (BY_TYPE_RECENT / BY_PROTO / GLOBAL_RECENT).
 #     Backfillable in place from existing GT rows (deploy_height + protocols are
 #     already stored) — no radiantd rescan; see _migrate_3_to_4.
-CURRENT_SCHEMA_VERSION = 4
+# v5: container membership index (GCM keys). Backfillable in place from stored
+#     metadata (`in` field); see _migrate_4_to_5.
+# v6: metadata type index (GMT keys). Backfillable in place from stored metadata
+#     (`type` field); see _migrate_5_to_6.
+#
+# v5/v6 were developed as v4/v5 against a v3 base, before the recency indexes took
+# v4 upstream; they are renumbered here so the chain stays linear. Both derive
+# purely from the CBOR metadata already stored in GM rows, so neither needs the
+# full reindex their original notes assumed.
+# v7: creator attribution index (GA keys). Backfillable in place from stored metadata
+#     (`by` field); see _migrate_6_to_7.
+# v8: media-duplicate (GMH) and whole-payload-clone (GDH) indexes. Backfillable in place from
+#     stored metadata (embed bytes / remote `h`, and the metadata_hash already on each GT row);
+#     see _migrate_7_to_8.
+CURRENT_SCHEMA_VERSION = 8
+
+# Upper bound on GT rows examined by one wildcard search. The corpus is ~13k tokens today, so a
+# full pass is cheap; this exists so the cost stays bounded if it grows by orders of magnitude.
+MAX_WILDCARD_SCAN = int(os.getenv('GLYPH_MAX_WILDCARD_SCAN', '200000'))
 
 
 # History event types
@@ -107,6 +148,55 @@ def ref_to_display(ref: bytes) -> str:
     the raw 72-hex form) on input.
     """
     return hash_to_hex_str(ref[:32]) + '_' + str(struct.unpack('<I', ref[32:36])[0])
+
+
+def unwrap_cbor_bytes(value) -> Optional[bytes]:
+    """Unwrap a CBOR byte payload to raw bytes, or None.
+
+    Handles the shapes cbor2 hands back for embedded media: raw bytes/bytearray, or a CBORTag
+    (typed array, tag 64) whose ``.value`` is either bytes or a hex string.
+    """
+    if hasattr(value, 'value'):
+        value = value.value
+        if isinstance(value, str):
+            try:
+                return bytes.fromhex(value)
+            except ValueError:
+                return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    return None
+
+
+def media_hashes_from_metadata(metadata: Dict[str, Any]) -> Set[bytes]:
+    """Every 32-byte media hash a token's metadata commits to.
+
+    Embedded media contributes ``sha256(bytes)``; remote media contributes the committed ``h``
+    verbatim. Both are SINGLE sha256, deliberately: that is what a remote ``h`` already is, so an
+    embedded copy and a remote copy of one artwork land on the same key and collide in one index.
+
+    Candidate containers are classified by CONTENT, not key name — `main` may hold either an embed
+    (`b`) or a remote (`u`/`h`), which is why _token_to_dict already sniffs them this way. Unlike
+    the token-field extraction below, remote and embed are NOT mutually exclusive here: a token
+    carrying both should be findable by either hash.
+    """
+    out: Set[bytes] = set()
+    if not isinstance(metadata, dict):
+        return out
+    for key in ('main', 'preview', 'embed', 'em', 'remote', 'rm'):
+        section = metadata.get(key)
+        if not isinstance(section, dict):
+            continue
+        # Remote: a committed content hash, already a single sha256.
+        h = section.get('h')
+        if isinstance(h, (bytes, bytearray)) and len(h) == 32:
+            out.add(bytes(h))
+        # Embedded: hash the bytes ourselves. The 640 KiB CBOR payload cap
+        # (MAX_CBOR_PAYLOAD_BYTES) already bounds the work.
+        raw = unwrap_cbor_bytes(section.get('b'))
+        if raw:
+            out.add(sha256(raw))
+    return out
 
 
 def parse_ref_any(ref_str: str) -> bytes:
@@ -534,6 +624,20 @@ class GlyphIndex:
         self.contract_to_token_cache: Dict[bytes, bytes] = {}  # contract_ref -> token_ref
         self.contract_to_token_height: Dict[bytes, int] = {}   # contract_ref -> height
 
+        # Pending container membership index entries for flush
+        self.container_member_cache: Dict[bytes, Set[bytes]] = defaultdict(set)  # container_ref -> {member_ref}
+        self.container_member_height: Dict[bytes, int] = {}   # container_ref -> height
+
+        # Pending metadata type index entries for flush (GMT)
+        self.meta_type_cache: Dict[str, Set[bytes]] = defaultdict(set)  # meta_type_lower -> {ref}
+        self.meta_type_height: Dict[str, int] = {}            # meta_type_lower -> height
+        self.creator_works_cache: Dict[bytes, Set[bytes]] = defaultdict(set)  # creator_ref -> {work_ref}
+        self.creator_works_height: Dict[bytes, int] = {}      # creator_ref -> height
+        self.media_hash_cache: Dict[bytes, Set[bytes]] = defaultdict(set)  # media_sha256 -> {ref}
+        self.media_hash_height: Dict[bytes, int] = {}         # media_sha256 -> height
+        self.payload_hash_cache: Dict[bytes, Set[bytes]] = defaultdict(set)  # metadata_hash -> {ref}
+        self.payload_hash_height: Dict[bytes, int] = {}       # metadata_hash -> height
+
         # In-memory stats delta accumulator (R11)
         # Tracks net change in counts since last flush
         self._stats_delta: Dict[str, int] = dict(self._STATS_ZERO)
@@ -615,7 +719,11 @@ class GlyphIndex:
             return
 
         # v < CURRENT — walk the in-place migration chain.
-        migrations = {3: self._migrate_3_to_4}
+        migrations = {3: self._migrate_3_to_4,
+                      4: self._migrate_4_to_5,
+                      5: self._migrate_5_to_6,
+                      6: self._migrate_6_to_7,
+                      7: self._migrate_7_to_8}
         while v < CURRENT_SCHEMA_VERSION:
             migrator = migrations.get(v)
             if migrator is None:
@@ -687,6 +795,157 @@ class GlyphIndex:
             f'Glyph v4 migration complete: {total} tokens backfilled into '
             f'discovery indexes (GZ/GP/GQ)')
         return total
+
+    def _read_token_page(self, seek: bytes, page: int):
+        """Read one page of GT rows from ``seek``. Returns ``(items, next_seek)``.
+
+        ``items`` is ``[(ref, token)]`` with unparseable rows dropped; ``next_seek`` is None once
+        the walk is complete. The iterator is fully drained before returning, so a caller's
+        ``write_batch`` never overlaps an open RocksDB iterator — the same constraint
+        ``_migrate_3_to_4`` observes by collecting a page before opening its batch.
+        """
+        prefix = GlyphDBKeys.TOKEN
+        raw = []
+        for key, value in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            raw.append((key, value))
+            if len(raw) >= page:
+                break
+        items = []
+        for key, value in raw:
+            ref = key[len(prefix):]
+            if len(ref) != 36:
+                continue
+            try:
+                items.append((ref, GlyphTokenInfo.from_bytes(value)))
+            except Exception:
+                continue
+        # seek is inclusive, so resume strictly after the last key read.
+        next_seek = (raw[-1][0] + b'\x00') if len(raw) >= page else None
+        return items, next_seek
+
+    def _migrate_metadata_derived(self, label: str, derive) -> int:
+        """Shared driver for the v4->v5 and v5->v6 backfills.
+
+        Each walks existing GT rows, re-reads the token's stored CBOR metadata from its GM row, and
+        writes keys that are a pure function of that metadata — so none needs a radiantd rescan or
+        any block reprocessing. ``derive(ref, metadata, metadata_hash)`` returns the keys to write;
+        the hash is passed because a derived key may need the payload's identity rather than its
+        contents (see _migrate_7_to_8).
+
+        Notes (mirroring _migrate_3_to_4):
+          * Idempotent — the keys are derived, so re-writing them is a no-op and a run interrupted
+            before the version stamp is safe to repeat.
+          * Page-committed via ``seek``, never holding an iterator open across a commit.
+          * No undo recorded: migrations run at startup before block sync, so no reorg is
+            concurrent, and every list query hydrates via ``get_token`` and skips refs whose token
+            is gone — leaving any orphan inert.
+          * Tokens whose metadata is absent (never stored, or scrubbed by the dMint denylist) or
+            undecodable are skipped: there is nothing to derive a key from.
+        """
+        PAGE = 5000
+        seek = GlyphDBKeys.TOKEN
+        total = 0
+        indexed = 0
+        pages = 0
+        while True:
+            items, seek = self._read_token_page(seek, PAGE)
+            if items:
+                with self.db.utxo_db.write_batch() as batch:
+                    for ref, token in items:
+                        total += 1
+                        if not token.metadata_hash:
+                            continue
+                        metadata = self.get_metadata(token.metadata_hash)
+                        if not isinstance(metadata, dict):
+                            continue
+                        for key in derive(ref, metadata, token.metadata_hash):
+                            batch.put(key, b'')
+                            indexed += 1
+                pages += 1
+                self.logger.info(
+                    f'Glyph {label} migration: {total} tokens scanned, '
+                    f'{indexed} rows written ({pages} page(s))')
+            if seek is None:
+                break
+        self.logger.info(
+            f'Glyph {label} migration complete: {indexed} rows written from {total} tokens')
+        return indexed
+
+    def _migrate_4_to_5(self) -> int:
+        """v4 -> v5: backfill the container membership index (GCM) in place.
+
+        Mirrors the live write path exactly: membership is declared by the MEMBER token, whose
+        metadata carries a 36-byte container ref at ``metadata['in'][0]`` (CBORTag-wrapped in some
+        encoders). Member tokens are plain NFTs and carry no distinguishing protocol flag, so the
+        ``in`` field is the sole signal.
+        """
+        def derive(ref, metadata, _metadata_hash):
+            in_field = metadata.get('in')
+            if not isinstance(in_field, (list, tuple)) or not in_field:
+                return
+            in_0 = in_field[0]
+            if hasattr(in_0, 'value'):      # unwrap CBORTag
+                in_0 = in_0.value
+            if isinstance(in_0, (bytes, bytearray)) and len(in_0) == 36:
+                yield GlyphDBKeys.CONTAINER_MEMBERS + bytes(in_0) + ref
+
+        return self._migrate_metadata_derived('v5 (GCM)', derive)
+
+    def _migrate_5_to_6(self) -> int:
+        """v5 -> v6: backfill the metadata type index (GMT) in place.
+
+        Mirrors the live write path exactly, including the ``strip().lower()`` normalisation — the
+        stored key is ``sha256(normalised_type)[:16]``, so any divergence here would produce keys
+        that live writes could never match.
+        """
+        def derive(ref, metadata, _metadata_hash):
+            raw_meta_type = metadata.get('type')
+            if raw_meta_type and isinstance(raw_meta_type, str):
+                meta_type_lower = raw_meta_type.strip().lower()
+                if meta_type_lower:
+                    type_hash = sha256(meta_type_lower.encode('utf-8'))[:16]
+                    yield GlyphDBKeys.BY_META_TYPE + type_hash + ref
+
+        return self._migrate_metadata_derived('v6 (GMT)', derive)
+
+    def _migrate_6_to_7(self) -> int:
+        """v6 -> v7: backfill the creator attribution index (GA) in place.
+
+        Mirrors the live write path: a 36-byte ref at ``metadata['by'][0]`` (CBORTag-wrapped in some
+        encoders). Note this backfills only the GA rows, not ``token.author`` on the GT record —
+        rewriting every token row to populate a display field is not worth a full rewrite pass, and
+        `get_creator_works` reads the GA index rather than the field. Tokens minted from here on
+        get both.
+        """
+        def derive(ref, metadata, _metadata_hash):
+            by_field = metadata.get('by')
+            if not isinstance(by_field, (list, tuple)) or not by_field:
+                return
+            by_0 = by_field[0]
+            if hasattr(by_0, 'value'):      # unwrap CBORTag
+                by_0 = by_0.value
+            if isinstance(by_0, (bytes, bytearray)) and len(by_0) == 36:
+                yield GlyphDBKeys.BY_CREATOR + bytes(by_0) + ref
+
+        return self._migrate_metadata_derived('v7 (GA)', derive)
+
+    def _migrate_7_to_8(self) -> int:
+        """v7 -> v8: backfill the media-duplicate (GMH) and payload-clone (GDH) indexes in place.
+
+        Both derive from what is already stored: GMH from the embedded bytes / remote ``h`` inside
+        the CBOR, GDH from the metadata_hash already on the GT row. No chain rescan.
+
+        Note this does NOT backfill ``token.embedded_data_hash`` for embed-only tokens (the live
+        path now sets it). Rewriting every GT row for a display field is not worth a full rewrite
+        pass, and the index — which is what queries read — is complete either way.
+        """
+        def derive(ref, metadata, metadata_hash):
+            for media_hash in media_hashes_from_metadata(metadata):
+                yield GlyphDBKeys.MEDIA_HASH + media_hash + ref
+            if metadata_hash:
+                yield GlyphDBKeys.PAYLOAD_HASH + metadata_hash + ref
+
+        return self._migrate_metadata_derived('v8 (GMH/GDH)', derive)
 
     def _scrub_denylist_metadata(self) -> None:
         """Delete stored CBOR metadata blobs (GM keys) for all denylisted tokens.
@@ -1544,13 +1803,30 @@ class GlyphIndex:
                 token.embedded_data_hash = bytes(h)
         elif embed and isinstance(embed, dict):
             token.icon_type = embed.get('t') or embed.get('type')
-            b = embed.get('b')
-            # CBORTag 64 = typed array; value may be hex str or bytes
-            if hasattr(b, 'value'):
-                b = bytes.fromhex(b.value) if isinstance(b.value, str) else b.value
-            if isinstance(b, (bytes, bytearray)):
+            b = unwrap_cbor_bytes(embed.get('b'))
+            if b:
                 token.icon_size = len(b)
                 token.icon_ref = 'embedded'
+                # Embedded media had no content hash on the token row until now — this field was
+                # only ever set from a REMOTE `h`, so embed-only tokens read back None. Populate it
+                # with the same single sha256 the GMH index keys on, so the row and the index can
+                # never disagree.
+                if token.embedded_data_hash is None:
+                    token.embedded_data_hash = sha256(b)
+
+        # Media-duplicate index (GMH): every media hash this token commits to, embedded or remote.
+        # Computed from the metadata directly rather than from the fields above, because those are
+        # mutually exclusive (`elif`) while a token carrying both should be findable by either.
+        for media_hash in media_hashes_from_metadata(metadata):
+            self.media_hash_cache[media_hash].add(ref)
+            if media_hash not in self.media_hash_height:
+                self.media_hash_height[media_hash] = height
+
+        # Whole-payload clone index (GDH): identical CBOR, not merely identical media.
+        if token.metadata_hash:
+            self.payload_hash_cache[token.metadata_hash].add(ref)
+            if token.metadata_hash not in self.payload_hash_height:
+                self.payload_hash_height[token.metadata_hash] = height
 
         # Encrypted content fields (Phase 6 / REP-3008)
         if GlyphProtocol.GLYPH_ENCRYPTED in token.protocols:
@@ -1573,6 +1849,54 @@ class GlyphIndex:
                     token.timelock_unlock_at = tl.get('unlock_at')
                     token.timelock_cek_hash = tl.get('cek_hash')  # 'sha256:hex'
                     token.timelock_hint = tl.get('hint')
+
+        # Extract container membership: presence of an 'in' field is sufficient —
+        # member tokens are plain NFTs and do not carry a specific container
+        # protocol flag.  The container ref is a 36-byte value at metadata['in'][0].
+        in_field = metadata.get('in')
+        if isinstance(in_field, (list, tuple)) and len(in_field) > 0:
+            in_0 = in_field[0]
+            # Unwrap CBORTag if needed
+            if hasattr(in_0, 'value'):
+                in_0 = in_0.value
+            if isinstance(in_0, (bytes, bytearray)) and len(in_0) == 36:
+                container_ref_bytes = bytes(in_0)
+                token.container_ref = container_ref_bytes.hex()
+                self.container_member_cache[container_ref_bytes].add(ref)
+                if container_ref_bytes not in self.container_member_height:
+                    self.container_member_height[container_ref_bytes] = height
+
+        # Extract creator attribution (GA) from the metadata `by` field, mirroring `in` above:
+        # a 36-byte ref at metadata['by'][0] pointing at the creator's token.  This also finally
+        # populates `token.author`, which has been serialized ('au') and surfaced by the API since
+        # the beginning while never being assigned — so it always read back as None.
+        #
+        # Attribution is SELF-ASSERTED: `by` is a field the minter writes, with nothing binding it
+        # to the referenced token's owner.  A row here means "this token claims that creator", never
+        # that the creator agreed.  Callers must not present it as proof of authorship.
+        by_field = metadata.get('by')
+        if isinstance(by_field, (list, tuple)) and len(by_field) > 0:
+            by_0 = by_field[0]
+            if hasattr(by_0, 'value'):      # unwrap CBORTag
+                by_0 = by_0.value
+            if isinstance(by_0, (bytes, bytearray)) and len(by_0) == 36:
+                creator_ref_bytes = bytes(by_0)
+                token.author = creator_ref_bytes.hex()
+                self.creator_works_cache[creator_ref_bytes].add(ref)
+                if creator_ref_bytes not in self.creator_works_height:
+                    self.creator_works_height[creator_ref_bytes] = height
+
+        # Index by metadata 'type' field (GMT) — covers application-level token
+        # categories like "user", "profile", etc. that are not expressed as
+        # protocol flags.  Both v1 (type string only) and v2 (p array + type
+        # string) tokens may carry this field.
+        raw_meta_type = metadata.get('type')
+        if raw_meta_type and isinstance(raw_meta_type, str):
+            meta_type_lower = raw_meta_type.strip().lower()
+            if meta_type_lower:
+                self.meta_type_cache[meta_type_lower].add(ref)
+                if meta_type_lower not in self.meta_type_height:
+                    self.meta_type_height[meta_type_lower] = height
 
         # Store in cache (GSTAT counting happens once at the GT write point in
         # flush(), covering all registration paths uniformly).
@@ -2066,6 +2390,47 @@ class GlyphIndex:
             self._record_undo(height, key)
             batch.put(key, token_ref)
 
+        # Flush container membership index (GCM + container_ref + member_ref -> empty)
+        for container_ref_bytes, member_refs in self.container_member_cache.items():
+            c_height = self.container_member_height.get(container_ref_bytes, self.db.db_height) or 0
+            for member_ref in member_refs:
+                key = GlyphDBKeys.CONTAINER_MEMBERS + container_ref_bytes + member_ref
+                self._record_undo(c_height, key)
+                batch.put(key, b'')
+
+        # Flush metadata type index (GMT + type_hash(16) + ref(36) -> empty)
+        for meta_type_str, refs in self.meta_type_cache.items():
+            type_hash = sha256(meta_type_str.encode('utf-8'))[:16]
+            mt_height = self.meta_type_height.get(meta_type_str, self.db.db_height) or 0
+            for ref in refs:
+                key = GlyphDBKeys.BY_META_TYPE + type_hash + ref
+                self._record_undo(mt_height, key)
+                batch.put(key, b'')
+
+        # Flush creator attribution index (GA + creator_ref(36) + work_ref(36) -> empty)
+        for creator_ref_bytes, work_refs in self.creator_works_cache.items():
+            cr_height = self.creator_works_height.get(creator_ref_bytes, self.db.db_height) or 0
+            for work_ref in work_refs:
+                key = GlyphDBKeys.BY_CREATOR + creator_ref_bytes + work_ref
+                self._record_undo(cr_height, key)
+                batch.put(key, b'')
+
+        # Flush media-duplicate index (GMH + media_sha256(32) + ref(36) -> empty)
+        for media_hash, refs in self.media_hash_cache.items():
+            mh_height = self.media_hash_height.get(media_hash, self.db.db_height) or 0
+            for ref in refs:
+                key = GlyphDBKeys.MEDIA_HASH + media_hash + ref
+                self._record_undo(mh_height, key)
+                batch.put(key, b'')
+
+        # Flush whole-payload clone index (GDH + metadata_hash(32) + ref(36) -> empty)
+        for payload_hash, refs in self.payload_hash_cache.items():
+            ph_height = self.payload_hash_height.get(payload_hash, self.db.db_height) or 0
+            for ref in refs:
+                key = GlyphDBKeys.PAYLOAD_HASH + payload_hash + ref
+                self._record_undo(ph_height, key)
+                batch.put(key, b'')
+
         # R11: Flush incremental stats counter
         self._flush_stats_counter(batch)
 
@@ -2088,6 +2453,16 @@ class GlyphIndex:
         self.key_reveal_height.clear()         # R2
         self.contract_to_token_cache.clear()   # R6
         self.contract_to_token_height.clear()  # R6
+        self.container_member_cache.clear()
+        self.container_member_height.clear()
+        self.meta_type_cache.clear()
+        self.meta_type_height.clear()
+        self.creator_works_cache.clear()
+        self.creator_works_height.clear()
+        self.media_hash_cache.clear()
+        self.media_hash_height.clear()
+        self.payload_hash_cache.clear()
+        self.payload_hash_height.clear()
         self._stats_delta = dict(self._STATS_ZERO)  # R11
         self._known_refs.clear()               # R14: clear on every flush
     
@@ -2195,7 +2570,8 @@ class GlyphIndex:
             ref = pack_ref(hex_str_to_hash(txid), vout)
             token = self.get_token(ref)
             if token:
-                return self._token_to_dict(token)
+                # Detail path: opt into the media-reuse extras.
+                return self._token_to_dict(token, include_media_dupes=True)
         except Exception:
             pass
         return None
@@ -2687,6 +3063,280 @@ class GlyphIndex:
         prefix = GlyphDBKeys.BY_PROTO + struct.pack('<B', proto & 0xFF)
         return self._paginate_hydrated(prefix, limit, cursor)
 
+    def get_container_members(self, container_ref: bytes, limit: int = 100,
+                              cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Get all member tokens belonging to a container, with cursor-based pagination."""
+        results = []
+        prefix = GlyphDBKeys.CONTAINER_MEMBERS + container_ref
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            member_ref = key[len(prefix):]
+            if len(member_ref) != 36:
+                continue
+            token = self.get_token(member_ref)
+            if token:
+                results.append(self._token_to_dict(token))
+
+        txid, vout = unpack_ref(container_ref)
+        return {
+            'container_ref': hash_to_hex_str(txid) + '_' + str(vout),
+            'tokens': results,
+            'next_cursor': next_cursor,
+        }
+
+    def has_container_members(self, container_ref: bytes) -> bool:
+        """Return True if any GCM entries exist for this container ref."""
+        prefix = GlyphDBKeys.CONTAINER_MEMBERS + container_ref
+        for _ in self.db.utxo_db.iterator(prefix=prefix):
+            return True
+        return False
+
+    def has_meta_type(self, meta_type: str, ref: bytes) -> bool:
+        """Return True if ref is indexed under the given metadata type."""
+        type_hash = sha256(meta_type.strip().lower().encode('utf-8'))[:16]
+        key = GlyphDBKeys.BY_META_TYPE + type_hash + ref
+        return self.db.utxo_db.get(key) is not None
+
+    def get_creator_works(self, creator_ref: bytes, limit: int = 100,
+                          cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Tokens attributed to a creator, from the metadata ``by`` field.
+
+        Attribution is self-asserted by the minter and is not verified against the creator token's
+        owner — see the note at the GA write site. Treat entries as claims, not proof.
+        """
+        results = []
+        prefix = GlyphDBKeys.BY_CREATOR + creator_ref
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            work_ref = key[len(prefix):]
+            if len(work_ref) != 36:
+                continue
+            token = self.get_token(work_ref)
+            if token:
+                results.append(self._token_to_dict(token))
+
+        txid, vout = unpack_ref(creator_ref)
+        return {
+            'creator_ref': hash_to_hex_str(txid) + '_' + str(vout),
+            'attribution': 'self-asserted',
+            'tokens': results,
+            'next_cursor': next_cursor,
+        }
+
+    def get_tokens_by_media_hash(self, media_hash: bytes, limit: int = 100,
+                                 cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Tokens whose media is byte-identical to ``media_hash``.
+
+        Covers embedded media (sha256 of the bytes) and remote media (the committed ``h``) in one
+        keyspace, so a re-upload of the same artwork is found regardless of how each token carries
+        it. Keys are not height-ordered — duplicate sets are small and each hydrated row carries
+        ``deploy_height``, so a caller sorts client-side to badge the first mint.
+        """
+        results = []
+        prefix = GlyphDBKeys.MEDIA_HASH + media_hash
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            ref = key[len(prefix):]
+            if len(ref) != 36:
+                continue
+            token = self.get_token(ref)
+            if token:
+                results.append(self._token_to_dict(token, include_embed_data=False))
+
+        return {
+            'media_sha256': media_hash.hex(),
+            'tokens': results,
+            'next_cursor': next_cursor,
+        }
+
+    def count_tokens_by_media_hash(self, media_hash: bytes, cap: int = 51) -> int:
+        """How many tokens share this media, counted key-only (no hydration).
+
+        Stops at ``cap`` so a hash reused thousands of times costs a bounded scan; callers render
+        a capped count as "50+".
+        """
+        prefix = GlyphDBKeys.MEDIA_HASH + media_hash
+        n = 0
+        for _ in self.db.utxo_db.iterator(prefix=prefix):
+            n += 1
+            if n >= cap:
+                break
+        return n
+
+    def get_tokens_by_payload_hash(self, payload_hash: bytes, limit: int = 100,
+                                   cursor: Optional[str] = None) -> Dict[str, Any]:
+        """Tokens whose ENTIRE CBOR payload is byte-identical — a whole-record clone."""
+        results = []
+        prefix = GlyphDBKeys.PAYLOAD_HASH + payload_hash
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            ref = key[len(prefix):]
+            if len(ref) != 36:
+                continue
+            token = self.get_token(ref)
+            if token:
+                results.append(self._token_to_dict(token, include_embed_data=False))
+
+        return {
+            'payload_sha256': payload_hash.hex(),
+            'tokens': results,
+            'next_cursor': next_cursor,
+        }
+
+    def count_creator_works(self, creator_ref: bytes) -> int:
+        """Number of tokens attributed to a creator (key-only scan, no hydration)."""
+        prefix = GlyphDBKeys.BY_CREATOR + creator_ref
+        return sum(1 for _ in self.db.utxo_db.iterator(prefix=prefix))
+
+    def search_tokens_wildcard(self, pattern: str, protocols: List[int] = None,
+                               limit: int = 50, offset: int = 0,
+                               fields: Tuple[str, ...] = ('name', 'ticker')) -> Dict[str, Any]:
+        """Wildcard search over token name and ticker.
+
+        Supports shell-style patterns: ``*`` (any run), ``?`` (one char), ``[abc]`` (class).
+        A pattern with no wildcard is treated as ``*pattern*`` — a substring search, which is what
+        a search box means by typing three letters.  Matching is case-insensitive.
+
+        Why this is a full scan rather than an index seek: BY_NAME stores ``sha256(name)[:16]``, so
+        the on-disk name is one-way and admits exact equality only. No ordered index over hashed
+        keys can answer a prefix, let alone an infix, query. Ticker (``GK``) IS stored in the clear,
+        but a single scan that covers both fields keeps one code path and one result ordering.
+        Bounded by MAX_WILDCARD_SCAN so a pathological pattern cannot pin the event loop.
+        """
+        import fnmatch
+
+        pat = (pattern or '').strip().lower()
+        if not pat:
+            return {'tokens': [], 'count': 0, 'scanned': 0, 'truncated': False}
+        if not any(ch in pat for ch in '*?['):
+            pat = f'*{pat}*'          # bare text means substring, not exact
+
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        want_name = 'name' in fields
+        want_ticker = 'ticker' in fields
+
+        matched = []
+        scanned = 0
+        truncated = False
+        prefix = GlyphDBKeys.TOKEN
+        for key, value in self.db.utxo_db.iterator(prefix=prefix):
+            if scanned >= MAX_WILDCARD_SCAN:
+                truncated = True
+                break
+            ref = key[len(prefix):]
+            if len(ref) != 36:
+                continue
+            scanned += 1
+            try:
+                token = GlyphTokenInfo.from_bytes(value)
+            except Exception:
+                continue
+            if protocols and not any(p in (token.protocols or []) for p in protocols):
+                continue
+            name = (token.name or '').lower()
+            ticker = (token.ticker or '').lower()
+            hit = ((want_name and name and fnmatch.fnmatchcase(name, pat))
+                   or (want_ticker and ticker and fnmatch.fnmatchcase(ticker, pat)))
+            if not hit:
+                continue
+            matched.append((name or ticker, ref, token))
+
+        # The scan deliberately runs to completion rather than stopping at offset+limit: results are
+        # ordered alphabetically, GT rows arrive in ref order, so an early break would sort only
+        # whichever matches happened to come first and page through a different set each call.
+        # Alphabetical so paging is stable across calls (GT order is by ref, i.e. arbitrary).
+        matched.sort(key=lambda m: (m[0], m[1]))
+        page = matched[offset:offset + limit]
+        return {
+            'pattern': pat,
+            'tokens': [self._token_to_dict(t) for _n, _r, t in page],
+            'count': len(page),
+            'has_more': len(matched) > offset + limit,
+            'scanned': scanned,
+            'truncated': truncated,
+        }
+
+    def get_all_containers(self, limit: int = 100,
+                           cursor: Optional[str] = None) -> Dict[str, Any]:
+        """List containers that actually hold members, by scanning the GCM index.
+
+        This is deliberately narrower than ``get_tokens_by_type(CONTAINER)``.  A token carrying
+        GLYPH_CONTAINER (7) — or recovered by ``meta_indicates_container`` — is classified
+        CONTAINER and is discoverable through BY_TYPE whether or not anything is inside it.  This
+        scan instead walks GCM keys (GCM + container_ref + member_ref) and returns the unique
+        container_refs, so it yields only non-empty containers, in membership-index order.
+
+        Use BY_TYPE to enumerate every container; use this to enumerate the populated ones.
+        """
+        prefix = GlyphDBKeys.CONTAINER_MEMBERS
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+        results = []
+        last_container_ref = None
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(key) < len(prefix) + 36:
+                continue
+            container_ref = key[len(prefix):len(prefix) + 36]
+            if container_ref == last_container_ref:
+                continue  # additional member of same container — skip
+            # New container encountered
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            last_container_ref = container_ref
+            token = self.get_token(container_ref)
+            if token:
+                results.append(self._token_to_dict(token))
+
+        return {'tokens': results, 'next_cursor': next_cursor}
+
+    def get_tokens_by_meta_type(self, meta_type: str, limit: int = 100,
+                                cursor: Optional[str] = None) -> Dict[str, Any]:
+        """List tokens whose metadata carries a specific 'type' string (e.g. 'user').
+
+        Scans the GMT index (GMT + sha256(type_lower)[:16] + ref).
+        """
+        type_hash = sha256(meta_type.strip().lower().encode('utf-8'))[:16]
+        prefix = GlyphDBKeys.BY_META_TYPE + type_hash
+        seek = self._decode_cursor(cursor) or prefix
+        next_cursor = None
+        results = []
+
+        for key, _ in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(results) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            ref = key[len(prefix):]
+            if len(ref) != 36:
+                continue
+            token = self.get_token(ref)
+            if token:
+                results.append(self._token_to_dict(token))
+
+        return {'tokens': results, 'next_cursor': next_cursor}
+
     def get_metadata(self, metadata_hash: bytes) -> Optional[Dict]:
         """Get parsed metadata by hash."""
         # Check cache
@@ -2708,7 +3358,8 @@ class GlyphIndex:
     
     def _token_to_dict(self, token: GlyphTokenInfo, include_dmint: bool = True,
                         include_content: bool = True,
-                        include_embed_data: bool = True) -> Dict[str, Any]:
+                        include_embed_data: bool = True,
+                        include_media_dupes: bool = False) -> Dict[str, Any]:
         """
         Convert token info to API dict.
 
@@ -2718,6 +3369,12 @@ class GlyphIndex:
         page of icon-heavy tokens otherwise ships megabytes per page and blows
         the ElectrumX per-session bandwidth budget (the session gets dropped
         mid-pagination). Single-token endpoints keep the full payload.
+
+        ``include_media_dupes=True`` adds ``media_sha256`` and ``media_duplicates`` (a bounded
+        count of tokens sharing that media). DETAIL responses only, and off by default: the count
+        costs a GMH prefix scan per token, which on a 500-row list page would be 500 scans. A
+        client uses ``media_duplicates > 1`` as the trigger to fetch /media/{sha256}/glyphs, so it
+        never has to probe that endpoint speculatively.
         """
         txid, vout = unpack_ref(token.ref)
         
@@ -2855,6 +3512,22 @@ class GlyphIndex:
             result['is_wave_duplicate'] = token.is_wave_duplicate
             if token.is_wave_duplicate:
                 result['wave_warning'] = 'This is a DUPLICATE WAVE name registration. It is NOT used for name resolution. Only the first (canonical) registration is authoritative.'
+
+        # Media-reuse discovery (detail responses only — see include_media_dupes).
+        if include_media_dupes and token.embedded_data_hash:
+            try:
+                n = self.count_tokens_by_media_hash(token.embedded_data_hash)
+                # .hex(), NOT hash_to_hex_str: that reverses byte order for txid display, which
+                # would produce a string no client-computed sha256(file) could ever match. Matches
+                # what get_tokens_by_media_hash echoes back, so the two agree.
+                result['media_sha256'] = token.embedded_data_hash.hex()
+                # `capped` distinguishes "exactly 51" from "at least 51", so a client can render
+                # "50+" instead of a wrong exact figure.
+                result['media_duplicates'] = n
+                result['media_duplicates_capped'] = n >= 51
+            except Exception:
+                # A discovery extra must never break a token detail response.
+                self.logger.exception('media duplicate count failed for %s', token.ref.hex())
 
         # Several fields here are carried verbatim from the on-chain CBOR
         # metadata with no type coercion — `attrs` (an arbitrary NFT-attribute

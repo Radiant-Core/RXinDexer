@@ -266,6 +266,7 @@ def _make_bp():
     bp.predict_index = None
     bp.royalty_index = None
     bp.analytics_index = None
+    bp.hashmark_index = None
     bp.subscriptions = None
     bp.dmint_contracts = None
     return bp

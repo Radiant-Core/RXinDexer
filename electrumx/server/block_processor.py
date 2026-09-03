@@ -83,6 +83,14 @@ except ImportError:
     HAS_ROYALTY_INDEX = False
     RoyaltyIndex = None
 
+# Import HashMarkIndex for HashMark digest lookups
+try:
+    from electrumx.server.hashmark_index import HashMarkIndex
+    HAS_HASHMARK_INDEX = True
+except ImportError:
+    HAS_HASHMARK_INDEX = False
+    HashMarkIndex = None
+
 try:
     from electrumx.server.analytics_index import AnalyticsIndex
     HAS_ANALYTICS_INDEX = True
@@ -264,6 +272,8 @@ class BlockProcessor:
         self.reorg_count = None
         self.height = -1
         self.tip = None
+        # Hash of the block currently being advanced; set by _advance_block for advance_txs.
+        self._block_hash = None
         self.tx_count = 0
         self._caught_up_event = None
 
@@ -317,6 +327,11 @@ class BlockProcessor:
         if HAS_ROYALTY_INDEX and getattr(env, 'royalty_index', False):
             self.royalty_index = RoyaltyIndex(db, env)
             self.logger.info('Royalty-listing (RRYL) discovery indexing initialized')
+        # HashMark digest indexing (backfilled from the daemon on first enable)
+        self.hashmark_index = None
+        if HAS_HASHMARK_INDEX and getattr(env, 'hashmark_index', False):
+            self.hashmark_index = HashMarkIndex(db, env)
+            self.logger.info('HashMark digest indexing initialized')
         self.analytics_index = None
         if HAS_ANALYTICS_INDEX and getattr(env, 'analytics_index', True):
             self.analytics_index = AnalyticsIndex(db, env)
@@ -388,6 +403,7 @@ class BlockProcessor:
                 swap_index=self.swap_index,
                 predict_index=self.predict_index,
                 royalty_index=self.royalty_index,
+                hashmark_index=self.hashmark_index,
                 analytics_index=self.analytics_index,
                 dmint_contracts=self.dmint_contracts,
             )
@@ -475,6 +491,7 @@ class BlockProcessor:
                          swap_index=self.swap_index,
                          predict_index=self.predict_index,
                          royalty_index=self.royalty_index,
+                         hashmark_index=self.hashmark_index,
                          analytics_index=self.analytics_index,
                          dmint_contracts=self.dmint_contracts)
         # Invalidate cached balances for any addresses touched by this flush.
@@ -528,6 +545,8 @@ class BlockProcessor:
             index_cache_size += self.predict_index.memory_estimate()
         if self.royalty_index is not None:
             index_cache_size += self.royalty_index.memory_estimate()
+        if self.hashmark_index is not None:
+            index_cache_size += self.hashmark_index.memory_estimate()
         if self.analytics_index is not None:
             index_cache_size += self.analytics_index.memory_estimate()
         utxo_MB = (db_deletes_size + utxo_cache_size) // one_MB
@@ -601,6 +620,11 @@ class BlockProcessor:
             self._current_block_time = 0
 
         is_unspendable = is_unspendable_legacy
+        # The HashMark index stores the block hash alongside every record, so make it available to
+        # advance_txs before the transactions are walked (it is the same hash used for self.tip
+        # below, so this costs no extra hashing).
+        block_hash = self.coin.header_hash(block.header)
+        self._block_hash = block_hash
         undo_info, ref_loc_undo_info = self.advance_txs(block.transactions, is_unspendable)
         if height >= min_height:
             self.undo_infos.append((undo_info, height))
@@ -609,7 +633,7 @@ class BlockProcessor:
 
         self.height = height
         self.headers.append(block.header)
-        self.tip = self.coin.header_hash(block.header)
+        self.tip = block_hash
 
         await sleep(0)
 
@@ -846,6 +870,20 @@ class BlockProcessor:
             append_hashXs(hashXs)
             update_touched(hashXs)
             update_touched(refs)
+
+            # HashMark digest records.  Deliberately outside the glyph_index guard below: a
+            # HashMark is a plain data output with no Glyph envelope, so it must still be indexed
+            # on a node running with GLYPH_INDEX=0.
+            if self.hashmark_index:
+                try:
+                    self.hashmark_index.process_tx(tx_hash, tx, self.height + 1, self._block_hash)
+                except MemoryError:
+                    raise
+                except Exception:
+                    self.logger.exception(
+                        'hashmark_index.process_tx failed for tx %s at height %d; skipping',
+                        hash_to_hex_str(tx_hash), self.height + 1
+                    )
 
             # Process transaction for Glyph tokens
             if self.glyph_index:
@@ -1350,6 +1388,9 @@ class BlockProcessor:
                 await group.spawn(self._process_blocks())
                 if self.analytics_index and self.height >= 0:
                     await group.spawn(self.analytics_index.backfill(self.height, caught_up_event))
+                if self.hashmark_index and self.height >= 0:
+                    await group.spawn(self.hashmark_index.backfill(
+                        self.height, self.daemon, caught_up_event))
 
                 async for task in group:
                     if not task.cancelled():

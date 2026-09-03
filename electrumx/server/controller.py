@@ -147,6 +147,7 @@ class Controller(ServerBase):
                     wave_index=getattr(bp, 'wave_index', None),
                     swap_index=getattr(bp, 'swap_index', None),
                     royalty_index=getattr(bp, 'royalty_index', None),
+                    hashmark_index=getattr(bp, 'hashmark_index', None),
                     analytics_index=getattr(bp, 'analytics_index', None),
                     dmint_contracts=getattr(bp, 'dmint_contracts', None),
                     mempool=mempool,
