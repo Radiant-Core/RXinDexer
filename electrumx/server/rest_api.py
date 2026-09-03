@@ -484,6 +484,7 @@ async def _security_middleware(request: Request, call_next):
         '/hashmark', '/hashmark/',
         '/creators', '/creators/',
         '/media', '/media/',
+        '/declarations', '/declarations/',
         '/containers', '/containers/', '/container', '/container/',
         '/users', '/users/',
         '/mempool', '/mempool/',
@@ -525,6 +526,7 @@ _wave_index = None
 _swap_index = None
 _royalty_index = None
 _hashmark_index = None
+_declaration_index = None
 _analytics_index = None
 _dmint_contracts = None
 _mempool = None
@@ -534,10 +536,10 @@ _start_time = time.time()
 
 
 def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
-                royalty_index=None, hashmark_index=None, analytics_index=None,
-                dmint_contracts=None, mempool=None):
+                royalty_index=None, hashmark_index=None, declaration_index=None,
+                analytics_index=None, dmint_contracts=None, mempool=None):
     """Set the indexer references from the main server."""
-    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _hashmark_index, _analytics_index, _dmint_contracts, _mempool
+    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _hashmark_index, _declaration_index, _analytics_index, _dmint_contracts, _mempool
     _glyph_index = glyph_index
     _db = db
     _daemon = daemon
@@ -545,6 +547,7 @@ def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
     _swap_index = swap_index
     _royalty_index = royalty_index
     _hashmark_index = hashmark_index
+    _declaration_index = declaration_index
     _analytics_index = analytics_index
     _dmint_contracts = dmint_contracts
     _mempool = mempool
@@ -911,6 +914,114 @@ async def search_glyphs(
         return {"query": q, "mode": "exact", "results": result, "count": len(result)}
     except Exception as e:
         raise _internal_error(e)
+
+
+# =============================================================================
+# CANON DECLARATIONS (discovery only — pointers and hints, never a verdict)
+# =============================================================================
+
+def _ensure_declarations():
+    if not _declaration_index:
+        raise HTTPException(status_code=503, detail="Declaration index not available")
+
+
+def _declaration_cursor(cursor: Optional[str]) -> Optional[bytes]:
+    if not cursor:
+        return None
+    try:
+        return bytes.fromhex(cursor)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+
+@app.get("/declarations/stats", tags=["Declarations"])
+async def declaration_stats():
+    """Declaration index status, including backfill progress and whether signatures are checked.
+
+    `signature_verification: false` means `sig_valid` on every row is null — UNCHECKED, not
+    invalid. That distinction matters: treating null as invalid silently discards valid
+    declarations on a node without the optional `coincurve` dependency.
+    """
+    _ensure_declarations()
+    try:
+        return _declaration_index.stats()
+    except Exception as e:
+        raise _internal_error(e, "declaration_stats")
+
+
+@app.post("/declarations/scan/{txid}", tags=["Declarations"])
+async def declaration_scan_txid(
+    txid: str = Path(..., min_length=64, max_length=64, description="Confirmed txid to scan"),
+):
+    """Index the declarations in one known transaction, immediately.
+
+    Two daemon calls instead of a chain rescan — the right tool when you already know the txid,
+    since backfill cost is per-block while declarations are rare. Confirmed transactions only.
+
+    POST, so the security middleware requires an API key.
+    """
+    _ensure_declarations()
+    if not _daemon:
+        raise HTTPException(status_code=503, detail="Daemon not available")
+    try:
+        bytes.fromhex(txid)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="txid must be 64 hex chars")
+
+    try:
+        result = await _declaration_index.scan_txid(txid, _daemon)
+    except Exception as e:
+        raise _internal_error(e, "declaration_scan_txid")
+    if 'error' in result:
+        raise HTTPException(status_code=400, detail=result['error'])
+    return result
+
+
+@app.get("/declarations/by-ref/{ref}", tags=["Declarations"])
+async def declarations_by_ref(
+    ref: str = Path(..., min_length=72, max_length=72, description="72-hex ref"),
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Declarations naming this ref, height-ascending.
+
+    Discovery only: rows are pointers plus hints. `sig_valid` is a hint (null = unchecked), and a
+    row means only that a schema-valid document naming this ref was revealed on chain at that
+    height — never that its claim is true. Anyone can sign a document about a ref they do not own.
+    Re-verify client-side before showing anything as authoritative.
+    """
+    _ensure_declarations()
+    try:
+        ref_bytes = bytes.fromhex(ref)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ref must be 72 hex chars")
+    if len(ref_bytes) != 36:
+        raise HTTPException(status_code=400, detail="ref must be 72 hex chars")
+
+    try:
+        return _declaration_index.get_by_ref(
+            ref_bytes, limit=limit, cursor=_declaration_cursor(cursor))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _internal_error(e, "declarations_by_ref")
+
+
+@app.get("/declarations/by-signer/{address}", tags=["Declarations"])
+async def declarations_by_signer(
+    address: str = Path(..., min_length=1, max_length=90, description="Signing address"),
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Declarations signed by this address, height-ascending. Same caveats as by-ref."""
+    _ensure_declarations()
+    try:
+        return _declaration_index.get_by_signer(
+            address, limit=limit, cursor=_declaration_cursor(cursor))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _internal_error(e, "declarations_by_signer")
 
 
 _MEDIA_HASH_PATH = Path(..., min_length=64, max_length=64,

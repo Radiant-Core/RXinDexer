@@ -107,6 +107,17 @@ class Env(EnvBase):
         # off a background historic backfill (see HashMarkIndex.backfill), which re-reads every
         # block from the daemon once.  Set HASHMARK_INDEX=0 to skip it.
         self.hashmark_index = False if minimal else self.boolean('HASHMARK_INDEX', True)
+        # Canon declaration index (/declarations/*). Scans INPUT scripts, so enabling it on a
+        # synced node needs a daemon rescan (input scripts are not retained in the DB) rather
+        # than the in-place metadata backfills the glyph indexes use. Default OFF.
+        self.declaration_index = False if minimal else self.boolean('DECLARATION_INDEX', False)
+        # Signature checking needs the optional coincurve dependency; when unavailable
+        # sig_valid is reported as null (UNCHECKED), never as false.
+        self.declaration_verify_signatures = self.boolean('DECLARATION_VERIFY_SIGNATURES', True)
+        # Height the canon-declaration format was introduced. The backfill scans from here
+        # rather than 0, because a daemon rescan costs per-block while declarations are rare;
+        # documents cannot exist below this height.
+        self.declaration_start_height = self.integer('DECLARATION_START_HEIGHT', 0)
         self.analytics_index = False if minimal else self.boolean('ANALYTICS_INDEX', True)
         self.glyph_subscriptions = False if minimal else self.boolean('GLYPH_SUBSCRIPTIONS', True)
         self.mempool_glyph_index = False if minimal else self.boolean('MEMPOOL_GLYPH_INDEX', True)
