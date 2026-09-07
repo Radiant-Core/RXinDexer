@@ -651,6 +651,10 @@ class GlyphIndex:
         # it is touched within a given height.
         self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
         self._undo_seen: Dict[int, Set[bytes]] = defaultdict(set)
+        # Lowest height worth recording undo for; set per block by the block processor from
+        # db.min_undo_height(daemon.cached_height()), matching the core UTXO path. 0 means
+        # "record everything", the safe default if nothing ever sets it.
+        self.undo_min_height = 0
 
         # Undo retention: keep at most env.reorg_limit heights of undo data.
         # We do not try to retroactively delete historical keys on startup; we
@@ -2166,14 +2170,42 @@ class GlyphIndex:
         return GlyphDBKeys.UNDO + pack_be_uint32(height)
     
     def _record_undo(self, height: int, key: bytes):
-        """Record undo information for a key."""
+        """Record undo information for a key that may already hold a value.
+
+        Costs one random DB read per key, which is why the two gates below matter: at dMint-era
+        block density this is called on the order of a million times per flush, and a random read
+        is ~20-30us on disk-backed RocksDB.
+        """
         if not self.enabled:
+            return
+        # Blocks below the reorg window can never be unwound, so undo for them is written and then
+        # pruned unread. The core UTXO path already skips it the same way (see _advance_block's
+        # `if height >= min_height`); during a long catch-up this is nearly every block.
+        if height < self.undo_min_height:
             return
         if key in self._undo_seen[height]:
             return
         self._undo_seen[height].add(key)
         prev_value = self.db.utxo_db.get(key)
         self._undo_cache[height].append((key, prev_value))
+
+    def _record_undo_insert(self, height: int, key: bytes):
+        """Record undo for a key that CANNOT already exist — no DB read.
+
+        Valid only where the key is written at exactly one height, so the previous value is
+        provably None: history rows (GH + ref + height + tx_idx embeds the height) and the
+        pair-keyed derived indexes (GCM/GMT/GA/GMH/GDH), each written once when its token is
+        revealed. Using this where a key can be rewritten at a later height would make a reorg
+        delete a row that legitimately predates it.
+        """
+        if not self.enabled:
+            return
+        if height < self.undo_min_height:
+            return
+        if key in self._undo_seen[height]:
+            return
+        self._undo_seen[height].add(key)
+        self._undo_cache[height].append((key, None))
     
     def backup(self, batch, height: int):
         """Revert DB keys written at the given height (reorg unwind)."""
@@ -2455,7 +2487,7 @@ class GlyphIndex:
             c_height = self.container_member_height.get(container_ref_bytes, self.db.db_height) or 0
             for member_ref in member_refs:
                 key = GlyphDBKeys.CONTAINER_MEMBERS + container_ref_bytes + member_ref
-                self._record_undo(c_height, key)
+                self._record_undo_insert(c_height, key)
                 batch.put(key, b'')
 
         # Flush metadata type index (GMT + type_hash(16) + ref(36) -> empty)
@@ -2464,7 +2496,7 @@ class GlyphIndex:
             mt_height = self.meta_type_height.get(meta_type_str, self.db.db_height) or 0
             for ref in refs:
                 key = GlyphDBKeys.BY_META_TYPE + type_hash + ref
-                self._record_undo(mt_height, key)
+                self._record_undo_insert(mt_height, key)
                 batch.put(key, b'')
 
         # Flush creator attribution index (GA + creator_ref(36) + work_ref(36) -> empty)
@@ -2472,7 +2504,7 @@ class GlyphIndex:
             cr_height = self.creator_works_height.get(creator_ref_bytes, self.db.db_height) or 0
             for work_ref in work_refs:
                 key = GlyphDBKeys.BY_CREATOR + creator_ref_bytes + work_ref
-                self._record_undo(cr_height, key)
+                self._record_undo_insert(cr_height, key)
                 batch.put(key, b'')
 
         # Flush media-duplicate index (GMH + media_sha256(32) + ref(36) -> empty)
@@ -2480,7 +2512,7 @@ class GlyphIndex:
             mh_height = self.media_hash_height.get(media_hash, self.db.db_height) or 0
             for ref in refs:
                 key = GlyphDBKeys.MEDIA_HASH + media_hash + ref
-                self._record_undo(mh_height, key)
+                self._record_undo_insert(mh_height, key)
                 batch.put(key, b'')
 
         # Flush whole-payload clone index (GDH + metadata_hash(32) + ref(36) -> empty)
@@ -2488,7 +2520,7 @@ class GlyphIndex:
             ph_height = self.payload_hash_height.get(payload_hash, self.db.db_height) or 0
             for ref in refs:
                 key = GlyphDBKeys.PAYLOAD_HASH + payload_hash + ref
-                self._record_undo(ph_height, key)
+                self._record_undo_insert(ph_height, key)
                 batch.put(key, b'')
 
         # R11: Flush incremental stats counter
