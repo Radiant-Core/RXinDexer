@@ -118,6 +118,10 @@ class Env(EnvBase):
         # rather than 0, because a daemon rescan costs per-block while declarations are rare;
         # documents cannot exist below this height.
         self.declaration_start_height = self.integer('DECLARATION_START_HEIGHT', 0)
+        # One-shot rescan that reconstructs singleton ref location chains for blocks indexed
+        # before that code existed. Off by default; it re-reads the chain from the daemon.
+        # NOTE boolean() treats ANY non-empty value as true — use an EMPTY value for false.
+        self.ref_history_backfill = self.boolean('REF_HISTORY_BACKFILL', False)
         self.analytics_index = False if minimal else self.boolean('ANALYTICS_INDEX', True)
         self.glyph_subscriptions = False if minimal else self.boolean('GLYPH_SUBSCRIPTIONS', True)
         self.mempool_glyph_index = False if minimal else self.boolean('MEMPOOL_GLYPH_INDEX', True)

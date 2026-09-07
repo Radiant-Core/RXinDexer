@@ -212,7 +212,7 @@ class TestCursorShape:
         assert cursor is not None
         # 256-byte cap from docs/pagination-cursors.md.
         assert len(cursor.encode()) <= 256
-        # In practice: HISTORY key is 44 raw bytes → 60 base64 chars.
+        # In practice: HISTORY key is 46 raw bytes → 64 base64 chars (tx_idx widened in v9).
         assert len(cursor.encode()) < 100
 
     def test_malformed_cursor_does_not_crash(self):

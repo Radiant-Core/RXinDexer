@@ -37,7 +37,7 @@ from electrumx.server.db import FlushData
 
 # Import GlyphIndex for token indexing
 try:
-    from electrumx.server.glyph_index import GlyphIndex
+    from electrumx.server.glyph_index import GlyphIndex, GlyphEventType
     HAS_GLYPH_INDEX = True
 except ImportError:
     HAS_GLYPH_INDEX = False
@@ -90,6 +90,14 @@ try:
 except ImportError:
     HAS_DECLARATION_INDEX = False
     DeclarationIndex = None
+
+# Import the ref-history backfill (one-shot rescan for singleton location chains)
+try:
+    from electrumx.server.ref_history_backfill import RefHistoryBackfill
+    HAS_REF_HISTORY_BACKFILL = True
+except ImportError:
+    HAS_REF_HISTORY_BACKFILL = False
+    RefHistoryBackfill = None
 
 # Import HashMarkIndex for HashMark digest lookups
 try:
@@ -340,6 +348,11 @@ class BlockProcessor:
         if HAS_HASHMARK_INDEX and getattr(env, 'hashmark_index', False):
             self.hashmark_index = HashMarkIndex(db, env)
             self.logger.info('HashMark digest indexing initialized')
+        self.ref_history_backfill = None
+        if HAS_REF_HISTORY_BACKFILL and self.glyph_index:
+            self.ref_history_backfill = RefHistoryBackfill(db, env, self.glyph_index)
+            if self.ref_history_backfill.enabled:
+                self.logger.info('Ref-history backfill enabled (one-shot rescan)')
         self.declaration_index = None
         if HAS_DECLARATION_INDEX and getattr(env, 'declaration_index', False):
             self.declaration_index = DeclarationIndex(db, env)
@@ -627,6 +640,13 @@ class BlockProcessor:
         min_height = self.db.min_undo_height(self.daemon.cached_height())
         height = self.height + 1
 
+        # Share the reorg-window floor with the glyph index so it can skip undo bookkeeping for
+        # blocks that can never be unwound, exactly as the `height >= min_height` gate below does
+        # for core undo info. Each glyph undo entry costs a random DB read, and at dMint-era block
+        # density that is ~1M reads per flush — all of it pruned unread during a long catch-up.
+        if self.glyph_index is not None:
+            self.glyph_index.undo_min_height = min_height
+
         # Header timestamp for this block, consumed by the WAVE name-lifecycle
         # logic inside advance_txs (expiry stamping / renewals / supersession).
         # 80-byte header, little-endian uint32 time at offset 68.
@@ -723,6 +743,10 @@ class BlockProcessor:
             balance_credits = []
             # Singleton refs consumed by inputs (for burn detection)
             spent_singleton_refs = set() if self.glyph_index else None
+            # Singleton refs this tx RE-CREATES in its outputs. Diffed against
+            # spent_singleton_refs below to find melts: a ref consumed by an input and not
+            # carried forward, which ends its location chain.
+            recreated_singletons = set() if self.glyph_index else None
 
             # Spend the inputs
             for txin in tx.inputs:
@@ -835,7 +859,50 @@ class BlockProcessor:
                     if len(refs_value):
                         put_refs(cache_key, refs_value)
 
+                    # Collect credit for Glyph balance tracking.  The ownership index
+                    # is keyed by the recipient's *base address* hashX (the locking
+                    # script with the Radiant ref preamble stripped) rather than the
+                    # token output's own (ref-wrapped) hashX, so that a wallet can
+                    # list the tokens it holds using its normal address scripthash.
+                    # The base hashX is persisted per-outpoint (b'rb' + outpoint) so
+                    # the matching debit can be applied symmetrically on spend.
+                    #
+                    # Computed HERE, above the singleton loop, because record_ref_hop
+                    # stores this same base hashX: the location chain resolves a holder
+                    # through the GO index, which is keyed by base hashX.  Passing the
+                    # output's own ref-wrapped `hashX` instead made every lookup miss
+                    # and every holder_address come back null.  Reset per output, or a
+                    # previous output's holder would leak into a ref-less one.
+                    base_hashX = b''
+                    if self.glyph_index and all_refs_dedup:
+                        base_script = Script.base_locking_script(txout.pk_script)
+                        base_hashX = script_hashX(base_script)
+                        put_data(b'rb' + cache_key, base_hashX)
+                        # Carry base_script so the glyph index can persist a
+                        # resolvable owner identity (GO: hashX -> base scriptPubKey).
+                        balance_credits.append((base_hashX, txout.value,
+                                                list(all_refs_dedup.keys()), base_script))
+
                     for ref in singleton_refs_dedup.keys():
+                        # Record this hop in the ref's location chain. This is the only place the
+                        # mint/transfer distinction is already computed, and the vout and holder
+                        # hashX are both in scope here — reconstructing either later would need a
+                        # daemon rescan.
+                        if self.glyph_index:
+                            recreated_singletons.add(ref)
+                            event = (GlyphEventType.MINT if ref in spent_outpoints
+                                     else GlyphEventType.TRANSFER)
+                            # A dMint mining contract is re-created by every mint, so its
+                            # TRANSFER hops are pure churn -- half the GH keyspace on mainnet
+                            # (see GlyphIndex.is_plumbing_singleton). Keep the MINT and MELT
+                            # endpoints for those refs and drop the middle.
+                            if (event != GlyphEventType.TRANSFER
+                                    or not self.glyph_index.is_plumbing_singleton(ref)):
+                                self.glyph_index.record_ref_hop(
+                                    ref, event,
+                                    tx_hash, self.height + 1, tx_num - self.tx_count,
+                                    idx, base_hashX,
+                                )
                         if ref in spent_outpoints:  # R13: O(1) lookup
                             # Track singleton ref mints
                             mints.add(ref)
@@ -862,26 +929,20 @@ class BlockProcessor:
                     # We could check for refs used in inputs that are burnt in this tx,
                     # but current burn implementations are done using op return so this may not be needed
 
-                    # Collect credit for Glyph balance tracking.  The ownership index
-                    # is keyed by the recipient's *base address* hashX (the locking
-                    # script with the Radiant ref preamble stripped) rather than the
-                    # token output's own (ref-wrapped) hashX, so that a wallet can
-                    # list the tokens it holds using its normal address scripthash.
-                    # The base hashX is persisted per-outpoint (b'rb' + outpoint) so
-                    # the matching debit can be applied symmetrically on spend.
-                    if self.glyph_index and all_refs_dedup:
-                        base_script = Script.base_locking_script(txout.pk_script)
-                        base_hashX = script_hashX(base_script)
-                        put_data(b'rb' + cache_key, base_hashX)
-                        # Carry base_script so the glyph index can persist a
-                        # resolvable owner identity (GO: hashX -> base scriptPubKey).
-                        balance_credits.append((base_hashX, txout.value,
-                                                list(all_refs_dedup.keys()), base_script))
                 except (ScriptError, AssertionError, ValueError, IndexError) as e:
                     self.logger.warning(
                         'skipping refs for malformed output %s:%d (%s); '
                         'treating output as ref-less',
                         hash_to_hex_str(tx_hash), idx, e)
+
+            # Melts: refs the inputs consumed that no output re-created. Recorded with no vout
+            # (NO_VOUT) because there is no output to point at — the ref simply ends here.
+            if self.glyph_index and spent_singleton_refs:
+                for ref in spent_singleton_refs - recreated_singletons:
+                    self.glyph_index.record_ref_hop(
+                        ref, GlyphEventType.MELT, tx_hash, self.height + 1,
+                        tx_num - self.tx_count, None, b'',
+                    )
 
             append_hashXs(hashXs)
             update_touched(hashXs)
@@ -1423,6 +1484,9 @@ class BlockProcessor:
                         self.height, self.daemon, caught_up_event))
                 if self.declaration_index and self.height >= 0:
                     await group.spawn(self.declaration_index.backfill(
+                        self.height, self.daemon, caught_up_event))
+                if self.ref_history_backfill and self.height >= 0:
+                    await group.spawn(self.ref_history_backfill.backfill(
                         self.height, self.daemon, caught_up_event))
 
                 async for task in group:

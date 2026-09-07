@@ -61,7 +61,14 @@ from electrumx.lib.glyph import (
     wave_full_name_from_token as _wave_full_name,
 )
 from electrumx.lib.hash import hash_to_hex_str
+from electrumx.lib.util import unpack_be_uint32
 from electrumx.server import metrics as _metrics
+try:
+    # Optional, like the block processor's guarded import: the status endpoint reads the
+    # backfill's checkpoint keys directly, so it needs the constants but not the class.
+    from electrumx.server.ref_history_backfill import RefHistoryBackfillKeys
+except ImportError:                                          # pragma: no cover
+    RefHistoryBackfillKeys = None
 from electrumx.server.hashmark_index import (
     DEFAULT_LIMIT as HASHMARK_DEFAULT_LIMIT,
     MAX_LIMIT as HASHMARK_MAX_LIMIT,
@@ -485,6 +492,8 @@ async def _security_middleware(request: Request, call_next):
         '/creators', '/creators/',
         '/media', '/media/',
         '/declarations', '/declarations/',
+        # Read-only rescan progress, alongside /hashmark/stats and /declarations/status.
+        '/ref-history', '/ref-history/',
         '/containers', '/containers/', '/container', '/container/',
         '/users', '/users/',
         '/mempool', '/mempool/',
@@ -1564,6 +1573,78 @@ async def get_top_token_holders(
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
         raise _internal_error(e)
+
+
+@app.get("/ref-history/status", tags=["Token Analytics"])
+async def get_ref_history_backfill_status():
+    """Progress of the one-shot rescan that reconstructs singleton location chains.
+
+    Mirrors /hashmark/stats and /declarations/status. Until this reports `complete`, an empty or
+    short `rows` from /tokens/{ref}/locations may mean "not scanned back that far yet" rather
+    than "the ref never moved" — the same distinction those endpoints exist to make.
+
+    Read straight from the checkpoint keys rather than from the backfill object, so it answers
+    whether or not the rescan is enabled in this process.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    if RefHistoryBackfillKeys is None:
+        raise HTTPException(status_code=503, detail="Ref-history backfill not available")
+
+    try:
+        get = _db.utxo_db.get
+        done = bool(get(RefHistoryBackfillKeys.DONE))
+        raw_cursor = get(RefHistoryBackfillKeys.CURSOR)
+        raw_target = get(RefHistoryBackfillKeys.TARGET)
+        target = unpack_be_uint32(raw_target)[0] if raw_target else None
+        cursor = unpack_be_uint32(raw_cursor)[0] if raw_cursor else None
+        pct = None
+        if not done and cursor is not None and target:
+            pct = round(100.0 * cursor / target, 2)
+        return {
+            "complete": done,
+            "started": target is not None,
+            "next_height": None if done else cursor,
+            "target_height": target,
+            "percent": 100.0 if done else pct,
+        }
+    except Exception as e:
+        raise _internal_error(e, "ref_history_status")
+
+
+@app.get("/tokens/{ref}/locations", tags=["Token Analytics"])
+async def get_token_locations(
+    ref: str = _REF_PATH,
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """A singleton ref's location chain, height-ascending.
+
+    A singleton's life is a chain of outpoints: `mint` -> each spend that re-creates the ref
+    (`transfer`) -> the current UTXO, or a `melt`. `blockchain.ref.get` returns only the two
+    endpoints; these are the hops between them.
+
+    **Singletons only.** An FT ref multiplies across outputs, so "location" is not a property it
+    has — those return an empty `rows` with a `note`.
+
+    Rows are pointers plus hints, never verdicts: `holder_address` is a display convenience
+    resolved from the owner index and may be null for a non-P2PKH holder or an unindexed one, and
+    a `melt` row has no `vout` because the ref was consumed rather than re-created.
+
+    Separate from `/tokens/{ref}/history`, which keeps its existing response shape (and now also
+    carries the transfer/melt events, since both read the same keyspace).
+    """
+    _ensure_glyph_index()
+
+    try:
+        ref_bytes = _resolve_ref(ref)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+
+    try:
+        return _glyph_index.get_ref_location_history(ref_bytes, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e, "get_token_locations")
 
 
 @app.get("/tokens/{ref}/history", tags=["Token Analytics"])
