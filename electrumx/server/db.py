@@ -246,37 +246,65 @@ class DB(object):
         # Then history
         self.flush_history()
 
+        # Per-phase timing. The wall time between "committing..." and the flush's own summary was
+        # ~32s with no accounting for it, which made tuning guesswork: the candidates (building
+        # index keys vs the RocksDB batch commit itself) live in the same unmeasured span. These
+        # timers cost one perf_counter per phase and are logged once per flush.
+        _phase = {}
+        _t = time.perf_counter()
+
         # Flush state last as it reads the wall time.
         with self.utxo_db.write_batch() as batch:
             if flush_utxos:
                 self.flush_utxo_db(batch, flush_data)
+            _phase['utxo'] = time.perf_counter() - _t; _t = time.perf_counter()
             # Flush Glyph index data
             if glyph_index:
                 glyph_index.flush(batch)
+            _phase['glyph'] = time.perf_counter() - _t; _t = time.perf_counter()
             # Flush WAVE index data
             if wave_index:
                 wave_index.flush(batch)
+            _phase['wave'] = time.perf_counter() - _t; _t = time.perf_counter()
             # Flush realm directory index data
             if realm_index:
                 realm_index.flush(batch)
+            _phase['realm'] = time.perf_counter() - _t; _t = time.perf_counter()
             # Flush Swap index data
             if swap_index:
                 swap_index.flush(batch)
+            _phase['swap'] = time.perf_counter() - _t; _t = time.perf_counter()
             if predict_index:
                 predict_index.flush(batch)
+            _phase['predict'] = time.perf_counter() - _t; _t = time.perf_counter()
             if royalty_index:
                 royalty_index.flush(batch)
+            _phase['royalty'] = time.perf_counter() - _t; _t = time.perf_counter()
             if hashmark_index:
                 hashmark_index.flush(batch)
+            _phase['hashmark'] = time.perf_counter() - _t; _t = time.perf_counter()
             if declaration_index:
                 declaration_index.flush(batch)
+            _phase['declaration'] = time.perf_counter() - _t; _t = time.perf_counter()
             if analytics_index:
                 analytics_index.flush(batch)
+            _phase['analytics'] = time.perf_counter() - _t; _t = time.perf_counter()
             self.flush_state(batch)
-        
+            _phase['state'] = time.perf_counter() - _t; _t = time.perf_counter()
+        # The batch commits on __exit__, so this is the RocksDB write itself — the phase the
+        # earlier logs could not distinguish from key building.
+        _phase['commit'] = time.perf_counter() - _t; _t = time.perf_counter()
+
         # Sync dMint contracts from Glyph index (after batch commit)
         if dmint_contracts and glyph_index:
             dmint_contracts.sync_from_index(flush_data.height)
+        _phase['dmint_sync'] = time.perf_counter() - _t
+
+        # Only phases that actually cost something, so the line stays readable as indexes are
+        # added; anything under 50ms is noise next to a 30s flush.
+        shown = ' '.join(f'{name} {secs:.1f}s'
+                         for name, secs in _phase.items() if secs >= 0.05)
+        self.logger.info('flush phases: %s', shown or 'all under 50ms')
 
         # Update and put the wall time again - otherwise we drop the
         # time it took to commit the batch

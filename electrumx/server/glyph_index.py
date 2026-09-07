@@ -3481,7 +3481,10 @@ class GlyphIndex:
             'ticker': token.ticker,
             'decimals': token.decimals,
             'description': token.description,
-            'author': token.author,
+            # Display form (txid_vout), matching `ref`/`container_ref`. Stored internally as
+            # reversed-txid + LE vout, which a consumer would otherwise have to un-reverse
+            # itself — the same byte-order trap as media_sha256 and codeScriptHash.
+            'author': self._ref_to_display(token.author),
             'license': token.license,
             # Deployment
             'deploy_height': token.deploy_height,
@@ -3678,6 +3681,17 @@ class GlyphIndex:
         }
         return names.get(token_type, 'Unknown')
     
+    @staticmethod
+    def _ref_to_display(ref_hex: Optional[str]) -> Optional[str]:
+        """72-hex internal ref -> "txid_vout", or the value unchanged if it is not one."""
+        if not ref_hex or not isinstance(ref_hex, str) or len(ref_hex) != 72:
+            return ref_hex
+        try:
+            raw = bytes.fromhex(ref_hex)
+        except ValueError:
+            return ref_hex
+        return f"{raw[:32][::-1].hex()}_{struct.unpack('<I', raw[32:36])[0]}"
+
     @staticmethod
     def _event_type_name(event_type: int) -> str:
         """Get event type name."""

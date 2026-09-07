@@ -1145,17 +1145,43 @@ async def get_glyphs_by_type(
 async def get_glyphs_recent(
     limit: int = Query(default=100, le=500),
     cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
-    type_id: Optional[int] = Query(default=None, ge=0, le=7, description="Optional token-type filter; omit for newest across all types"),
+    token_type: Optional[int] = Query(default=None, ge=0, le=7, description="Optional token-type filter; omit for newest across all types"),
+    type_id: Optional[int] = Query(default=None, ge=0, le=7, description="Deprecated alias for token_type"),
 ):
-    """Newest-deployed Glyph tokens (v4 discovery index), across all types or one type."""
+    """Newest-deployed Glyph tokens, height-descending (v4 discovery index).
+
+    This is the height-ordered listing: keys are `inv_height = 0xFFFFFFFF - deploy_height`, so a
+    forward prefix scan emerges newest-first without a reverse iterator. Filtered by type it reads
+    BY_TYPE_RECENT, unfiltered it reads GLOBAL_RECENT.
+
+    Pages with an opaque `cursor`, not `offset` — offset over a prefix scan is O(offset), and the
+    cursors are order-specific. That is why this ordering lives here rather than as a `sort=` on
+    `/glyphs`, which pages by offset.
+
+    `token_type` is the parameter name `/glyphs` uses; `type_id` is accepted as a deprecated alias
+    so existing callers keep working. Supplying both with different values is an error rather than
+    a silent pick.
+    """
     _ensure_glyph_index()
 
+    if token_type is not None and type_id is not None and token_type != type_id:
+        raise HTTPException(
+            status_code=400,
+            detail="token_type and type_id disagree; token_type is the current name, "
+                   "type_id its deprecated alias — supply one",
+        )
+    selected = token_type if token_type is not None else type_id
+
     try:
-        if type_id is not None:
-            result = _glyph_index.get_tokens_by_type(type_id, limit=limit, cursor=cursor, order="recent")
+        if selected is not None:
+            result = _glyph_index.get_tokens_by_type(selected, limit=limit, cursor=cursor, order="recent")
         else:
             result = _glyph_index.get_recent_tokens(limit=limit, cursor=cursor)
-        return {"type_id": type_id, "order": "recent", **result}
+        # Both names are echoed: `token_type` going forward, `type_id` so existing consumers that
+        # read it back are not broken by the rename.
+        return {"token_type": selected, "type_id": selected, "order": "recent", **result}
+    except HTTPException:
+        raise
     except Exception as e:
         raise _internal_error(e)
 
@@ -1366,7 +1392,11 @@ async def get_address_history(
                 owner_key = b'GO' + hashX
                 base_script = _db.utxo_db.get(owner_key)
                 if base_script:
-                    display_address = Script(base_script).address(coin)
+                    # Script has no .address() method, so the old call here always raised into
+                    # the bare except below and left display_address as None — which is why this
+                    # endpoint reported `address: null` even for addresses with a GO row.
+                    from electrumx.server.glyph_index import GlyphIndex
+                    display_address = GlyphIndex.script_to_address(base_script, coin)
         except Exception:
             pass
 
