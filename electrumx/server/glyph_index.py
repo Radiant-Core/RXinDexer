@@ -3884,6 +3884,16 @@ class GlyphIndex:
             'name': self._sanitize_str(payload.get('name'), 200),
             'ticker': self._sanitize_str(payload.get('ticker'), 16),
             'linked_ref': f"{linked_ref[:32][::-1].hex()}_{loc}",
+            # The artwork too. Photonic merges the whole payload, embeddedFiles and remoteFiles
+            # included, so a link record renders with the target's image; resolving only the
+            # name left consumers showing the right title over an empty frame.
+            'icon_ref': linked.icon_ref,
+            'icon_type': linked.icon_type,
+            'icon_size': linked.icon_size,
+            'embedded_data_hash': linked.embedded_data_hash,
+            # {...linked, ...own}: the link's own fields win, which is what makes this a merge
+            # rather than a redirect. The content block renders the file object from this.
+            'payload': {**payload, **own},
         }
 
     def _token_to_dict(self, token: GlyphTokenInfo, include_dmint: bool = True,
@@ -3961,49 +3971,54 @@ class GlyphIndex:
         
         # Include image/content info
         if include_content:
+            # A link record carries no media of its own; it inherits the target's.
+            embedded_hash = token.embedded_data_hash or (link or {}).get('embedded_data_hash')
             result.update({
-                'icon_ref': token.icon_ref,
-                'icon_type': token.icon_type,
-                'icon_size': token.icon_size,
-                'embedded_data_hash': hash_to_hex_str(token.embedded_data_hash) if token.embedded_data_hash else None,
+                'icon_ref': token.icon_ref or (link or {}).get('icon_ref'),
+                'icon_type': token.icon_type or (link or {}).get('icon_type'),
+                'icon_size': token.icon_size or (link or {}).get('icon_size'),
+                'embedded_data_hash': hash_to_hex_str(embedded_hash) if embedded_hash else None,
             })
             # Re-parse CBOR metadata to expose remote/embed for explorer image rendering
             # Classify files by content (like Photonic Wallet filterFileObj),
             # not by key name, since 'main' can be either embed or remote.
-            if token.metadata_hash:
+            # For a link record this is the MERGED payload, so the file object comes from the
+            # target; for everything else it is the token's own metadata, unchanged.
+            raw_meta = (link or {}).get('payload')
+            if raw_meta is None and token.metadata_hash:
                 raw_meta = self.get_metadata(token.metadata_hash)
-                if raw_meta and isinstance(raw_meta, dict):
-                    file_obj = None
-                    for fkey in ('main', 'preview', 'embed', 'em', 'remote', 'rm'):
-                        candidate = raw_meta.get(fkey)
-                        if isinstance(candidate, dict):
-                            file_obj = candidate
-                            break
-                    if file_obj:
-                        # Classify by content: 'u'/'url' = remote, 'b' = embed
-                        has_url = isinstance(file_obj.get('u'), str) or isinstance(file_obj.get('url'), str)
-                        raw_b = file_obj.get('b')
-                        has_bytes = isinstance(raw_b, (bytes, bytearray)) or hasattr(raw_b, 'value')
-                        if has_url:
-                            hs = file_obj.get('hs')
-                            result['remote'] = {
-                                'url': file_obj.get('u') or file_obj.get('url'),
-                                'type': file_obj.get('t') or file_obj.get('type'),
-                                'hash': (file_obj.get('h') or b'').hex() if isinstance(file_obj.get('h'), (bytes, bytearray)) else None,
-                                'hashstamp': (bytes(hs).hex() if isinstance(hs, (bytes, bytearray)) else None),
-                            }
-                        elif has_bytes:
-                            b = raw_b
-                            # CBORTag 64 = typed array; value may be hex str or bytes
-                            if hasattr(b, 'value'):
-                                b = bytes.fromhex(b.value) if isinstance(b.value, str) else b.value
-                            result['embed'] = {
-                                'type': file_obj.get('t') or file_obj.get('type'),
-                                'size': len(b) if isinstance(b, (bytes, bytearray)) else None,
-                                'data': (bytes(b).hex() if isinstance(b, (bytes, bytearray)) else None)
-                                        if include_embed_data else None,
-                            }
-        
+            if raw_meta and isinstance(raw_meta, dict):
+                file_obj = None
+                for fkey in ('main', 'preview', 'embed', 'em', 'remote', 'rm'):
+                    candidate = raw_meta.get(fkey)
+                    if isinstance(candidate, dict):
+                        file_obj = candidate
+                        break
+                if file_obj:
+                    # Classify by content: 'u'/'url' = remote, 'b' = embed
+                    has_url = isinstance(file_obj.get('u'), str) or isinstance(file_obj.get('url'), str)
+                    raw_b = file_obj.get('b')
+                    has_bytes = isinstance(raw_b, (bytes, bytearray)) or hasattr(raw_b, 'value')
+                    if has_url:
+                        hs = file_obj.get('hs')
+                        result['remote'] = {
+                            'url': file_obj.get('u') or file_obj.get('url'),
+                            'type': file_obj.get('t') or file_obj.get('type'),
+                            'hash': (file_obj.get('h') or b'').hex() if isinstance(file_obj.get('h'), (bytes, bytearray)) else None,
+                            'hashstamp': (bytes(hs).hex() if isinstance(hs, (bytes, bytearray)) else None),
+                        }
+                    elif has_bytes:
+                        b = raw_b
+                        # CBORTag 64 = typed array; value may be hex str or bytes
+                        if hasattr(b, 'value'):
+                            b = bytes.fromhex(b.value) if isinstance(b.value, str) else b.value
+                        result['embed'] = {
+                            'type': file_obj.get('t') or file_obj.get('type'),
+                            'size': len(b) if isinstance(b, (bytes, bytearray)) else None,
+                            'data': (bytes(b).hex() if isinstance(b, (bytes, bytearray)) else None)
+                                    if include_embed_data else None,
+                        }
+    
         # Include dMint-specific fields for minable tokens
         if include_dmint and GlyphProtocol.GLYPH_DMINT in token.protocols:
             result['dmint'] = {

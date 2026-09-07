@@ -26,7 +26,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from electrumx.server.glyph_index import GlyphIndex, pack_ref  # noqa: E402
+from electrumx.server.glyph_index import (  # noqa: E402
+    GlyphIndex, GlyphTokenInfo, pack_ref,
+)
 
 TXID = bytes([0x20]) * 32
 TARGET = pack_ref(TXID, 0)          # "Surfer on Acid"
@@ -37,11 +39,16 @@ OTHER_TXID = bytes([0x99]) * 32
 class _Token:
     """Minimal stand-in for GlyphTokenInfo: only what the resolver reads."""
 
-    def __init__(self, ref, name=None, ticker=None, metadata_hash=b''):
+    def __init__(self, ref, name=None, ticker=None, metadata_hash=b'',
+                 icon_ref=None, icon_type=None, icon_size=None, embedded_data_hash=None):
         self.ref = ref
         self.name = name
         self.ticker = ticker
         self.metadata_hash = metadata_hash
+        self.icon_ref = icon_ref
+        self.icon_type = icon_type
+        self.icon_size = icon_size
+        self.embedded_data_hash = embedded_data_hash
 
 
 def _index(tokens=None, metadata=None):
@@ -55,17 +62,33 @@ def _index(tokens=None, metadata=None):
     return idx
 
 
+
+def _real_token(ref, **fields):
+    """A genuine GlyphTokenInfo, because _token_to_dict reads far more of the record than the
+    resolver does -- live_contracts, percent_mined, the relationship refs. Stubbing them one at
+    a time just tracks the serialiser's field list."""
+    t = GlyphTokenInfo()
+    t.ref = ref
+    for k, v in fields.items():
+        setattr(t, k, v)
+    return t
+
+
 def _wired(link_payload, target_name='Surfer on Acid', target_ticker='SoA'):
     """The mainnet shape: a link at vout 33 pointing back at a named token at vout 0."""
     return _index(
         tokens={
             LINK: _Token(LINK, metadata_hash=b'LINKHASH'),
             TARGET: _Token(TARGET, name=target_name, ticker=target_ticker,
-                           metadata_hash=b'TARGETHASH'),
+                           metadata_hash=b'TARGETHASH', icon_ref='embedded',
+                           icon_type='image/jpeg', icon_size=4096,
+                           embedded_data_hash=bytes(range(32))),
         },
         metadata={
             b'LINKHASH': link_payload,
-            b'TARGETHASH': {'p': [1, 4], 'name': target_name, 'ticker': target_ticker},
+            b'TARGETHASH': {'p': [1, 4], 'name': target_name, 'ticker': target_ticker,
+                            'main': {'t': 'image/jpeg',
+                                     'b': bytes([0xFF, 0xD8]) + b'jpegbytes'}},
         },
     )
 
@@ -190,3 +213,68 @@ def test_pack_ref_round_trip_matches_the_resolver_arithmetic():
 
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-v']))
+
+
+# ------------------------------------------------------------------ the artwork, not just the name
+#
+# Reported by CoinFlow after the first pass shipped: _33 resolved to "Surfer on Acid"/SoA but came
+# back icon_type: null, embed: null, so listings showed the right title over an empty frame.
+# Photonic merges the WHOLE payload -- embeddedFiles and remoteFiles included -- so the media has
+# to travel with the name.
+
+def test_the_resolver_carries_the_targets_media():
+    idx = _wired({'p': [2], 'loc': 0})
+    got = idx._resolve_link_payload(idx.get_token(LINK))
+    assert got['icon_type'] == 'image/jpeg'
+    assert got['icon_ref'] == 'embedded'
+    assert got['icon_size'] == 4096
+    assert got['embedded_data_hash'] == bytes(range(32))
+
+
+def test_the_merged_payload_keeps_the_targets_file_object():
+    """The content block renders `embed`/`remote` from this, so the file object must survive."""
+    idx = _wired({'p': [2], 'loc': 0})
+    payload = idx._resolve_link_payload(idx.get_token(LINK))['payload']
+    assert payload['main']['t'] == 'image/jpeg'
+    assert payload['name'] == 'Surfer on Acid'
+
+
+def test_the_links_own_fields_still_win_over_the_targets():
+    """{...linked, ...own}: a merge, not a redirect. A link that sets its own `main` keeps it."""
+    idx = _wired({'p': [2], 'loc': 0, 'main': {'t': 'image/svg+xml', 'b': b'<svg/>'}})
+    payload = idx._resolve_link_payload(idx.get_token(LINK))['payload']
+    assert payload['main']['t'] == 'image/svg+xml', "the link's own media must not be replaced"
+    assert payload['name'] == 'Surfer on Acid', 'but it still inherits what it does not set'
+
+
+def test_token_to_dict_renders_the_inherited_icon_and_embed():
+    """End to end through the serialiser: this is the field set CoinFlow reads per row."""
+    idx = _wired({'p': [2], 'loc': 0})
+    token = _real_token(LINK, metadata_hash=b'LINKHASH', token_type=2, protocols=[2])
+    idx._type_name = lambda t: 'NFT'
+    idx._ref_to_display = lambda v: v
+    out = idx._token_to_dict(token, include_dmint=False)
+
+    assert out['name'] == 'Surfer on Acid'
+    assert out['ticker'] == 'SoA'
+    assert out['linked_ref'] == f'{TXID[::-1].hex()}_0'
+    assert out['icon_type'] == 'image/jpeg', 'the reported symptom'
+    assert out['icon_ref'] == 'embedded'
+    assert out['embed'] is not None and out['embed']['type'] == 'image/jpeg'
+    assert out['embed']['size'] == len(bytes([0xFF, 0xD8]) + b'jpegbytes')
+
+
+def test_token_to_dict_leaves_an_ordinary_token_alone():
+    """No link, no extra reads, no changed fields -- the serialiser must be untouched for the
+    99% case."""
+    idx = _wired({'p': [2], 'loc': 0})
+    token = _real_token(TARGET, metadata_hash=b'TARGETHASH', token_type=4, protocols=[1, 4],
+                        name='Surfer on Acid', ticker='SoA', icon_ref='embedded',
+                        icon_type='image/jpeg', icon_size=4096)
+    idx._type_name = lambda t: 'FT'
+    idx._ref_to_display = lambda v: v
+    out = idx._token_to_dict(token, include_dmint=False)
+
+    assert out['name'] == 'Surfer on Acid'
+    assert out['linked_ref'] is None, 'a token with its own name is not a link'
+    assert out['icon_type'] == 'image/jpeg'
