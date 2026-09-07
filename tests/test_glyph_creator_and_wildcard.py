@@ -447,7 +447,9 @@ def test_media_prefixes_do_not_alias_a_scanned_prefix():
 
 def test_schema_v8_registered():
     from electrumx.server.glyph_index import CURRENT_SCHEMA_VERSION
-    assert CURRENT_SCHEMA_VERSION == 8
+    # v8 is no longer the head — v9 widened the GH tx_idx field — but it must stay reachable in
+    # the chain, or a v7 DB hard-fails with 'no in-place migration'.
+    assert CURRENT_SCHEMA_VERSION >= 8
     src = open(os.path.join(os.path.dirname(__file__), '..', 'electrumx', 'server',
                             'glyph_index.py'), encoding='utf-8').read()
     assert '7: self._migrate_7_to_8' in src

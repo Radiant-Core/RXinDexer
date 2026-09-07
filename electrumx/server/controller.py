@@ -148,6 +148,7 @@ class Controller(ServerBase):
                     swap_index=getattr(bp, 'swap_index', None),
                     royalty_index=getattr(bp, 'royalty_index', None),
                     hashmark_index=getattr(bp, 'hashmark_index', None),
+                    declaration_index=getattr(bp, 'declaration_index', None),
                     analytics_index=getattr(bp, 'analytics_index', None),
                     dmint_contracts=getattr(bp, 'dmint_contracts', None),
                     mempool=mempool,

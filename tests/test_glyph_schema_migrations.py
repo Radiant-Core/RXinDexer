@@ -51,6 +51,9 @@ class _StubUtxoDB:
     def get(self, key):
         return self.store.get(key)
 
+    def put(self, key, value):
+        self.store[key] = value
+
     def write_batch(self):
         return _Batch(self.store)
 
@@ -242,3 +245,109 @@ def test_migration_chain_is_registered_for_every_step():
 if __name__ == '__main__':
     import pytest
     sys.exit(pytest.main([__file__, '-v']))
+
+
+# --------------------------------------------------------------- v8 -> v9 (GH tx_idx widening)
+#
+# The v8 GH key packed tx_idx as '>H'. That held only while every writer recorded a ref's FIRST
+# sighting; record_ref_hop writes a row per singleton movement, so the first mainnet block with
+# more than 65,535 transactions raised struct.error inside advance_txs and terminated the server
+# mid-sync (2026-09-06, resync at ~443,590 — every block since the last flush was lost).
+
+def _v8_history_key(ref, height, tx_idx):
+    """The pre-v9 key, packed the way the old pack_history_key did."""
+    import struct
+    return (GlyphDBKeys.HISTORY + ref
+            + struct.pack('>I', height) + struct.pack('>H', tx_idx))
+
+
+def _history_index(v8_rows):
+    idx = object.__new__(GlyphIndex)
+    idx.db = SimpleNamespace(utxo_db=_StubUtxoDB())
+    idx.logger = _Logger()
+    for ref, height, tx_idx, value in v8_rows:
+        idx.db.utxo_db.store[_v8_history_key(ref, height, tx_idx)] = value
+    return idx
+
+
+def test_the_bug_a_block_over_65535_txs_no_longer_raises():
+    """The exact failure: struct.error: 'H' format requires 0 <= number <= 65535."""
+    key = gi.pack_history_key(REF_A, 443_591, 70_000)
+    assert gi.unpack_history_key_tail(key) == (443_591, 70_000)
+
+
+def test_tx_idx_survives_the_full_32_bit_range():
+    for tx_idx in (0, 1, 65_535, 65_536, 1_000_000, 0xFFFFFFFF):
+        key = gi.pack_history_key(REF_A, 443_591, tx_idx)
+        assert gi.unpack_history_key_tail(key) == (443_591, tx_idx)
+
+
+def test_v9_keys_still_sort_height_then_tx_idx():
+    """Ordering is load-bearing: /tokens/{ref}/history and the location chain both rely on a
+    forward prefix scan being chronological."""
+    keys = [gi.pack_history_key(REF_A, h, t)
+            for h, t in [(2, 0), (1, 70_000), (1, 3), (1, 65_536), (2, 70_000)]]
+    assert sorted(keys) == [
+        gi.pack_history_key(REF_A, 1, 3),
+        gi.pack_history_key(REF_A, 1, 65_536),
+        gi.pack_history_key(REF_A, 1, 70_000),
+        gi.pack_history_key(REF_A, 2, 0),
+        gi.pack_history_key(REF_A, 2, 70_000),
+    ]
+
+
+def test_v9_migration_rewrites_keys_and_preserves_values():
+    rows = [(REF_A, 100, 0, b'v0'), (REF_A, 100, 7, b'v7'), (REF_B, 250, 65_535, b'vmax')]
+    idx = _history_index(rows)
+    assert idx._migrate_8_to_9() == 3
+    store = idx.db.utxo_db.store
+    for ref, height, tx_idx, value in rows:
+        assert store[gi.pack_history_key(ref, height, tx_idx)] == value
+        assert _v8_history_key(ref, height, tx_idx) not in store, 'old key must be removed'
+    assert len(store) == 3, 'no strays'
+
+
+def test_v9_migration_is_idempotent():
+    """A run interrupted before the version stamp is repeated on the next start."""
+    idx = _history_index([(REF_A, 100, 5, b'v5')])
+    assert idx._migrate_8_to_9() == 1
+    before = dict(idx.db.utxo_db.store)
+    assert idx._migrate_8_to_9() == 0, 'already-widened keys must not be rewritten'
+    assert idx.db.utxo_db.store == before
+
+
+def test_v9_migration_handles_tx_idx_zero():
+    """tx_idx == 0 is the one case where the old key is a proper PREFIX of the new one, so the
+    walk re-reads the row it just wrote. Length, not content, is the test."""
+    idx = _history_index([(REF_A, 100, 0, b'z')])
+    assert idx._migrate_8_to_9() == 1
+    assert idx.db.utxo_db.store == {gi.pack_history_key(REF_A, 100, 0): b'z'}
+
+
+def test_v9_migration_leaves_other_keyspaces_alone():
+    idx = _history_index([(REF_A, 100, 1, b'v')])
+    idx.db.utxo_db.store[GlyphDBKeys.TOKEN + REF_B] = b'token'
+    idx.db.utxo_db.store[GlyphDBKeys.OWNER + b'\x01' * 11] = b'owner'
+    idx._migrate_8_to_9()
+    assert idx.db.utxo_db.store[GlyphDBKeys.TOKEN + REF_B] == b'token'
+    assert idx.db.utxo_db.store[GlyphDBKeys.OWNER + b'\x01' * 11] == b'owner'
+
+
+def test_v9_migration_pages_past_its_batch_size():
+    """PAGE is 20,000; the seek walk must not stall or double-count across page boundaries."""
+    rows = [(REF_A, 100, i, bytes([i % 256])) for i in range(45_000)]
+    idx = _history_index(rows)
+    assert idx._migrate_8_to_9() == 45_000
+    assert len(idx.db.utxo_db.store) == 45_000
+    assert all(len(k) == len(GlyphDBKeys.HISTORY) + 36 + gi.HISTORY_TAIL_LEN
+               for k in idx.db.utxo_db.store)
+
+
+def test_v9_is_registered_in_the_migration_chain():
+    """Unregistered, the deploy hard-fails with 'no in-place migration' and demands a full
+    reindex — the same wall a v4 DB hit earlier. Drives the real _check_schema_version."""
+    idx = _history_index([(REF_A, 100, 3, b'v')])
+    idx.db.utxo_db.store[GlyphDBKeys.SCHEMA_VERSION] = bytes([8])
+    idx._check_schema_version()
+    assert idx.db.utxo_db.store[GlyphDBKeys.SCHEMA_VERSION] == bytes([9])
+    assert gi.pack_history_key(REF_A, 100, 3) in idx.db.utxo_db.store

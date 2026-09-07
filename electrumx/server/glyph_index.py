@@ -111,7 +111,9 @@ class GlyphDBKeys:
 # v8: media-duplicate (GMH) and whole-payload-clone (GDH) indexes. Backfillable in place from
 #     stored metadata (embed bytes / remote `h`, and the metadata_hash already on each GT row);
 #     see _migrate_7_to_8.
-CURRENT_SCHEMA_VERSION = 8
+#   9 - GH key tx_idx widened from 16 to 32 bits (a Radiant block can hold more than 65,535
+#     transactions). Rewrites GH keys; no value changes. See _migrate_8_to_9.
+CURRENT_SCHEMA_VERSION = 9
 
 # Upper bound on GT rows examined by one wildcard search. The corpus is ~13k tokens today, so a
 # full pass is cheap; this exists so the cost stays bounded if it grows by orders of magnitude.
@@ -125,6 +127,18 @@ class GlyphEventType:
     TRANSFER = 2
     BURN = 3
     UPDATE = 4  # Mutable metadata update
+    # A singleton ref consumed by an input and NOT re-created in any output — the end of that
+    # ref's location chain. Distinct from BURN, which glyph_index emits for a token-level burn
+    # (fully spent / fully mined); a melt is a statement about the REF's movement, not the token's
+    # economics, and the two can occur independently.
+    MELT = 5
+
+
+# Location-history value layout, appended to the existing GH keyspace:
+#   <B event><32 txid><I vout><HASHX_LEN holder>
+# Older rows are shorter (DEPLOY/BURN 33 bytes, MINT 41 with an amount) and must stay readable,
+# so the reader switches on event type and length rather than assuming a fixed size.
+NO_VOUT = 0xFFFFFFFF        # melt rows: the ref was consumed, not re-created
 
 
 def pack_ref(txid_bytes: bytes, vout: int) -> bytes:
@@ -282,10 +296,42 @@ def pack_token_key(ref: bytes) -> bytes:
     return GlyphDBKeys.TOKEN + ref
 
 
+# GH key tail: height (4 BE) + tx_idx (4 BE). tx_idx was two bytes through schema v8; see
+# pack_history_key for why that held until it suddenly did not.
+HISTORY_TAIL_LEN = 8
+HISTORY_TAIL_LEN_V8 = 6
+# A GH value always opens with event(1) + txid(32); anything past that is layout-specific
+# (a dMint mint's amount, a hop's vout + holder). See decode_history_value.
+#
+# Only a LOCATION tail is transplantable between events by merge_history_values: it describes
+# where the ref sat, which is true of the row whatever the event is called. A dMint mint's
+# amount describes that mint alone and stays with it.
+HISTORY_BASE_LEN = 33
+HISTORY_AMOUNT_TAIL_LEN = 8                     # dMint mint: uint64 minted amount
+HISTORY_LOCATION_TAIL_LENS = frozenset((4, 4 + HASHX_LEN))   # hop: vout [+ holder hashX]
+
+
 def pack_history_key(ref: bytes, height: int, tx_idx: int) -> bytes:
-    """Pack a history key."""
+    """Pack a history key: GH + ref(36) + height(4 BE) + tx_idx(4 BE).
+
+    ``tx_idx`` is 32-bit. It was 16-bit until schema v9, which held only because every caller
+    then wrote a row for a ref's FIRST sighting -- a new ref appears a handful of times per
+    block, never at a high index. ``record_ref_hop`` writes a row per singleton movement, so the
+    first mainnet block carrying more than 65,535 transactions raised struct.error inside
+    ``advance_txs`` and terminated the server. A block cannot hold 2**32 transactions.
+    """
     return (GlyphDBKeys.HISTORY + ref +
-            struct.pack('>I', height) + struct.pack('>H', tx_idx))
+            struct.pack('>I', height) + struct.pack('>I', tx_idx))
+
+
+def unpack_history_key_tail(key: bytes) -> Tuple[int, int]:
+    """(height, tx_idx) from a GH key. Raises struct.error on a key that is not a v9 GH key.
+
+    Reads from the END of the key, so it is independent of the 36-byte ref and of how the caller
+    happened to build its prefix.
+    """
+    return (struct.unpack('>I', key[-HISTORY_TAIL_LEN:-4])[0],
+            struct.unpack('>I', key[-4:])[0])
 
 
 # v4 discovery indexes ------------------------------------------------------
@@ -621,6 +667,9 @@ class GlyphIndex:
         self.key_reveal_height: Dict[bytes, int] = {}   # ref -> height
 
         # Pending contract→token reverse index entries for flush (R6)
+        # ref -> "is this singleton protocol plumbing?" See is_plumbing_singleton. Small and
+        # long-lived: mainnet has ~13k distinct singletons and a verdict never flips back.
+        self._plumbing_cache: Dict[bytes, bool] = {}
         self.contract_to_token_cache: Dict[bytes, bytes] = {}  # contract_ref -> token_ref
         self.contract_to_token_height: Dict[bytes, int] = {}   # contract_ref -> height
 
@@ -651,6 +700,10 @@ class GlyphIndex:
         # it is touched within a given height.
         self._undo_cache: Dict[int, List[Tuple[bytes, Optional[bytes]]]] = defaultdict(list)
         self._undo_seen: Dict[int, Set[bytes]] = defaultdict(set)
+        # Lowest height worth recording undo for; set per block by the block processor from
+        # db.min_undo_height(daemon.cached_height()), matching the core UTXO path. 0 means
+        # "record everything", the safe default if nothing ever sets it.
+        self.undo_min_height = 0
 
         # Undo retention: keep at most env.reorg_limit heights of undo data.
         # We do not try to retroactively delete historical keys on startup; we
@@ -723,7 +776,8 @@ class GlyphIndex:
                       4: self._migrate_4_to_5,
                       5: self._migrate_5_to_6,
                       6: self._migrate_6_to_7,
-                      7: self._migrate_7_to_8}
+                      7: self._migrate_7_to_8,
+                      8: self._migrate_8_to_9}
         while v < CURRENT_SCHEMA_VERSION:
             migrator = migrations.get(v)
             if migrator is None:
@@ -737,6 +791,68 @@ class GlyphIndex:
             v += 1
             self.db.utxo_db.put(GlyphDBKeys.SCHEMA_VERSION, bytes([v]))
             self.logger.info(f'Glyph DB schema upgraded to v{v}')
+
+    def _migrate_8_to_9(self) -> int:
+        """v8 -> v9: widen the GH key's tx_idx field from 16 to 32 bits.
+
+        A GH key is ``GH + ref(36) + height(4 BE) + tx_idx``. tx_idx was two bytes, which was
+        sufficient only while every writer recorded a ref's FIRST sighting. ``record_ref_hop``
+        writes a row per singleton movement, so the first mainnet block holding more than 65,535
+        transactions raised struct.error mid-``advance_txs`` and killed the server -- losing every
+        block since the last flush. Rewrites each 44-byte key at its 46-byte equivalent; values
+        are copied untouched.
+
+        Notes:
+          * Idempotent -- a key already at the v9 length is skipped, so a run interrupted before
+            the version stamp is safe to repeat.
+          * A widened key sorts BEFORE the key it replaces (widening inserts high-order zero
+            bytes), so rewrites land behind the walk. The one exception is tx_idx == 0, where the
+            old key is a proper prefix of the new one and so is re-read -- harmless, because the
+            test is key length, not content.
+          * Page-committed via ``seek``, never holding a RocksDB iterator open across a
+            ``write_batch`` -- the same constraint ``_migrate_3_to_4`` observes.
+          * Undo rows written before this migration name pre-widening keys. Deleting an absent
+            key is a no-op in RocksDB, so the worst a deep reorg spanning the upgrade could do is
+            leave a hop row standing. Hop rows are pointers; a ref's authoritative endpoints come
+            from the ref index, not from here.
+        """
+        prefix = GlyphDBKeys.HISTORY
+        ref_len = 36
+        PAGE = 20000
+        seek = prefix
+        converted = scanned = pages = 0
+        while True:
+            page = []
+            for key, value in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+                page.append((key, value))
+                if len(page) >= PAGE:
+                    break
+            if not page:
+                break
+            with self.db.utxo_db.write_batch() as batch:
+                for key, value in page:
+                    scanned += 1
+                    tail = key[len(prefix) + ref_len:]
+                    if len(tail) != HISTORY_TAIL_LEN_V8:
+                        continue          # already v9, or not a GH row shape we own
+                    ref = key[len(prefix):len(prefix) + ref_len]
+                    height, tx_idx = struct.unpack('>IH', tail)
+                    batch.put(pack_history_key(ref, height, tx_idx), value)
+                    batch.delete(key)
+                    converted += 1
+            pages += 1
+            if pages % 20 == 0:
+                self.logger.info(
+                    f'Glyph v9 migration: {converted:,} history keys widened '
+                    f'({scanned:,} scanned)')
+            if len(page) < PAGE:
+                break
+            # seek is inclusive, so resume strictly after the last key read.
+            seek = page[-1][0] + b'\x00'
+        self.logger.info(
+            f'Glyph v9 migration complete: {converted:,} history keys widened to a 32-bit '
+            f'tx_idx ({scanned:,} rows scanned)')
+        return converted
 
     def _migrate_3_to_4(self) -> int:
         """v3 -> v4: backfill the recency-ordered discovery indexes in place.
@@ -1139,18 +1255,37 @@ class GlyphIndex:
                 result_envelope['tx_hash'] = tx_hash
                 result_envelope['vin_idx'] = vin_idx
             
-            # Find the ref for this reveal
+            # Find the ref for this reveal.
+            #
+            # A glyph's ref is the outpoint spent by its OWN envelope-carrying input — that is the
+            # seed Radiant consensus lets the singleton be minted from. _find_output_ref cannot
+            # express that: it returns the FIRST singleton found scanning outputs in order, with no
+            # reference to which input the envelope came from. On a single mint the first singleton
+            # happens to be the right one, so preferring it looked harmless; on a batch reveal it
+            # silently mis-attributes.
+            #
+            # Real case (height 236,693, tx 8736b2bd…): a DEEZ NUTZ ft+dmint deploy reveals from
+            # input 0 while a separate NFT reveals from input 11, and outputs 0-9 mint the deploy's
+            # ten dmint contract singletons at commit:1..:10. Scanning outputs handed the input-11
+            # NFT's payload the ref commit:1 — a mining contract — so the NFT was listed under the
+            # wrong outpoint and :1 appeared as an "Unnamed token".
+            #
+            # So prefer this input's prevout, but only once the tx is confirmed to actually mint it
+            # (as a singleton or a normal ref in some output). That keeps the output scan as the
+            # fallback for the shape it was added for (R4), where the envelope input spends
+            # something other than the commit being revealed, instead of letting it win outright.
             prev_hash = txin.prev_hash
             prev_idx = txin.prev_idx
             ref = pack_ref(prev_hash, prev_idx)
-            
-            output_ref = self._find_output_ref(tx_hash, tx, metadata)
-            final_ref = output_ref if output_ref else ref
-            
+
+            if self._ref_minted_in_outputs(tx, ref):
+                final_ref = ref
+            else:
+                final_ref = self._find_output_ref(tx_hash, tx, metadata) or ref
+
             # Index the reveal with full metadata
             self._index_token_reveal(
-                final_ref, tx_hash,
-                vin_idx if not output_ref else output_ref[32:36],
+                final_ref, tx_hash, final_ref[32:36],
                 height, tx_idx, envelope, metadata, tx
             )
         
@@ -1302,6 +1437,282 @@ class GlyphIndex:
                 n += 36
         return results
     
+    def is_plumbing_singleton(self, ref: bytes) -> bool:
+        """Whether a singleton ref is protocol plumbing rather than a user-facing asset.
+
+        A dMint mining contract is spent and re-created by EVERY mint, so recording its every
+        movement produces one row per mint: 218,751 rows for a single mainnet contract, and
+        18,957,168 across the keyspace -- fully half of GH -- to say "the miner moved it again".
+        That is not an ownership history, and no UI can render it. The index already draws this
+        line for the recency feeds through ``is_companion``, documented as covering exactly these
+        ("WAVE zone contract, dMint mining contract"); location chains draw it in the same place.
+
+        Callers still record MINT and MELT for these refs, so a chain keeps its endpoints and a
+        contract remains traceable to where it began and ended. Only the churn between is dropped.
+
+        Two sources, cheapest first: the GC reverse index names dMint contract outpoints
+        outright, and ``_is_companion_singleton`` catches the sibling-singleton shape that GC
+        does not record.
+
+        Fails OPEN. A ref whose owning token is not indexed yet -- a singleton seen before its
+        reveal is processed -- returns False and is NOT cached, so the hop is recorded rather
+        than silently lost and the verdict is recomputed once the record exists.
+        """
+        verdict = self._plumbing_cache.get(ref)
+        if verdict is not None:
+            return verdict
+        verdict = self._compute_plumbing_singleton(ref)
+        if verdict is None:
+            return False
+        self._plumbing_cache[ref] = verdict
+        return verdict
+
+    def _compute_plumbing_singleton(self, ref: bytes) -> Optional[bool]:
+        """True/False, or None when the owning record is not available yet (do not cache)."""
+        # A dMint contract outpoint. Pending writes first: a contract can be spent again in the
+        # same block that revealed it, before the GC row is flushed.
+        if ref in self.contract_to_token_cache:
+            return True
+        try:
+            if self.db.utxo_db.get(GlyphDBKeys.CONTRACT_TO_TOKEN + ref):
+                return True
+        except Exception:
+            return None
+        token = self.token_cache.get(ref) or self.get_token(ref)
+        if token is None:
+            return None
+        try:
+            return bool(self._is_companion_singleton(token))
+        except Exception:
+            return None
+
+    def record_ref_hop(self, ref: bytes, event: int, tx_hash: bytes, height: int,
+                       tx_idx: int, vout: int, holder_hashX: bytes = b''):
+        """Append one hop in a singleton ref's location chain.
+
+        A singleton's life is a chain of outpoints: mint -> each spend that re-creates the ref ->
+        the current UTXO, or a melt. ``blockchain.ref.get`` returns only the two endpoints; these
+        rows are the hops in between, which nothing recorded before — GlyphEventType.TRANSFER
+        existed but was never emitted, which is also why get_token_trades returned nothing.
+
+        Written into the existing GH keyspace rather than a parallel one: the key shape
+        (ref + height + tx_idx) is already exactly right and already iterates height-ascending, and
+        /tokens/{ref}/history already reads it.
+
+        Called from the block processor at the point it ALREADY detects ref movement, where the
+        vout and the holder's base hashX are both in scope. Singleton refs only — an FT ref
+        multiplies across outputs, so "location" is not a property it has.
+        """
+        if not self.enabled:
+            return
+        key = pack_history_key(ref, height, tx_idx)
+        value = (struct.pack('<B', event) + tx_hash
+                 + struct.pack('<I', vout if vout is not None else NO_VOUT)
+                 + (holder_hashX or b''))
+        self.history_cache.append((height, key, value))
+
+    # Event types only process_tx writes. record_ref_hop and the ref-history backfill emit
+    # MINT/TRANSFER/MELT, so an event byte from this set marks a row the hop writers did not
+    # produce -- which is what lets the merge below stay idempotent across repeated rescans.
+    NON_HOP_EVENTS = frozenset((GlyphEventType.DEPLOY, GlyphEventType.BURN,
+                                GlyphEventType.UPDATE))
+
+    @classmethod
+    def merge_history_values(cls, a: bytes, b: bytes) -> bytes:
+        """Combine two GH values that land on the same key. ``b`` is the later/incoming one.
+
+        A reveal writes twice for one ref at one (height, tx_idx): the block processor records
+        the MINT hop (event + txid + vout + holder) and process_tx then records the DEPLOY row
+        (event + txid). The key embeds only ref/height/tx_idx, so the second write clobbered the
+        first -- every singleton lost its mint hop, and with it the vout and holder, which is why
+        /tokens/{ref}/locations showed a bare `deploy` row with nulls.
+
+        Both describe the same event, so the result keeps:
+
+          * the EVENT BYTE of whichever side the hop writers could not have produced. DEPLOY is
+            what /tokens/{ref}/history has always reported for a reveal, and testing the event
+            type rather than the row length is what makes this idempotent: an earlier rescan
+            leaves behind a full-length row that still carries DEPLOY, and a later rescan must
+            recognise it rather than treat it as just another hop and overwrite it. Keying on
+            length got this wrong and cost the deploy label on a live DB.
+          * the longer TAIL, preferring the incoming one when they tie, so a re-derived holder
+            replaces a stale one instead of being discarded.
+
+        With neither side (or both) carrying a non-hop event there is nothing to reconcile and
+        the later write wins, as a plain put would have done.
+
+        A dMint mint's 8-byte amount tail and a hop's vout+holder tail cannot meet on one key:
+        the former is written against a fungible token_ref, the latter only against singletons.
+        """
+        if not a:
+            return b
+        if not b:
+            return a
+        a_nonhop = a[0] in cls.NON_HOP_EVENTS
+        b_nonhop = b[0] in cls.NON_HOP_EVENTS
+        if a_nonhop and not b_nonhop:
+            head = a
+        elif b_nonhop and not a_nonhop:
+            head = b
+        else:
+            head = b
+        head_tail = head[HISTORY_BASE_LEN:]
+        if len(head_tail) == HISTORY_AMOUNT_TAIL_LEN:
+            return head            # a mint's amount is its own; never overwrite it with a vout
+        # Prefer the incoming location tail so a re-derived holder replaces a stale one, but
+        # never trade a holder away for a bare vout.
+        candidates = [t for t in (b[HISTORY_BASE_LEN:], a[HISTORY_BASE_LEN:])
+                      if len(t) in HISTORY_LOCATION_TAIL_LENS]
+        tail = max(candidates, key=len) if candidates else head_tail
+        return head[:HISTORY_BASE_LEN] + tail
+
+    @staticmethod
+    def decode_history_value(value: bytes) -> Dict[str, Any]:
+        """Decode a GH value across every layout it has ever had.
+
+        Rows predating the location log are shorter, and a reader that assumed one fixed size
+        would silently mis-parse them:
+            33  DEPLOY / BURN      event + txid
+            41  MINT               event + txid + amount(Q)
+            48  TRANSFER / MELT    event + txid + vout(I) + holder hashX
+        """
+        out: Dict[str, Any] = {'event': None, 'txid': None, 'vout': None,
+                               'amount': None, 'holder_hashX': None}
+        if not value:
+            return out
+        out['event'] = value[0]
+        if len(value) >= 33:
+            out['txid'] = value[1:33]
+        # MINT has two producers with different payloads, so length is what disambiguates them —
+        # switching on the event byte alone would read a vout+holder as an amount:
+        #   41 bytes  glyph_index's token mint      event + txid + amount(Q)
+        #   48 bytes  a ref-chain mint hop          event + txid + vout(I) + holder(HASHX_LEN)
+        # The two lengths cannot coincide (33+8 vs 33+4+11), so this is exact rather than a guess.
+        if out['event'] == GlyphEventType.MINT and len(value) == 33 + 8:
+            out['amount'] = struct.unpack('<Q', value[33:41])[0]
+        elif len(value) >= 37:
+            vout = struct.unpack('<I', value[33:37])[0]
+            out['vout'] = None if vout == NO_VOUT else vout
+            holder = value[37:37 + HASHX_LEN]
+            out['holder_hashX'] = holder if len(holder) == HASHX_LEN else None
+        return out
+
+    def get_ref_location_history(self, ref: bytes, limit: int = 100,
+                                 cursor: Optional[str] = None) -> Dict[str, Any]:
+        """The hop chain for a singleton ref, height-ascending.
+
+        Rows are pointers plus hints, never verdicts: ``holder_address`` is a display convenience
+        resolved from the owner index, and a hop means only "the ref appeared at this outpoint at
+        this height".
+
+        ``filtered`` says whether this chain is COMPLETE. For protocol plumbing -- a dMint mining
+        contract, a WAVE zone contract -- the indexer records only the MINT and MELT endpoints
+        and drops the transfers between them, because a contract re-created by every mint
+        produced hundreds of thousands of rows apiece and half the entire history keyspace. A
+        consumer cannot otherwise tell "this ref moved twice" from "we did not store its moves",
+        so it is told outright rather than left to infer a complete trace from a short list.
+        """
+        limit = max(1, min(int(limit), 500))
+        display_ref = f"{ref[:32][::-1].hex()}_{struct.unpack('<I', ref[32:36])[0]}"
+
+        # Fungible refs are carried by many outputs at once, so there is no single location to
+        # chain. Answer explicitly rather than returning a misleading partial list.
+        token = self.get_token(ref)
+        if token is not None:
+            protocols = token.protocols or []
+            if GlyphProtocol.GLYPH_FT in protocols and GlyphProtocol.GLYPH_NFT not in protocols:
+                return {
+                    'ref': display_ref,
+                    'rows': [],
+                    'next_cursor': None,
+                    'filtered': False,
+                    'note': 'fungible ref: a location chain is only defined for singletons',
+                }
+
+        prefix = GlyphDBKeys.HISTORY + ref
+        seek = self._decode_cursor(cursor) or prefix
+        rows, next_cursor = [], None
+
+        for key, value in self.db.utxo_db.iterator(prefix=prefix, seek=seek):
+            if len(rows) >= limit:
+                next_cursor = self._encode_cursor(key)
+                break
+            tail = key[len(prefix):]
+            if len(tail) != HISTORY_TAIL_LEN:
+                continue
+            decoded = self.decode_history_value(value)
+            rows.append({
+                'txid': hash_to_hex_str(decoded['txid']) if decoded['txid'] else None,
+                'height': struct.unpack('>I', tail[:4])[0],
+                'tx_index': struct.unpack('>I', tail[4:8])[0],
+                'vout': decoded['vout'],
+                'event': self._event_type_name(decoded['event']),
+                'holder_address': self._resolve_owner_address(decoded['holder_hashX']),
+            })
+
+        out: Dict[str, Any] = {'ref': display_ref, 'rows': rows, 'next_cursor': next_cursor,
+                               'filtered': False}
+        if self.is_plumbing_singleton(ref):
+            out['filtered'] = True
+            out['note'] = ('protocol plumbing: transfer hops are not indexed for this ref, '
+                           'only its mint and melt. Derive intermediate hops from the '
+                           'transactions if you need the complete chain.')
+        return out
+
+    def _resolve_owner_address(self, holder_hashX: Optional[bytes]) -> Optional[str]:
+        """hashX -> base58 address via the GO owner index, or None.
+
+        A display hint only. Stored as a hashX rather than a 20-byte pubkey hash because that is
+        what the indexing pipeline already carries, and because a pkh cannot represent a
+        non-P2PKH holder.
+        """
+        if not holder_hashX:
+            return None
+        try:
+            script = self.db.utxo_db.get(GlyphDBKeys.OWNER + holder_hashX)
+            if not script:
+                return None
+            return self.script_to_address(script, self.env.coin)
+        except Exception:
+            return None
+
+    @staticmethod
+    def script_to_address(script: bytes, coin) -> Optional[str]:
+        """Base58 address for a P2PKH or P2SH script, or None for anything else.
+
+        Written out because there is no such helper in the tree: rest_api's owner lookup calls
+        ``Script(base_script).address(coin)``, which cannot work — Script has no ``address`` method
+        — and is wrapped in a bare except, so it silently yields None. That is why
+        /addresses/{ident}/history reports ``address: null`` even for addresses that have a GO row.
+        """
+        if not script:
+            return None
+        # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+        if (len(script) == 25 and script[0] == OpCodes.OP_DUP
+                and script[1] == OpCodes.OP_HASH160 and script[2] == 20
+                and script[23] == OpCodes.OP_EQUALVERIFY
+                and script[24] == OpCodes.OP_CHECKSIG):
+            return Base58.encode_check(coin.P2PKH_VERBYTE + script[3:23])
+        # P2SH: OP_HASH160 <20> OP_EQUAL
+        if (len(script) == 23 and script[0] == OpCodes.OP_HASH160
+                and script[1] == 20 and script[22] == OpCodes.OP_EQUAL):
+            return Base58.encode_check(coin.P2SH_VERBYTES[0] + script[2:22])
+        return None
+
+    def _ref_minted_in_outputs(self, tx, ref: bytes) -> bool:
+        """Whether this tx mints ``ref`` — i.e. some output carries it as a push-input-ref.
+
+        Used to confirm that an envelope-carrying input's prevout is genuinely the outpoint being
+        revealed, before trusting it over the positional output scan. Matches either ref type: a
+        singleton (0xd8, NFT/contract) or a normal ref (0xd0, FT) — an FT deploy's ref appears as a
+        normal ref on each minted output rather than as a singleton.
+        """
+        for output in tx.outputs:
+            for ref_bytes, _ref_type in self._extract_refs_from_script(output.pk_script):
+                if ref_bytes == ref:
+                    return True
+        return False
+
     def _find_output_ref(self, tx_hash: bytes, tx, metadata: Dict) -> Optional[bytes]:
         """
         Find the token ref in the reveal transaction's outputs.
@@ -1373,16 +1784,57 @@ class GlyphIndex:
         contracts) and ``_mark_companion_singletons`` (WAVE zone contracts):
         both are "extra singleton outputs a mint created alongside the token
         itself", and both use the same on-chain-verified filter.
+
+        Filter: singleton AND ref != token_ref AND ref.txid == token_ref.txid AND the ref is not
+        itself a REVEALED TOKEN in this tx.
+
+        That last clause is what a batch reveal needs. On a tx that reveals a dMint deploy from
+        input 0 and a separate NFT from input 11, the NFT's singleton satisfies every other
+        condition — same txid, singleton, not the FT's ref — and was therefore counted as a mining
+        contract. Consequences: ``live_contracts`` inflated by one (which feeds burn detection),
+        ``contract_ref`` able to point at an NFT, that NFT listed under /dmint/contracts, and the
+        NFT marked as its neighbour's plumbing and hidden from the recency feeds.
+
+        A ref is a revealed token exactly when some envelope-carrying input of this tx spends its
+        outpoint — the same rule that decides a glyph's ref in the reveal loop. So the token refs
+        are subtracted, and what remains is genuinely the parent's plumbing.
         """
         token_txid = token_ref[:32]
+        revealed = self._revealed_token_refs(tx)
         found = set()
         for output in tx.outputs:
             for ref_bytes, ref_type in self._extract_refs_from_script(output.pk_script):
                 if (ref_type == 1
                         and ref_bytes != token_ref
-                        and ref_bytes[:32] == token_txid):
+                        and ref_bytes[:32] == token_txid
+                        and ref_bytes not in revealed):
                     found.add(ref_bytes)
         return found
+
+    def _revealed_token_refs(self, tx: 'Tx') -> set:
+        """Refs this tx reveals as tokens: the prevout of every envelope-carrying input.
+
+        Same rule the reveal loop uses to assign a glyph its ref, so the two cannot disagree about
+        which outpoints are tokens and which are plumbing.
+        """
+        revealed = set()
+        # Tolerate a tx without inputs: real Tx objects always have them, but several existing
+        # tests build output-only stubs. Yielding an empty set there preserves the pre-fix
+        # behaviour for those callers rather than raising.
+        for txin in (getattr(tx, 'inputs', None) or ()):
+            script = getattr(txin, 'script', None)
+            if not script or txin.is_generation():
+                continue
+            try:
+                if not contains_glyph_magic(script):
+                    continue
+                envelope = parse_glyph_envelope(script)
+            except Exception:
+                continue
+            if not envelope or not envelope.get('is_reveal'):
+                continue
+            revealed.add(pack_ref(txin.prev_hash, txin.prev_idx))
+        return revealed
 
     def _mark_companion_singletons(self, ref: bytes, tx: 'Tx',
                                    height: int) -> int:
@@ -1615,7 +2067,7 @@ class GlyphIndex:
         self.history_cache.append((height, history_key, history_value))
         
         if token.mint_count % 100 == 1 or token.mint_count <= 1:
-            self.logger.info(
+            self.logger.debug(
                 f'dMint MINT: token={hash_to_hex_str(token_ref[:32])} '
                 f'amount={minted_amount} count={token.mint_count} '
                 f'supply={token.mined_supply}/{token.total_supply}'
@@ -2106,14 +2558,42 @@ class GlyphIndex:
         return GlyphDBKeys.UNDO + pack_be_uint32(height)
     
     def _record_undo(self, height: int, key: bytes):
-        """Record undo information for a key."""
+        """Record undo information for a key that may already hold a value.
+
+        Costs one random DB read per key, which is why the two gates below matter: at dMint-era
+        block density this is called on the order of a million times per flush, and a random read
+        is ~20-30us on disk-backed RocksDB.
+        """
         if not self.enabled:
+            return
+        # Blocks below the reorg window can never be unwound, so undo for them is written and then
+        # pruned unread. The core UTXO path already skips it the same way (see _advance_block's
+        # `if height >= min_height`); during a long catch-up this is nearly every block.
+        if height < self.undo_min_height:
             return
         if key in self._undo_seen[height]:
             return
         self._undo_seen[height].add(key)
         prev_value = self.db.utxo_db.get(key)
         self._undo_cache[height].append((key, prev_value))
+
+    def _record_undo_insert(self, height: int, key: bytes):
+        """Record undo for a key that CANNOT already exist — no DB read.
+
+        Valid only where the key is written at exactly one height, so the previous value is
+        provably None: history rows (GH + ref + height + tx_idx embeds the height) and the
+        pair-keyed derived indexes (GCM/GMT/GA/GMH/GDH), each written once when its token is
+        revealed. Using this where a key can be rewritten at a later height would make a reorg
+        delete a row that legitimately predates it.
+        """
+        if not self.enabled:
+            return
+        if height < self.undo_min_height:
+            return
+        if key in self._undo_seen[height]:
+            return
+        self._undo_seen[height].add(key)
+        self._undo_cache[height].append((key, None))
     
     def backup(self, batch, height: int):
         """Revert DB keys written at the given height (reorg unwind)."""
@@ -2363,9 +2843,20 @@ class GlyphIndex:
             batch.delete(key)
             batch.delete(holder_key)
         
-        # Flush history
+        # Flush history. Two writers can target one key within a block (a reveal's MINT hop and
+        # its DEPLOY row), so collapse before writing -- a plain put loop silently discards the
+        # earlier of the two. See merge_history_values.
+        #
+        # Insert-only with respect to the DB: GH + ref + height + tx_idx embeds the height, so no
+        # row can pre-exist at this key -- and this is the highest-volume undo site by far, one
+        # entry per mint/transfer event.
+        merged_history: Dict[bytes, Tuple[int, bytes]] = {}
         for height, key, value in self.history_cache:
-            self._record_undo(height, key)
+            prev = merged_history.get(key)
+            merged_history[key] = ((prev[0], self.merge_history_values(prev[1], value))
+                                   if prev else (height, value))
+        for key, (height, value) in merged_history.items():
+            self._record_undo_insert(height, key)
             batch.put(key, value)
         
         # Flush metadata
@@ -2395,7 +2886,7 @@ class GlyphIndex:
             c_height = self.container_member_height.get(container_ref_bytes, self.db.db_height) or 0
             for member_ref in member_refs:
                 key = GlyphDBKeys.CONTAINER_MEMBERS + container_ref_bytes + member_ref
-                self._record_undo(c_height, key)
+                self._record_undo_insert(c_height, key)
                 batch.put(key, b'')
 
         # Flush metadata type index (GMT + type_hash(16) + ref(36) -> empty)
@@ -2404,7 +2895,7 @@ class GlyphIndex:
             mt_height = self.meta_type_height.get(meta_type_str, self.db.db_height) or 0
             for ref in refs:
                 key = GlyphDBKeys.BY_META_TYPE + type_hash + ref
-                self._record_undo(mt_height, key)
+                self._record_undo_insert(mt_height, key)
                 batch.put(key, b'')
 
         # Flush creator attribution index (GA + creator_ref(36) + work_ref(36) -> empty)
@@ -2412,7 +2903,7 @@ class GlyphIndex:
             cr_height = self.creator_works_height.get(creator_ref_bytes, self.db.db_height) or 0
             for work_ref in work_refs:
                 key = GlyphDBKeys.BY_CREATOR + creator_ref_bytes + work_ref
-                self._record_undo(cr_height, key)
+                self._record_undo_insert(cr_height, key)
                 batch.put(key, b'')
 
         # Flush media-duplicate index (GMH + media_sha256(32) + ref(36) -> empty)
@@ -2420,7 +2911,7 @@ class GlyphIndex:
             mh_height = self.media_hash_height.get(media_hash, self.db.db_height) or 0
             for ref in refs:
                 key = GlyphDBKeys.MEDIA_HASH + media_hash + ref
-                self._record_undo(mh_height, key)
+                self._record_undo_insert(mh_height, key)
                 batch.put(key, b'')
 
         # Flush whole-payload clone index (GDH + metadata_hash(32) + ref(36) -> empty)
@@ -2428,7 +2919,7 @@ class GlyphIndex:
             ph_height = self.payload_hash_height.get(payload_hash, self.db.db_height) or 0
             for ref in refs:
                 key = GlyphDBKeys.PAYLOAD_HASH + payload_hash + ref
-                self._record_undo(ph_height, key)
+                self._record_undo_insert(ph_height, key)
                 batch.put(key, b'')
 
         # R11: Flush incremental stats counter
@@ -2766,8 +3257,7 @@ class GlyphIndex:
                     next_cursor = self._encode_cursor(key)
                     break
                 prefix_len = len(prefix)
-                height = struct.unpack('>I', key[prefix_len:prefix_len + 4])[0]
-                tx_idx = struct.unpack('>H', key[prefix_len + 4:prefix_len + 6])[0]
+                height, tx_idx = unpack_history_key_tail(key)
                 event_type = value[0]
                 txid = value[1:33]
                 entries.append({
@@ -2791,8 +3281,7 @@ class GlyphIndex:
             if len(results) >= limit:
                 break
 
-            height = struct.unpack('>I', key[len(prefix):len(prefix)+4])[0]
-            tx_idx = struct.unpack('>H', key[len(prefix)+4:len(prefix)+6])[0]
+            height, tx_idx = unpack_history_key_tail(key)
             event_type = value[0]
             txid = value[1:33]
 
@@ -2826,9 +3315,7 @@ class GlyphIndex:
             
             total_mints += 1
             if total_mints > offset and len(mints) < limit:
-                prefix_len = len(GlyphDBKeys.HISTORY) + 36  # R5: absolute offsets
-                height = struct.unpack('>I', key[prefix_len:prefix_len + 4])[0]
-                tx_idx = struct.unpack('>H', key[prefix_len + 4:prefix_len + 6])[0]
+                height, tx_idx = unpack_history_key_tail(key)
                 tx_hash = value[1:33] if len(value) >= 33 else b''
                 # MINT events store minted_amount as uint64 after txid
                 minted_amount = 0
@@ -3256,6 +3743,16 @@ class GlyphIndex:
                 continue
             name = (token.name or '').lower()
             ticker = (token.ticker or '').lower()
+            # A Glyph v2 link record has no name of its own but the API reports the one it
+            # inherits (see _resolve_link_payload), so a name search that could not match it
+            # would contradict what this same index says the token is called. Resolved here
+            # rather than indexed: BY_NAME is a hash seek and would need duplicate entries.
+            # Bounded -- only rows carrying metadata but no name reach this.
+            if not name and not ticker:
+                link = self._resolve_link_payload(token)
+                if link:
+                    name = (link.get('name') or '').lower()
+                    ticker = (link.get('ticker') or '').lower()
             hit = ((want_name and name and fnmatch.fnmatchcase(name, pat))
                    or (want_ticker and ticker and fnmatch.fnmatchcase(ticker, pat)))
             if not hit:
@@ -3356,6 +3853,59 @@ class GlyphIndex:
                 pass
         return None
     
+    def _resolve_link_payload(self, token: GlyphTokenInfo) -> Optional[Dict[str, Any]]:
+        """Display fields inherited through a Glyph v2 ``loc`` link, or None.
+
+        A dMint mint writes a LINK token alongside the token itself: a payload of just
+        ``{p, by, loc}`` where ``loc`` is a vout in the same commit txid whose payload this
+        record inherits. Photonic's createLinkCommit calls it "a record of dmints", and its
+        reader merges the two -- ``{...linked, ...own}``, linked as the base, the link's own
+        fields winning -- which is why the reference wallet shows a name here and this indexer
+        showed None for 244 tokens on mainnet.
+
+        Resolved for DISPLAY only, deliberately not written into the token row. The link's
+        identity is its own payload, and stamping the inherited name into BY_NAME would put
+        every dMint token's name in the search index twice -- once for the token, once for its
+        link record -- which is worse than leaving the record unnamed.
+
+        Cheap because it is rare: only consulted for a token that has metadata but no name, and
+        the linked payload is already in this DB (link and target are revealed in one
+        transaction, so indexing one implies the other).
+        """
+        if token.name or not token.metadata_hash or len(token.ref or b'') != 36:
+            return None
+        own = self.get_metadata(token.metadata_hash)
+        if not isinstance(own, dict):
+            return None
+        loc = own.get('loc')
+        # bool is an int subclass; a negative or out-of-range vout is not a link.
+        if not isinstance(loc, int) or isinstance(loc, bool) or not 0 <= loc <= 0xFFFFFFFF:
+            return None
+        linked_ref = token.ref[:32] + struct.pack('<I', loc)
+        if linked_ref == token.ref:
+            return None                     # a self-link resolves to nothing
+        linked = self.get_token(linked_ref)
+        if linked is None or not linked.metadata_hash:
+            return None
+        payload = self.get_metadata(linked.metadata_hash)
+        if not isinstance(payload, dict):
+            return None
+        return {
+            'name': self._sanitize_str(payload.get('name'), 200),
+            'ticker': self._sanitize_str(payload.get('ticker'), 16),
+            'linked_ref': f"{linked_ref[:32][::-1].hex()}_{loc}",
+            # The artwork too. Photonic merges the whole payload, embeddedFiles and remoteFiles
+            # included, so a link record renders with the target's image; resolving only the
+            # name left consumers showing the right title over an empty frame.
+            'icon_ref': linked.icon_ref,
+            'icon_type': linked.icon_type,
+            'icon_size': linked.icon_size,
+            'embedded_data_hash': linked.embedded_data_hash,
+            # {...linked, ...own}: the link's own fields win, which is what makes this a merge
+            # rather than a redirect. The content block renders the file object from this.
+            'payload': {**payload, **own},
+        }
+
     def _token_to_dict(self, token: GlyphTokenInfo, include_dmint: bool = True,
                         include_content: bool = True,
                         include_embed_data: bool = True,
@@ -3377,7 +3927,11 @@ class GlyphIndex:
         never has to probe that endpoint speculatively.
         """
         txid, vout = unpack_ref(token.ref)
-        
+
+        # A Glyph v2 link record carries no name of its own; it inherits one through `loc`.
+        # See _resolve_link_payload -- display only, never written back.
+        link = self._resolve_link_payload(token)
+
         result = {
             # Core identity (canonical txid_vout + raw 72-hex for round-tripping)
             'ref': hash_to_hex_str(txid) + '_' + str(vout),
@@ -3385,11 +3939,17 @@ class GlyphIndex:
             'protocols': token.protocols,
             'type': token.token_type,
             'type_name': self._type_name(token.token_type),
-            'name': token.name,
-            'ticker': token.ticker,
+            'name': token.name if token.name else (link or {}).get('name'),
+            'ticker': token.ticker if token.ticker else (link or {}).get('ticker'),
+            # Set only when name/ticker came from a LINKED payload rather than this token's own,
+            # so a consumer can say "inherited from ..." instead of implying it was minted here.
+            'linked_ref': (link or {}).get('linked_ref'),
             'decimals': token.decimals,
             'description': token.description,
-            'author': token.author,
+            # Display form (txid_vout), matching `ref`/`container_ref`. Stored internally as
+            # reversed-txid + LE vout, which a consumer would otherwise have to un-reverse
+            # itself — the same byte-order trap as media_sha256 and codeScriptHash.
+            'author': self._ref_to_display(token.author),
             'license': token.license,
             # Deployment
             'deploy_height': token.deploy_height,
@@ -3421,49 +3981,54 @@ class GlyphIndex:
         
         # Include image/content info
         if include_content:
+            # A link record carries no media of its own; it inherits the target's.
+            embedded_hash = token.embedded_data_hash or (link or {}).get('embedded_data_hash')
             result.update({
-                'icon_ref': token.icon_ref,
-                'icon_type': token.icon_type,
-                'icon_size': token.icon_size,
-                'embedded_data_hash': hash_to_hex_str(token.embedded_data_hash) if token.embedded_data_hash else None,
+                'icon_ref': token.icon_ref or (link or {}).get('icon_ref'),
+                'icon_type': token.icon_type or (link or {}).get('icon_type'),
+                'icon_size': token.icon_size or (link or {}).get('icon_size'),
+                'embedded_data_hash': hash_to_hex_str(embedded_hash) if embedded_hash else None,
             })
             # Re-parse CBOR metadata to expose remote/embed for explorer image rendering
             # Classify files by content (like Photonic Wallet filterFileObj),
             # not by key name, since 'main' can be either embed or remote.
-            if token.metadata_hash:
+            # For a link record this is the MERGED payload, so the file object comes from the
+            # target; for everything else it is the token's own metadata, unchanged.
+            raw_meta = (link or {}).get('payload')
+            if raw_meta is None and token.metadata_hash:
                 raw_meta = self.get_metadata(token.metadata_hash)
-                if raw_meta and isinstance(raw_meta, dict):
-                    file_obj = None
-                    for fkey in ('main', 'preview', 'embed', 'em', 'remote', 'rm'):
-                        candidate = raw_meta.get(fkey)
-                        if isinstance(candidate, dict):
-                            file_obj = candidate
-                            break
-                    if file_obj:
-                        # Classify by content: 'u'/'url' = remote, 'b' = embed
-                        has_url = isinstance(file_obj.get('u'), str) or isinstance(file_obj.get('url'), str)
-                        raw_b = file_obj.get('b')
-                        has_bytes = isinstance(raw_b, (bytes, bytearray)) or hasattr(raw_b, 'value')
-                        if has_url:
-                            hs = file_obj.get('hs')
-                            result['remote'] = {
-                                'url': file_obj.get('u') or file_obj.get('url'),
-                                'type': file_obj.get('t') or file_obj.get('type'),
-                                'hash': (file_obj.get('h') or b'').hex() if isinstance(file_obj.get('h'), (bytes, bytearray)) else None,
-                                'hashstamp': (bytes(hs).hex() if isinstance(hs, (bytes, bytearray)) else None),
-                            }
-                        elif has_bytes:
-                            b = raw_b
-                            # CBORTag 64 = typed array; value may be hex str or bytes
-                            if hasattr(b, 'value'):
-                                b = bytes.fromhex(b.value) if isinstance(b.value, str) else b.value
-                            result['embed'] = {
-                                'type': file_obj.get('t') or file_obj.get('type'),
-                                'size': len(b) if isinstance(b, (bytes, bytearray)) else None,
-                                'data': (bytes(b).hex() if isinstance(b, (bytes, bytearray)) else None)
-                                        if include_embed_data else None,
-                            }
-        
+            if raw_meta and isinstance(raw_meta, dict):
+                file_obj = None
+                for fkey in ('main', 'preview', 'embed', 'em', 'remote', 'rm'):
+                    candidate = raw_meta.get(fkey)
+                    if isinstance(candidate, dict):
+                        file_obj = candidate
+                        break
+                if file_obj:
+                    # Classify by content: 'u'/'url' = remote, 'b' = embed
+                    has_url = isinstance(file_obj.get('u'), str) or isinstance(file_obj.get('url'), str)
+                    raw_b = file_obj.get('b')
+                    has_bytes = isinstance(raw_b, (bytes, bytearray)) or hasattr(raw_b, 'value')
+                    if has_url:
+                        hs = file_obj.get('hs')
+                        result['remote'] = {
+                            'url': file_obj.get('u') or file_obj.get('url'),
+                            'type': file_obj.get('t') or file_obj.get('type'),
+                            'hash': (file_obj.get('h') or b'').hex() if isinstance(file_obj.get('h'), (bytes, bytearray)) else None,
+                            'hashstamp': (bytes(hs).hex() if isinstance(hs, (bytes, bytearray)) else None),
+                        }
+                    elif has_bytes:
+                        b = raw_b
+                        # CBORTag 64 = typed array; value may be hex str or bytes
+                        if hasattr(b, 'value'):
+                            b = bytes.fromhex(b.value) if isinstance(b.value, str) else b.value
+                        result['embed'] = {
+                            'type': file_obj.get('t') or file_obj.get('type'),
+                            'size': len(b) if isinstance(b, (bytes, bytearray)) else None,
+                            'data': (bytes(b).hex() if isinstance(b, (bytes, bytearray)) else None)
+                                    if include_embed_data else None,
+                        }
+    
         # Include dMint-specific fields for minable tokens
         if include_dmint and GlyphProtocol.GLYPH_DMINT in token.protocols:
             result['dmint'] = {
@@ -3587,6 +4152,17 @@ class GlyphIndex:
         return names.get(token_type, 'Unknown')
     
     @staticmethod
+    def _ref_to_display(ref_hex: Optional[str]) -> Optional[str]:
+        """72-hex internal ref -> "txid_vout", or the value unchanged if it is not one."""
+        if not ref_hex or not isinstance(ref_hex, str) or len(ref_hex) != 72:
+            return ref_hex
+        try:
+            raw = bytes.fromhex(ref_hex)
+        except ValueError:
+            return ref_hex
+        return f"{raw[:32][::-1].hex()}_{struct.unpack('<I', raw[32:36])[0]}"
+
+    @staticmethod
     def _event_type_name(event_type: int) -> str:
         """Get event type name."""
         names = {
@@ -3595,6 +4171,7 @@ class GlyphIndex:
             GlyphEventType.TRANSFER: 'transfer',
             GlyphEventType.BURN: 'burn',
             GlyphEventType.UPDATE: 'update',
+            GlyphEventType.MELT: 'melt',
         }
         return names.get(event_type, 'unknown')
     
@@ -3714,9 +4291,7 @@ class GlyphIndex:
             
             total_burns += 1
             if total_burns > offset and len(burns) < limit:
-                # Extract height and tx_idx from key
-                height = struct.unpack('>I', key[-6:-2])[0]
-                tx_idx = struct.unpack('>H', key[-2:])[0]
+                height, tx_idx = unpack_history_key_tail(key)
                 tx_hash = value[1:33] if len(value) >= 33 else b''
                 
                 burns.append({
@@ -3753,8 +4328,7 @@ class GlyphIndex:
             
             total_trades += 1
             if total_trades > offset and len(trades) < limit:
-                height = struct.unpack('>I', key[-6:-2])[0]
-                tx_idx = struct.unpack('>H', key[-2:])[0]
+                height, tx_idx = unpack_history_key_tail(key)
                 tx_hash = value[1:33] if len(value) >= 33 else b''
                 
                 trades.append({

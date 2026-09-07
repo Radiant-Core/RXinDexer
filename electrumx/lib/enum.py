@@ -43,6 +43,18 @@ class Enumeration:
             i = i + 1
         self.lookup = lookup
         self.reverseLookup = reverseLookup
+        # Bind every member as a real instance attribute.
+        #
+        # Without this, an access like OpCodes.OP_DUP misses normal attribute lookup and falls
+        # through to __getattr__ below -- a Python-level call plus a dict get. The script parsers
+        # do roughly three of those per opcode inside their inner loops, which profiling measured
+        # at a third of base_locking_script's runtime on a real 238-byte dMint contract script.
+        # Bound here, the same access is a C-level instance-dict hit and __getattr__ is never
+        # reached. It stays as the fallback so an unknown member still raises AttributeError.
+        for name, value in lookup.items():
+            if name in self.__dict__:
+                raise EnumError("enum name {} shadows an attribute".format(name))
+            self.__dict__[name] = value
 
     def __getattr__(self, attr):
         result = self.lookup.get(attr)

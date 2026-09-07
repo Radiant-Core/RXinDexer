@@ -61,7 +61,14 @@ from electrumx.lib.glyph import (
     wave_full_name_from_token as _wave_full_name,
 )
 from electrumx.lib.hash import hash_to_hex_str
+from electrumx.lib.util import unpack_be_uint32
 from electrumx.server import metrics as _metrics
+try:
+    # Optional, like the block processor's guarded import: the status endpoint reads the
+    # backfill's checkpoint keys directly, so it needs the constants but not the class.
+    from electrumx.server.ref_history_backfill import RefHistoryBackfillKeys
+except ImportError:                                          # pragma: no cover
+    RefHistoryBackfillKeys = None
 from electrumx.server.hashmark_index import (
     DEFAULT_LIMIT as HASHMARK_DEFAULT_LIMIT,
     MAX_LIMIT as HASHMARK_MAX_LIMIT,
@@ -484,6 +491,9 @@ async def _security_middleware(request: Request, call_next):
         '/hashmark', '/hashmark/',
         '/creators', '/creators/',
         '/media', '/media/',
+        '/declarations', '/declarations/',
+        # Read-only rescan progress, alongside /hashmark/stats and /declarations/status.
+        '/ref-history', '/ref-history/',
         '/containers', '/containers/', '/container', '/container/',
         '/users', '/users/',
         '/mempool', '/mempool/',
@@ -525,6 +535,7 @@ _wave_index = None
 _swap_index = None
 _royalty_index = None
 _hashmark_index = None
+_declaration_index = None
 _analytics_index = None
 _dmint_contracts = None
 _mempool = None
@@ -534,10 +545,10 @@ _start_time = time.time()
 
 
 def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
-                royalty_index=None, hashmark_index=None, analytics_index=None,
-                dmint_contracts=None, mempool=None):
+                royalty_index=None, hashmark_index=None, declaration_index=None,
+                analytics_index=None, dmint_contracts=None, mempool=None):
     """Set the indexer references from the main server."""
-    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _hashmark_index, _analytics_index, _dmint_contracts, _mempool
+    global _glyph_index, _db, _daemon, _wave_index, _swap_index, _royalty_index, _hashmark_index, _declaration_index, _analytics_index, _dmint_contracts, _mempool
     _glyph_index = glyph_index
     _db = db
     _daemon = daemon
@@ -545,6 +556,7 @@ def set_indexer(glyph_index, db, daemon, wave_index=None, swap_index=None,
     _swap_index = swap_index
     _royalty_index = royalty_index
     _hashmark_index = hashmark_index
+    _declaration_index = declaration_index
     _analytics_index = analytics_index
     _dmint_contracts = dmint_contracts
     _mempool = mempool
@@ -882,7 +894,10 @@ async def search_glyphs(
     protocols: Optional[str] = Query(default=None, max_length=256, description="Comma-separated protocol IDs to filter"),
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0, description="Wildcard mode only: skip this many matches"),
-    wildcard: bool = Query(default=False, description="Force wildcard mode: treat q as *q* (substring)"),
+    wildcard: Optional[bool] = Query(
+        default=None,
+        description="true forces wildcard mode (treat q as *q*); false forces a strict exact "
+                    "lookup with no fallback; omit to try exact and fall back to wildcard"),
 ):
     """Search tokens by name or ticker.
 
@@ -893,6 +908,17 @@ async def search_glyphs(
     Exact search is an indexed lookup. Wildcard search is a bounded full scan — BY_NAME stores
     `sha256(name)` and so cannot be seeked by prefix — and its response includes `scanned` and
     `truncated` so you can tell a complete answer from a capped one.
+
+    **A partial query falls back to wildcard.** Exact mode hashes the whole string, so `surfer`
+    could never match a token called "Surfer on Acid" and returned an empty list — a search box
+    that did not know to pass `wildcard=true` looked broken for every partial query. When exact
+    finds nothing the scan runs instead, and `mode` reports which one answered. Pass
+    `wildcard=false` explicitly to suppress the fallback and get a strict exact lookup.
+
+    Wildcard mode also matches a token by the name it INHERITS through a Glyph v2 `loc` link, so
+    a dMint link record is findable by the name this API reports for it. Exact mode does not:
+    it seeks a hashed index that stores each token's own name. Those records carry `linked_ref`,
+    so a caller can group them under their target or filter them out.
     """
     _ensure_glyph_index()
 
@@ -901,16 +927,132 @@ async def search_glyphs(
         if protocols:
             protocol_list = [int(p.strip()) for p in protocols.split(',') if p.strip()]
 
-        if wildcard or any(ch in q for ch in '*?['):
-            result = _glyph_index.search_tokens_wildcard(
-                q, protocols=protocol_list, limit=limit, offset=offset,
-            )
-            return {"query": q, "mode": "wildcard", **result}
+        def _wild():
+            return {"query": q, "mode": "wildcard",
+                    **_glyph_index.search_tokens_wildcard(
+                        q, protocols=protocol_list, limit=limit, offset=offset)}
+
+        if wildcard or (wildcard is None and any(ch in q for ch in '*?[')):
+            return _wild()
 
         result = _glyph_index.search_tokens(q, protocols=protocol_list, limit=limit)
-        return {"query": q, "mode": "exact", "results": result, "count": len(result)}
+        if result or wildcard is False:
+            # wildcard=false is the explicit opt-out: a strict lookup, empty answer and all.
+            return {"query": q, "mode": "exact", "results": result, "count": len(result)}
+        # Exact hashes the whole string, so a partial query cannot match and used to return an
+        # empty list. Fall back rather than tell a caller who typed three letters that no such
+        # token exists.
+        return _wild()
     except Exception as e:
         raise _internal_error(e)
+
+
+# =============================================================================
+# CANON DECLARATIONS (discovery only — pointers and hints, never a verdict)
+# =============================================================================
+
+def _ensure_declarations():
+    if not _declaration_index:
+        raise HTTPException(status_code=503, detail="Declaration index not available")
+
+
+def _declaration_cursor(cursor: Optional[str]) -> Optional[bytes]:
+    if not cursor:
+        return None
+    try:
+        return bytes.fromhex(cursor)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+
+@app.get("/declarations/stats", tags=["Declarations"])
+async def declaration_stats():
+    """Declaration index status, including backfill progress and whether signatures are checked.
+
+    `signature_verification: false` means `sig_valid` on every row is null — UNCHECKED, not
+    invalid. That distinction matters: treating null as invalid silently discards valid
+    declarations on a node without the optional `coincurve` dependency.
+    """
+    _ensure_declarations()
+    try:
+        return _declaration_index.stats()
+    except Exception as e:
+        raise _internal_error(e, "declaration_stats")
+
+
+@app.post("/declarations/scan/{txid}", tags=["Declarations"])
+async def declaration_scan_txid(
+    txid: str = Path(..., min_length=64, max_length=64, description="Confirmed txid to scan"),
+):
+    """Index the declarations in one known transaction, immediately.
+
+    Two daemon calls instead of a chain rescan — the right tool when you already know the txid,
+    since backfill cost is per-block while declarations are rare. Confirmed transactions only.
+
+    POST, so the security middleware requires an API key.
+    """
+    _ensure_declarations()
+    if not _daemon:
+        raise HTTPException(status_code=503, detail="Daemon not available")
+    try:
+        bytes.fromhex(txid)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="txid must be 64 hex chars")
+
+    try:
+        result = await _declaration_index.scan_txid(txid, _daemon)
+    except Exception as e:
+        raise _internal_error(e, "declaration_scan_txid")
+    if 'error' in result:
+        raise HTTPException(status_code=400, detail=result['error'])
+    return result
+
+
+@app.get("/declarations/by-ref/{ref}", tags=["Declarations"])
+async def declarations_by_ref(
+    ref: str = Path(..., min_length=72, max_length=72, description="72-hex ref"),
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Declarations naming this ref, height-ascending.
+
+    Discovery only: rows are pointers plus hints. `sig_valid` is a hint (null = unchecked), and a
+    row means only that a schema-valid document naming this ref was revealed on chain at that
+    height — never that its claim is true. Anyone can sign a document about a ref they do not own.
+    Re-verify client-side before showing anything as authoritative.
+    """
+    _ensure_declarations()
+    try:
+        ref_bytes = bytes.fromhex(ref)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ref must be 72 hex chars")
+    if len(ref_bytes) != 36:
+        raise HTTPException(status_code=400, detail="ref must be 72 hex chars")
+
+    try:
+        return _declaration_index.get_by_ref(
+            ref_bytes, limit=limit, cursor=_declaration_cursor(cursor))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _internal_error(e, "declarations_by_ref")
+
+
+@app.get("/declarations/by-signer/{address}", tags=["Declarations"])
+async def declarations_by_signer(
+    address: str = Path(..., min_length=1, max_length=90, description="Signing address"),
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """Declarations signed by this address, height-ascending. Same caveats as by-ref."""
+    _ensure_declarations()
+    try:
+        return _declaration_index.get_by_signer(
+            address, limit=limit, cursor=_declaration_cursor(cursor))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _internal_error(e, "declarations_by_signer")
 
 
 _MEDIA_HASH_PATH = Path(..., min_length=64, max_length=64,
@@ -1034,17 +1176,43 @@ async def get_glyphs_by_type(
 async def get_glyphs_recent(
     limit: int = Query(default=100, le=500),
     cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor from previous response next_cursor"),
-    type_id: Optional[int] = Query(default=None, ge=0, le=7, description="Optional token-type filter; omit for newest across all types"),
+    token_type: Optional[int] = Query(default=None, ge=0, le=7, description="Optional token-type filter; omit for newest across all types"),
+    type_id: Optional[int] = Query(default=None, ge=0, le=7, description="Deprecated alias for token_type"),
 ):
-    """Newest-deployed Glyph tokens (v4 discovery index), across all types or one type."""
+    """Newest-deployed Glyph tokens, height-descending (v4 discovery index).
+
+    This is the height-ordered listing: keys are `inv_height = 0xFFFFFFFF - deploy_height`, so a
+    forward prefix scan emerges newest-first without a reverse iterator. Filtered by type it reads
+    BY_TYPE_RECENT, unfiltered it reads GLOBAL_RECENT.
+
+    Pages with an opaque `cursor`, not `offset` — offset over a prefix scan is O(offset), and the
+    cursors are order-specific. That is why this ordering lives here rather than as a `sort=` on
+    `/glyphs`, which pages by offset.
+
+    `token_type` is the parameter name `/glyphs` uses; `type_id` is accepted as a deprecated alias
+    so existing callers keep working. Supplying both with different values is an error rather than
+    a silent pick.
+    """
     _ensure_glyph_index()
 
+    if token_type is not None and type_id is not None and token_type != type_id:
+        raise HTTPException(
+            status_code=400,
+            detail="token_type and type_id disagree; token_type is the current name, "
+                   "type_id its deprecated alias — supply one",
+        )
+    selected = token_type if token_type is not None else type_id
+
     try:
-        if type_id is not None:
-            result = _glyph_index.get_tokens_by_type(type_id, limit=limit, cursor=cursor, order="recent")
+        if selected is not None:
+            result = _glyph_index.get_tokens_by_type(selected, limit=limit, cursor=cursor, order="recent")
         else:
             result = _glyph_index.get_recent_tokens(limit=limit, cursor=cursor)
-        return {"type_id": type_id, "order": "recent", **result}
+        # Both names are echoed: `token_type` going forward, `type_id` so existing consumers that
+        # read it back are not broken by the rename.
+        return {"token_type": selected, "type_id": selected, "order": "recent", **result}
+    except HTTPException:
+        raise
     except Exception as e:
         raise _internal_error(e)
 
@@ -1255,7 +1423,11 @@ async def get_address_history(
                 owner_key = b'GO' + hashX
                 base_script = _db.utxo_db.get(owner_key)
                 if base_script:
-                    display_address = Script(base_script).address(coin)
+                    # Script has no .address() method, so the old call here always raised into
+                    # the bare except below and left display_address as None — which is why this
+                    # endpoint reported `address: null` even for addresses with a GO row.
+                    from electrumx.server.glyph_index import GlyphIndex
+                    display_address = GlyphIndex.script_to_address(base_script, coin)
         except Exception:
             pass
 
@@ -1423,6 +1595,88 @@ async def get_top_token_holders(
         raise HTTPException(status_code=400, detail="Invalid ref format")
     except Exception as e:
         raise _internal_error(e)
+
+
+@app.get("/ref-history/status", tags=["Token Analytics"])
+async def get_ref_history_backfill_status():
+    """Progress of the one-shot rescan that reconstructs singleton location chains.
+
+    Mirrors /hashmark/stats and /declarations/status. Until this reports `complete`, an empty or
+    short `rows` from /tokens/{ref}/locations may mean "not scanned back that far yet" rather
+    than "the ref never moved" — the same distinction those endpoints exist to make.
+
+    Read straight from the checkpoint keys rather than from the backfill object, so it answers
+    whether or not the rescan is enabled in this process.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    if RefHistoryBackfillKeys is None:
+        raise HTTPException(status_code=503, detail="Ref-history backfill not available")
+
+    try:
+        get = _db.utxo_db.get
+        done = bool(get(RefHistoryBackfillKeys.DONE))
+        raw_cursor = get(RefHistoryBackfillKeys.CURSOR)
+        raw_target = get(RefHistoryBackfillKeys.TARGET)
+        target = unpack_be_uint32(raw_target)[0] if raw_target else None
+        cursor = unpack_be_uint32(raw_cursor)[0] if raw_cursor else None
+        pct = None
+        if not done and cursor is not None and target:
+            pct = round(100.0 * cursor / target, 2)
+        return {
+            "complete": done,
+            "started": target is not None,
+            "next_height": None if done else cursor,
+            "target_height": target,
+            "percent": 100.0 if done else pct,
+        }
+    except Exception as e:
+        raise _internal_error(e, "ref_history_status")
+
+
+@app.get("/tokens/{ref}/locations", tags=["Token Analytics"])
+async def get_token_locations(
+    ref: str = _REF_PATH,
+    limit: int = Query(default=100, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque pagination cursor"),
+):
+    """A singleton ref's location chain, height-ascending.
+
+    A singleton's life is a chain of outpoints: `mint` -> each spend that re-creates the ref
+    (`transfer`) -> the current UTXO, or a `melt`. `blockchain.ref.get` returns only the two
+    endpoints; these are the hops between them.
+
+    **Singletons only.** An FT ref multiplies across outputs, so "location" is not a property it
+    has — those return an empty `rows` with a `note`.
+
+    Rows are pointers plus hints, never verdicts: `holder_address` is a display convenience
+    resolved from the owner index and may be null for a non-P2PKH holder or an unindexed one, and
+    a `melt` row has no `vout` because the ref was consumed rather than re-created.
+
+    **Check `filtered` before presenting this as a complete trace.** For protocol plumbing (a
+    dMint mining contract, a WAVE zone contract) only the `mint` and `melt` endpoints are
+    indexed and the transfers between them are deliberately dropped — one such contract
+    accumulated 218,751 hops, and together they were half the entire history keyspace. When
+    `filtered` is true the chain is intentionally incomplete and `note` says so; derive the
+    intermediate hops from the transactions if you need them all.
+
+    `filtered` is also false with a `note` for a fungible ref, where a location chain is not a
+    property the ref has at all — treat that as "not applicable" rather than "no history".
+
+    Separate from `/tokens/{ref}/history`, which keeps its existing response shape (and now also
+    carries the transfer/melt events, since both read the same keyspace).
+    """
+    _ensure_glyph_index()
+
+    try:
+        ref_bytes = _resolve_ref(ref)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ref format")
+
+    try:
+        return _glyph_index.get_ref_location_history(ref_bytes, limit=limit, cursor=cursor)
+    except Exception as e:
+        raise _internal_error(e, "get_token_locations")
 
 
 @app.get("/tokens/{ref}/history", tags=["Token Analytics"])

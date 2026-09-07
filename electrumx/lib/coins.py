@@ -133,9 +133,29 @@ class Coin:
  
     @classmethod
     def codeScriptHash_from_script(cls, script):
-        '''Returns a codeScriptHash from a script.'''
-        stateseperator_index = Script.get_stateseperator_index(script)
-        return sha256(script[stateseperator_index:]).digest()
+        '''Returns a codeScriptHash from a script, matching consensus.
+
+        Two things this must agree with the node on, and previously did not (see
+        tests/lib/test_code_script_hash.py):
+
+        * DOUBLE SHA256, not single. The node builds it with CHashWriter, whose CHash256::Finalize
+          runs sha256 twice (src/hash.h). Radiant uses double_sha512_256 for block headers, but
+          this call site is standard double SHA256.
+        * The separator byte is EXCLUDED. The node hashes from stateSeperatorByteIndex, which is
+          the byte AFTER OP_STATESEPARATOR (GetOp has already advanced pc when the index is
+          recorded), so the 0xbd itself is not part of the code section.
+
+        With no separator the whole script is hashed; when the separator is the final byte the
+        code section is empty, which the node also handles explicitly by hashing an empty script.
+
+        This value is persisted in every UTXO row, so changing it requires a reindex — hence the
+        DB_VERSIONS bump that accompanies it.
+        '''
+        index = Script.state_separator_byte_index(script)
+        # Empty when the separator is the last byte; Python slicing already yields b'' there, but
+        # the node special-cases it and so do we, explicitly.
+        code = script[index:] if index < len(script) else b''
+        return double_sha256(code)
     
     @classmethod
     def hashX_from_script(cls, script):

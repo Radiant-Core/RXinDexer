@@ -43,6 +43,10 @@ def mock_glyph_index():
     idx._token_to_dict = Mock(return_value={})
     idx.get_all_tokens_summary = Mock(return_value={'total': 0, 'tokens': []})
     idx.search_tokens = Mock(return_value=[])
+    # An empty exact result now falls back to the wildcard scan, so the fixture has to
+    # answer both paths or every partial-query test 500s on an unstubbed Mock.
+    idx.search_tokens_wildcard = Mock(return_value={
+        'pattern': '*q*', 'tokens': [], 'count': 0, 'scanned': 0, 'truncated': False})
     idx.get_stats = Mock(return_value={'enabled': True, 'total_tokens': 0})
     idx.get_tokens_by_type = Mock(return_value=[])
     idx.get_token_holders = Mock(return_value={'holders': []})

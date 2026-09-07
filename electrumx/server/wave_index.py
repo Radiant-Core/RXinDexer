@@ -1764,11 +1764,17 @@ class WaveIndex:
         return duplicates
     
     def get_all_registrations(self, name: str) -> Dict[str, Any]:
-        """Get canonical registration plus all duplicates for a name."""
+        """Get canonical registration plus all duplicates for a name.
+
+        resolve() never returns a ``registered`` key, so the REST handler's
+        ``result.get('registered', False)`` always fell through to False and
+        /wave/registrations reported EVERY name as unregistered and available —
+        including names that resolve fine. Stamp it explicitly.
+        """
         result = self.resolve(name, include_duplicates=True)
         if not result:
-            return {'name': name, 'registered': False}
-        return result
+            return {'name': name, 'registered': False, 'available': True}
+        return {**result, 'registered': True}
     
     def check_available(self, name: str,
                         now: Optional[int] = None) -> Dict[str, Any]:
