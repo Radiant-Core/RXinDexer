@@ -110,6 +110,11 @@ OpCodes = Enumeration("Opcodes", [
 ])
 
 # Cached in hash set for improved parsing performance
+# Necessary-condition byte prefixes for the address templates base_locking_script looks for.
+# A P2PKH's opcodes appear literally as OP_DUP OP_HASH160 push-20; a P2SH's as OP_HASH160 push-20.
+P2PKH_LEAD_BYTES = bytes([0x76, 0xa9, 0x14])
+P2SH_LEAD_BYTES = bytes([0xa9, 0x14])
+
 INPUT_REF_OPS = {
     OpCodes.OP_PUSHINPUTREF,
     OpCodes.OP_PUSHINPUTREFSINGLETON,
@@ -265,7 +270,7 @@ class Script(object):
                 # Found the state seperator
                 if op == OpCodes.OP_STATESEPERATOR:
                     return n
-                
+
                 n += 1
                 if op <= OpCodes.OP_PUSHDATA4:
                     # Raw bytes follow
@@ -518,45 +523,75 @@ class Script(object):
         computed identically at create and spend time (the b'rb' side table
         stores it verbatim).
         '''
+        # Necessary-condition pre-filter, ahead of the O(script) opcode walk.
+        #
+        # A P2PKH's opcodes appear in the script as the literal bytes 76 a9 14 (OP_DUP,
+        # OP_HASH160, push-20) and a P2SH's as a9 14. Whatever the op boundaries turn out to be,
+        # the template cannot be present if those bytes are absent -- so absence is a proof, and
+        # `in` on bytes is a C-level search rather than a Python loop. Real dMint contract
+        # outputs contain neither, and they are both the longest scripts and the ones every mint
+        # re-creates, so this is where the function's cost actually lives.
+        has_p2pkh_bytes = P2PKH_LEAD_BYTES in script
+        has_p2sh_bytes = P2SH_LEAD_BYTES in script
+
+        if not has_p2sh_bytes:          # 76 a9 14 contains a9 14, so this covers both
+            # Neither template can exist, so only the fallback's answer is reachable. Take the
+            # shortcut only where it provably matches walking: the walk-raised path returns the
+            # whole script, and the fallback also returns the whole script when it strips
+            # nothing, so the two agree exactly when nothing is stripped. When something IS
+            # stripped they can differ (a truncation later in the script would have sent the old
+            # code down the walk-raised path), so that case falls through to the walk.
+            if cls._ref_preamble_end(script) == 0:
+                return script
+
         try:
             ops = cls._walk_ops(script)
         except Exception:
             return script
 
         # P2PKH: OP_DUP OP_HASH160 <push20> OP_EQUALVERIFY OP_CHECKSIG
-        for i in range(len(ops) - 4):
-            if (ops[i][0] == OpCodes.OP_DUP
-                    and ops[i + 1][0] == OpCodes.OP_HASH160
-                    and ops[i + 2][0] == 0x14 and ops[i + 2][1] == 20
-                    and ops[i + 3][0] == OpCodes.OP_EQUALVERIFY
-                    and ops[i + 4][0] == OpCodes.OP_CHECKSIG):
-                return script[ops[i][2]:ops[i + 4][3]]
+        if has_p2pkh_bytes:
+            for i in range(len(ops) - 4):
+                if (ops[i][0] == OpCodes.OP_DUP
+                        and ops[i + 1][0] == OpCodes.OP_HASH160
+                        and ops[i + 2][0] == 0x14 and ops[i + 2][1] == 20
+                        and ops[i + 3][0] == OpCodes.OP_EQUALVERIFY
+                        and ops[i + 4][0] == OpCodes.OP_CHECKSIG):
+                    return script[ops[i][2]:ops[i + 4][3]]
         # P2SH: OP_HASH160 <push20> OP_EQUAL
-        for i in range(len(ops) - 2):
-            if (ops[i][0] == OpCodes.OP_HASH160
-                    and ops[i + 1][0] == 0x14 and ops[i + 1][1] == 20
-                    and ops[i + 2][0] == OpCodes.OP_EQUAL):
-                return script[ops[i][2]:ops[i + 2][3]]
+        if has_p2sh_bytes:
+            for i in range(len(ops) - 2):
+                if (ops[i][0] == OpCodes.OP_HASH160
+                        and ops[i + 1][0] == 0x14 and ops[i + 1][1] == 20
+                        and ops[i + 2][0] == OpCodes.OP_EQUAL):
+                    return script[ops[i][2]:ops[i + 2][3]]
 
         # Fallback: strip a leading input-ref preamble (+ DROP/2DROP), then
         # return the remainder (or the whole script if nothing remains).
         try:
-            n = 0
-            length = len(script)
-            while n < length:
-                op = script[n]
-                if op in INPUT_REF_OPS:
-                    if n + 1 + 36 > length:
-                        break
-                    n += 1 + 36
-                elif op == OpCodes.OP_DROP or op == OpCodes.OP_2DROP:
-                    n += 1
-                else:
-                    break
-            remainder = script[n:]
+            remainder = script[cls._ref_preamble_end(script):]
             return remainder if remainder else script
         except Exception:
             return script
+
+    @classmethod
+    def _ref_preamble_end(cls, script):
+        '''Offset just past a leading input-ref preamble (ref pushes and their DROP/2DROP), or 0
+        if the script does not start with one. Stops at the first byte it does not recognise, and
+        at a truncated ref.'''
+        n = 0
+        length = len(script)
+        while n < length:
+            op = script[n]
+            if op in INPUT_REF_OPS:
+                if n + 1 + 36 > length:
+                    break
+                n += 1 + 36
+            elif op == OpCodes.OP_DROP or op == OpCodes.OP_2DROP:
+                n += 1
+            else:
+                break
+        return n
 
     @classmethod
     def push_data(cls, data):
