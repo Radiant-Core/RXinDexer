@@ -1631,6 +1631,16 @@ async def get_token_locations(
     resolved from the owner index and may be null for a non-P2PKH holder or an unindexed one, and
     a `melt` row has no `vout` because the ref was consumed rather than re-created.
 
+    **Check `filtered` before presenting this as a complete trace.** For protocol plumbing (a
+    dMint mining contract, a WAVE zone contract) only the `mint` and `melt` endpoints are
+    indexed and the transfers between them are deliberately dropped — one such contract
+    accumulated 218,751 hops, and together they were half the entire history keyspace. When
+    `filtered` is true the chain is intentionally incomplete and `note` says so; derive the
+    intermediate hops from the transactions if you need them all.
+
+    `filtered` is also false with a `note` for a fungible ref, where a location chain is not a
+    property the ref has at all — treat that as "not applicable" rather than "no history".
+
     Separate from `/tokens/{ref}/history`, which keeps its existing response shape (and now also
     carries the transfer/melt events, since both read the same keyspace).
     """

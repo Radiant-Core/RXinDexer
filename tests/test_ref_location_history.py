@@ -757,3 +757,49 @@ def test_backfill_still_records_an_ordinary_transfer():
     rows, tracked = [], {}
     assert bf.scan_block(_block([(tx, OTHER_TXID)]), 600, tracked, rows) == 1
     assert GlyphIndex.decode_history_value(rows[0][1])['event'] == GlyphEventType.TRANSFER
+
+
+# --------------------------------------------------- `filtered`: is this chain complete?
+#
+# Asked for by a consumer (CoinFlow) rendering a "Token Journey". Without it a short chain for a
+# plumbing ref is indistinguishable from a ref that genuinely moved twice, so a UI would present
+# a deliberately incomplete list as a full derivation.
+
+def test_a_normal_chain_is_not_filtered():
+    idx = _index()
+    idx.record_ref_hop(REF, GlyphEventType.TRANSFER, TXID, 500, 1, 0, HOLDER)
+    _commit(idx)
+    out = idx.get_ref_location_history(REF)
+    assert out['filtered'] is False
+    assert 'note' not in out
+    assert len(out['rows']) == 1
+
+
+def test_a_plumbing_chain_is_flagged_and_explained():
+    idx = _index()
+    idx.db.utxo_db.store[GlyphDBKeys.CONTRACT_TO_TOKEN + REF] = bytes([0xEE]) * 36
+    idx.record_ref_hop(REF, GlyphEventType.MINT, TXID, 500, 1, 0, HOLDER)
+    _commit(idx)
+    out = idx.get_ref_location_history(REF)
+    assert out['filtered'] is True
+    assert 'note' in out and 'transfer hops are not indexed' in out['note']
+    assert len(out['rows']) == 1, 'the endpoints it does have are still returned'
+
+
+def test_a_fungible_ref_is_not_applicable_rather_than_filtered():
+    """`filtered` must not be used to mean "no chain exists" -- an FT has no location at all,
+    which is a different answer from "we dropped some of it"."""
+    from electrumx.lib.glyph import GlyphProtocol
+    idx = _index()
+    idx.get_token = lambda ref: SimpleNamespace(
+        protocols=[GlyphProtocol.GLYPH_FT], name='FT', metadata_hash=b'')
+    out = idx.get_ref_location_history(REF)
+    assert out['filtered'] is False
+    assert 'fungible' in out['note']
+    assert out['rows'] == []
+
+
+def test_filtered_is_always_present_so_a_consumer_can_rely_on_it():
+    idx = _index()
+    for ref in (REF, pack_ref(bytes([0xEE]) * 32, 3)):
+        assert 'filtered' in idx.get_ref_location_history(ref)

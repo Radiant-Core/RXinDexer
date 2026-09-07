@@ -1604,6 +1604,13 @@ class GlyphIndex:
         Rows are pointers plus hints, never verdicts: ``holder_address`` is a display convenience
         resolved from the owner index, and a hop means only "the ref appeared at this outpoint at
         this height".
+
+        ``filtered`` says whether this chain is COMPLETE. For protocol plumbing -- a dMint mining
+        contract, a WAVE zone contract -- the indexer records only the MINT and MELT endpoints
+        and drops the transfers between them, because a contract re-created by every mint
+        produced hundreds of thousands of rows apiece and half the entire history keyspace. A
+        consumer cannot otherwise tell "this ref moved twice" from "we did not store its moves",
+        so it is told outright rather than left to infer a complete trace from a short list.
         """
         limit = max(1, min(int(limit), 500))
         display_ref = f"{ref[:32][::-1].hex()}_{struct.unpack('<I', ref[32:36])[0]}"
@@ -1618,6 +1625,7 @@ class GlyphIndex:
                     'ref': display_ref,
                     'rows': [],
                     'next_cursor': None,
+                    'filtered': False,
                     'note': 'fungible ref: a location chain is only defined for singletons',
                 }
 
@@ -1642,7 +1650,14 @@ class GlyphIndex:
                 'holder_address': self._resolve_owner_address(decoded['holder_hashX']),
             })
 
-        return {'ref': display_ref, 'rows': rows, 'next_cursor': next_cursor}
+        out: Dict[str, Any] = {'ref': display_ref, 'rows': rows, 'next_cursor': next_cursor,
+                               'filtered': False}
+        if self.is_plumbing_singleton(ref):
+            out['filtered'] = True
+            out['note'] = ('protocol plumbing: transfer hops are not indexed for this ref, '
+                           'only its mint and melt. Derive intermediate hops from the '
+                           'transactions if you need the complete chain.')
+        return out
 
     def _resolve_owner_address(self, holder_hashX: Optional[bytes]) -> Optional[str]:
         """hashX -> base58 address via the GO owner index, or None.
