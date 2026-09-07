@@ -3743,6 +3743,16 @@ class GlyphIndex:
                 continue
             name = (token.name or '').lower()
             ticker = (token.ticker or '').lower()
+            # A Glyph v2 link record has no name of its own but the API reports the one it
+            # inherits (see _resolve_link_payload), so a name search that could not match it
+            # would contradict what this same index says the token is called. Resolved here
+            # rather than indexed: BY_NAME is a hash seek and would need duplicate entries.
+            # Bounded -- only rows carrying metadata but no name reach this.
+            if not name and not ticker:
+                link = self._resolve_link_payload(token)
+                if link:
+                    name = (link.get('name') or '').lower()
+                    ticker = (link.get('ticker') or '').lower()
             hit = ((want_name and name and fnmatch.fnmatchcase(name, pat))
                    or (want_ticker and ticker and fnmatch.fnmatchcase(ticker, pat)))
             if not hit:

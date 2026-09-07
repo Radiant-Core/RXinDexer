@@ -894,7 +894,10 @@ async def search_glyphs(
     protocols: Optional[str] = Query(default=None, max_length=256, description="Comma-separated protocol IDs to filter"),
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0, description="Wildcard mode only: skip this many matches"),
-    wildcard: bool = Query(default=False, description="Force wildcard mode: treat q as *q* (substring)"),
+    wildcard: Optional[bool] = Query(
+        default=None,
+        description="true forces wildcard mode (treat q as *q*); false forces a strict exact "
+                    "lookup with no fallback; omit to try exact and fall back to wildcard"),
 ):
     """Search tokens by name or ticker.
 
@@ -905,6 +908,17 @@ async def search_glyphs(
     Exact search is an indexed lookup. Wildcard search is a bounded full scan — BY_NAME stores
     `sha256(name)` and so cannot be seeked by prefix — and its response includes `scanned` and
     `truncated` so you can tell a complete answer from a capped one.
+
+    **A partial query falls back to wildcard.** Exact mode hashes the whole string, so `surfer`
+    could never match a token called "Surfer on Acid" and returned an empty list — a search box
+    that did not know to pass `wildcard=true` looked broken for every partial query. When exact
+    finds nothing the scan runs instead, and `mode` reports which one answered. Pass
+    `wildcard=false` explicitly to suppress the fallback and get a strict exact lookup.
+
+    Wildcard mode also matches a token by the name it INHERITS through a Glyph v2 `loc` link, so
+    a dMint link record is findable by the name this API reports for it. Exact mode does not:
+    it seeks a hashed index that stores each token's own name. Those records carry `linked_ref`,
+    so a caller can group them under their target or filter them out.
     """
     _ensure_glyph_index()
 
@@ -913,14 +927,22 @@ async def search_glyphs(
         if protocols:
             protocol_list = [int(p.strip()) for p in protocols.split(',') if p.strip()]
 
-        if wildcard or any(ch in q for ch in '*?['):
-            result = _glyph_index.search_tokens_wildcard(
-                q, protocols=protocol_list, limit=limit, offset=offset,
-            )
-            return {"query": q, "mode": "wildcard", **result}
+        def _wild():
+            return {"query": q, "mode": "wildcard",
+                    **_glyph_index.search_tokens_wildcard(
+                        q, protocols=protocol_list, limit=limit, offset=offset)}
+
+        if wildcard or (wildcard is None and any(ch in q for ch in '*?[')):
+            return _wild()
 
         result = _glyph_index.search_tokens(q, protocols=protocol_list, limit=limit)
-        return {"query": q, "mode": "exact", "results": result, "count": len(result)}
+        if result or wildcard is False:
+            # wildcard=false is the explicit opt-out: a strict lookup, empty answer and all.
+            return {"query": q, "mode": "exact", "results": result, "count": len(result)}
+        # Exact hashes the whole string, so a partial query cannot match and used to return an
+        # empty list. Fall back rather than tell a caller who typed three letters that no such
+        # token exists.
+        return _wild()
     except Exception as e:
         raise _internal_error(e)
 
