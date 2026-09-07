@@ -3843,6 +3843,49 @@ class GlyphIndex:
                 pass
         return None
     
+    def _resolve_link_payload(self, token: GlyphTokenInfo) -> Optional[Dict[str, Any]]:
+        """Display fields inherited through a Glyph v2 ``loc`` link, or None.
+
+        A dMint mint writes a LINK token alongside the token itself: a payload of just
+        ``{p, by, loc}`` where ``loc`` is a vout in the same commit txid whose payload this
+        record inherits. Photonic's createLinkCommit calls it "a record of dmints", and its
+        reader merges the two -- ``{...linked, ...own}``, linked as the base, the link's own
+        fields winning -- which is why the reference wallet shows a name here and this indexer
+        showed None for 244 tokens on mainnet.
+
+        Resolved for DISPLAY only, deliberately not written into the token row. The link's
+        identity is its own payload, and stamping the inherited name into BY_NAME would put
+        every dMint token's name in the search index twice -- once for the token, once for its
+        link record -- which is worse than leaving the record unnamed.
+
+        Cheap because it is rare: only consulted for a token that has metadata but no name, and
+        the linked payload is already in this DB (link and target are revealed in one
+        transaction, so indexing one implies the other).
+        """
+        if token.name or not token.metadata_hash or len(token.ref or b'') != 36:
+            return None
+        own = self.get_metadata(token.metadata_hash)
+        if not isinstance(own, dict):
+            return None
+        loc = own.get('loc')
+        # bool is an int subclass; a negative or out-of-range vout is not a link.
+        if not isinstance(loc, int) or isinstance(loc, bool) or not 0 <= loc <= 0xFFFFFFFF:
+            return None
+        linked_ref = token.ref[:32] + struct.pack('<I', loc)
+        if linked_ref == token.ref:
+            return None                     # a self-link resolves to nothing
+        linked = self.get_token(linked_ref)
+        if linked is None or not linked.metadata_hash:
+            return None
+        payload = self.get_metadata(linked.metadata_hash)
+        if not isinstance(payload, dict):
+            return None
+        return {
+            'name': self._sanitize_str(payload.get('name'), 200),
+            'ticker': self._sanitize_str(payload.get('ticker'), 16),
+            'linked_ref': f"{linked_ref[:32][::-1].hex()}_{loc}",
+        }
+
     def _token_to_dict(self, token: GlyphTokenInfo, include_dmint: bool = True,
                         include_content: bool = True,
                         include_embed_data: bool = True,
@@ -3864,7 +3907,11 @@ class GlyphIndex:
         never has to probe that endpoint speculatively.
         """
         txid, vout = unpack_ref(token.ref)
-        
+
+        # A Glyph v2 link record carries no name of its own; it inherits one through `loc`.
+        # See _resolve_link_payload -- display only, never written back.
+        link = self._resolve_link_payload(token)
+
         result = {
             # Core identity (canonical txid_vout + raw 72-hex for round-tripping)
             'ref': hash_to_hex_str(txid) + '_' + str(vout),
@@ -3872,8 +3919,11 @@ class GlyphIndex:
             'protocols': token.protocols,
             'type': token.token_type,
             'type_name': self._type_name(token.token_type),
-            'name': token.name,
-            'ticker': token.ticker,
+            'name': token.name if token.name else (link or {}).get('name'),
+            'ticker': token.ticker if token.ticker else (link or {}).get('ticker'),
+            # Set only when name/ticker came from a LINKED payload rather than this token's own,
+            # so a consumer can say "inherited from ..." instead of implying it was minted here.
+            'linked_ref': (link or {}).get('linked_ref'),
             'decimals': token.decimals,
             'description': token.description,
             # Display form (txid_vout), matching `ref`/`container_ref`. Stored internally as
