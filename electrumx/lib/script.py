@@ -227,7 +227,37 @@ class ScriptPubKey(object):
 class Script(object):
 
     @classmethod
+    def state_separator_byte_index(cls, script):
+        """The consensus ``stateSeperatorByteIndex``: where the CODE section starts.
+
+        Mirrors CScript::GetPushRefs in the node (src/script/script.cpp). There, GetOp advances
+        ``pc`` past the opcode before ``stateSeperatorLocatedIt = pc`` runs, so the recorded index
+        is the byte AFTER OP_STATESEPARATOR — the separator is not part of the code section. With
+        no separator the index is 0 and the whole script is code.
+
+        Note this differs from :meth:`get_stateseperator_index`, which returns the index OF the
+        separator and cannot distinguish "separator at index 0" from "no separator". Use this one
+        for anything that must agree with consensus.
+        """
+        found = cls._find_state_separator(script)
+        return 0 if found is None else found + 1
+
+    @classmethod
     def get_stateseperator_index(cls, script):
+        """Index OF the separator opcode, or 0 when absent.
+
+        Ambiguous by construction (a separator at index 0 and no separator both give 0) and NOT the
+        consensus index — see :meth:`state_separator_byte_index`. Retained for existing callers.
+        """
+        found = cls._find_state_separator(script)
+        return 0 if found is None else found
+
+    @classmethod
+    def _find_state_separator(cls, script):
+        """Index of OP_STATESEPARATOR, or None if the script has none.
+
+        Raises ScriptError on a truncated script, as the callers above rely on.
+        """
         try:
             n = 0
             while n < len(script):
@@ -265,7 +295,7 @@ class Script(object):
             # this fires on every degenerate scriptPubKey during block sync).
             raise ScriptError('truncated script') from None
         # No state seperator found
-        return 0
+        return None
 
     @classmethod
     def get_ops(cls, script):

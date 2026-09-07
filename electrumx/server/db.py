@@ -74,7 +74,10 @@ class DB(object):
     # read_utxo_state() raises DBError ('your UTXO DB version is ...') and the node
     # REFUSES TO START. The operator must manually wipe the DB and resync from
     # genesis; there is no automatic migration for this bump.
-    DB_VERSIONS = [9]
+    # 10: codeScriptHash corrected to consensus (double SHA256, separator excluded). The value is
+    #     stored in every UTXO row and cannot be migrated — the source script is not retained — so
+    #     a v9 DB must refuse to start rather than silently mix two hashing schemes.
+    DB_VERSIONS = [10]
 
     class DBError(Exception):
         '''Raised on general DB errors generally indicating corruption.'''
