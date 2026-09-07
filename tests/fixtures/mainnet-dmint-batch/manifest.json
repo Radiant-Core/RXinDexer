@@ -1,0 +1,8 @@
+{
+  "description": "Batch reveal (height 236693): DEEZ NUTZ ft+dmint deploy (envelope in input 0, covenant at commit:0) plus a separate NFT (envelope in input 11, covenant at commit:11), minting dmint contract singletons at commit:1..:10 whose spending inputs are plain p2pkh — the batch-envelope fallback case.",
+  "commitTxid": "0ca8cf8ecf90be6be3233a2c6fbfda67dedf6cfa640072bd841ebd87bb688c01",
+  "revealTxid": "8736b2bdbe6ed2d516f9984cc6c8b962483c05a2f3cee64409e809063a8dfda0",
+  "contractRef": "0ca8cf8ecf90be6be3233a2c6fbfda67dedf6cfa640072bd841ebd87bb688c0100000001",
+  "nftRef": "0ca8cf8ecf90be6be3233a2c6fbfda67dedf6cfa640072bd841ebd87bb688c010000000b",
+  "creatorRef": "ae4e54f9599e99ecc29676f33a6ef5a45308f5f880ba0ccbbbd11e0b0cdd5ae100000000"
+}

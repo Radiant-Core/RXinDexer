@@ -1139,18 +1139,37 @@ class GlyphIndex:
                 result_envelope['tx_hash'] = tx_hash
                 result_envelope['vin_idx'] = vin_idx
             
-            # Find the ref for this reveal
+            # Find the ref for this reveal.
+            #
+            # A glyph's ref is the outpoint spent by its OWN envelope-carrying input — that is the
+            # seed Radiant consensus lets the singleton be minted from. _find_output_ref cannot
+            # express that: it returns the FIRST singleton found scanning outputs in order, with no
+            # reference to which input the envelope came from. On a single mint the first singleton
+            # happens to be the right one, so preferring it looked harmless; on a batch reveal it
+            # silently mis-attributes.
+            #
+            # Real case (height 236,693, tx 8736b2bd…): a DEEZ NUTZ ft+dmint deploy reveals from
+            # input 0 while a separate NFT reveals from input 11, and outputs 0-9 mint the deploy's
+            # ten dmint contract singletons at commit:1..:10. Scanning outputs handed the input-11
+            # NFT's payload the ref commit:1 — a mining contract — so the NFT was listed under the
+            # wrong outpoint and :1 appeared as an "Unnamed token".
+            #
+            # So prefer this input's prevout, but only once the tx is confirmed to actually mint it
+            # (as a singleton or a normal ref in some output). That keeps the output scan as the
+            # fallback for the shape it was added for (R4), where the envelope input spends
+            # something other than the commit being revealed, instead of letting it win outright.
             prev_hash = txin.prev_hash
             prev_idx = txin.prev_idx
             ref = pack_ref(prev_hash, prev_idx)
-            
-            output_ref = self._find_output_ref(tx_hash, tx, metadata)
-            final_ref = output_ref if output_ref else ref
-            
+
+            if self._ref_minted_in_outputs(tx, ref):
+                final_ref = ref
+            else:
+                final_ref = self._find_output_ref(tx_hash, tx, metadata) or ref
+
             # Index the reveal with full metadata
             self._index_token_reveal(
-                final_ref, tx_hash,
-                vin_idx if not output_ref else output_ref[32:36],
+                final_ref, tx_hash, final_ref[32:36],
                 height, tx_idx, envelope, metadata, tx
             )
         
@@ -1373,16 +1392,57 @@ class GlyphIndex:
         contracts) and ``_mark_companion_singletons`` (WAVE zone contracts):
         both are "extra singleton outputs a mint created alongside the token
         itself", and both use the same on-chain-verified filter.
+
+        Filter: singleton AND ref != token_ref AND ref.txid == token_ref.txid AND the ref is not
+        itself a REVEALED TOKEN in this tx.
+
+        That last clause is what a batch reveal needs. On a tx that reveals a dMint deploy from
+        input 0 and a separate NFT from input 11, the NFT's singleton satisfies every other
+        condition — same txid, singleton, not the FT's ref — and was therefore counted as a mining
+        contract. Consequences: ``live_contracts`` inflated by one (which feeds burn detection),
+        ``contract_ref`` able to point at an NFT, that NFT listed under /dmint/contracts, and the
+        NFT marked as its neighbour's plumbing and hidden from the recency feeds.
+
+        A ref is a revealed token exactly when some envelope-carrying input of this tx spends its
+        outpoint — the same rule that decides a glyph's ref in the reveal loop. So the token refs
+        are subtracted, and what remains is genuinely the parent's plumbing.
         """
         token_txid = token_ref[:32]
+        revealed = self._revealed_token_refs(tx)
         found = set()
         for output in tx.outputs:
             for ref_bytes, ref_type in self._extract_refs_from_script(output.pk_script):
                 if (ref_type == 1
                         and ref_bytes != token_ref
-                        and ref_bytes[:32] == token_txid):
+                        and ref_bytes[:32] == token_txid
+                        and ref_bytes not in revealed):
                     found.add(ref_bytes)
         return found
+
+    def _revealed_token_refs(self, tx: 'Tx') -> set:
+        """Refs this tx reveals as tokens: the prevout of every envelope-carrying input.
+
+        Same rule the reveal loop uses to assign a glyph its ref, so the two cannot disagree about
+        which outpoints are tokens and which are plumbing.
+        """
+        revealed = set()
+        # Tolerate a tx without inputs: real Tx objects always have them, but several existing
+        # tests build output-only stubs. Yielding an empty set there preserves the pre-fix
+        # behaviour for those callers rather than raising.
+        for txin in (getattr(tx, 'inputs', None) or ()):
+            script = getattr(txin, 'script', None)
+            if not script or txin.is_generation():
+                continue
+            try:
+                if not contains_glyph_magic(script):
+                    continue
+                envelope = parse_glyph_envelope(script)
+            except Exception:
+                continue
+            if not envelope or not envelope.get('is_reveal'):
+                continue
+            revealed.add(pack_ref(txin.prev_hash, txin.prev_idx))
+        return revealed
 
     def _mark_companion_singletons(self, ref: bytes, tx: 'Tx',
                                    height: int) -> int:
