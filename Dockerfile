@@ -2,12 +2,9 @@
 # https://github.com/Radiant-Core/RXinDexer
 # Build with: `docker build -t rxindexer .`
 
-# TODO digest-pin: pin the base image to an immutable digest for reproducible,
-# tamper-evident builds, e.g. `FROM ubuntu:22.04@sha256:<digest>`.
-# Resolve the current digest (needs registry/network access):
-#   docker pull ubuntu:22.04 && \
-#     docker inspect --format='{{index .RepoDigests 0}}' ubuntu:22.04
-FROM ubuntu:22.04
+# Base image pinned to the multi-arch index digest resolved 2026-10-21
+# (docker buildx imagetools inspect ubuntu:22.04). Bump deliberately.
+FROM ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
 
 LABEL maintainer="The Radiant Core devs"
 LABEL version="3.0.1"
@@ -68,13 +65,11 @@ WORKDIR /opt/electrumx
 RUN python3 -m pip install --upgrade pip setuptools wheel
 RUN python3 -m pip install 'Cython<3'
 
-# Install core dependencies first (except python-rocksdb)
-RUN python3 -m pip install plyvel 'aiorpcX[ws]>=0.22,<0.23' attrs pylru 'aiohttp>=3.3,<4.0' \
-    'websockets>=10.0,<14.0' psutil 'cbor2>=5.4.0' 'fastapi>=0.109.0' \
-    'uvicorn[standard]>=0.27.0' 'pydantic>=2.5.0'
-
-# Install python-rocksdb with build isolation disabled to use Cython<3
-RUN python3 -m pip install --no-build-isolation 'python-rocksdb<=0.7.0'
+# Install all dependencies from the hashed lockfile (see requirements.txt
+# header for regeneration). --no-build-isolation lets the python-rocksdb
+# sdist build against the Cython<3 installed above; every downloaded
+# artifact is verified against its pinned sha256.
+RUN python3 -m pip install --require-hashes --no-build-isolation -r requirements.lock
 
 # Ensure the electrumx user can read and execute the repo
 RUN chown -R root:electrumx /opt/electrumx && \

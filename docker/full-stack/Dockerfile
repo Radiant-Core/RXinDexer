@@ -5,7 +5,7 @@
 # Build with: docker build -t rxindexer .
 # Build timestamp: 2026-02-02
 
-FROM ubuntu:22.04
+FROM ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
 
 LABEL maintainer="The Radiant Core devs"
 LABEL version="3.0.1"

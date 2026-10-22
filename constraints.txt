@@ -1,0 +1,8 @@
+# Constraints applied when generating requirements.lock via `pip-compile -c`.
+# They narrow the resolver without changing the declared ranges in
+# requirements.txt (which must stay in sync with requirements-ci.txt).
+#
+# aiorpcx: requirements.txt allows <0.26, but the Dockerfile deploys the
+# >=0.22,<0.23 band and 0.23.x is not yet validated against this indexer.
+# Keep the lock on the deployed band; widen deliberately after testing.
+aiorpcx<0.23
